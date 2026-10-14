@@ -1,0 +1,210 @@
+From a8e0c8f48f4304eef1a6c95967d4fc3606cb6458 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Tue, 13 Oct 2026 03:57:18 +0000
+Subject: [PATCH 44/47] Z 6III: the touch panel takes QEMU's multi-touch input
+ -- what z63ui sends
+
+z63ui sends the monitor's pointers as QEMU multi-touch input
+(input-send-event "mtt": begin/update/end per slot, x and y 0..0x7fff
+across the picture, then a sync -- the sequence ui/input.c's
+qemu_input_queue_mtt/_mtt_abs make for QEMU's own windows) and got
+"Input handler not found for event type mtt". The touch panel now
+registers as that handler: contacts are kept per slot (two, as the
+driver reads at most two records) and applied at the sync, scaled to the
+panel's 1024x682. The touch property stays, for scripts; both go through
+one z63_touch_apply. A touch while the controller is not scanning is
+named once per contact rather than per event.
+
+Checked: the z63ui sequence for a tap at (0.947, 0.755) opens the live
+view's i menu, as the property's 970:515 did.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-touch.h | 131 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 111 insertions(+), 20 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-touch.h b/hw/arm/nikon-z63-touch.h
+index fa8c499..81b375c 100644
+--- a/hw/arm/nikon-z63-touch.h
++++ b/hw/arm/nikon-z63-touch.h
+@@ -52,15 +52,19 @@
+  * is made every 16 ms; the release makes one more. S1 bit 7 stays set
+  * after the boot (a "ready" flag nothing else tests). Touches are made
+  * only while registers 1 and 2 both hold 1 (scanning). The version reads
+- * 1.00.00. Fingers come from the machine property "touch": "x:y" for one,
+- * "x:y+x:y" for two (a pinch), "" or "up" to lift them; settable at run
+- * time with qom-set. A touch before the controller has been configured
+- * is dropped and named.
++ * 1.00.00. Fingers come from QEMU's multi-touch input (input-send-event
++ * "mtt", as QEMU's own windows and z63ui send them: begin/update/end per
++ * slot, x and y 0..0x7fff across the picture, then a sync) or from the
++ * machine property "touch": "x:y" for one, "x:y+x:y" for two (a pinch),
++ * "" or "up" to lift them; settable at run time with qom-set. A touch
++ * while the controller is not scanning is dropped and named once.
+  */
+ 
+ #ifndef HW_ARM_NIKON_Z63_TOUCH_H
+ #define HW_ARM_NIKON_Z63_TOUCH_H
+ 
++#include "ui/input.h"
++
+ #define Z63_TOUCH_BANK          0
+ #define Z63_TOUCH_ADDRESS       0x55
+ #define Z63_TOUCH_INT_LINE      14      /* EXT_INT_14, GPIO port 3 bit 14 */
+@@ -94,6 +98,11 @@ typedef struct Z63Touch {
+     unsigned records_left;
+     uint16_t rx_x[Z63_TOUCH_FINGERS], rx_y[Z63_TOUCH_FINGERS];
+     uint64_t reports, boot_edges, dropped;
++    bool drop_named;            /* this touch's drop already reported */
++    /* QEMU multi-touch input, per slot until the sync */
++    QemuInputHandlerState *input;
++    bool mt_down[Z63_TOUCH_FINGERS];
++    uint16_t mt_x[Z63_TOUCH_FINGERS], mt_y[Z63_TOUCH_FINGERS];
+ } Z63Touch;
+ 
+ static bool z63_touch_scanning(Z63Touch *t)
+@@ -176,6 +185,34 @@ static void z63_touch_power(Z63Touch *t, bool on)
+     error_report("Z63_TOUCH: panel power %s", on ? "on" : "off");
+ }
+ 
++/* The fingers on the panel are now these n. */
++static void z63_touch_apply(Z63Touch *t, unsigned n, const uint16_t *x,
++                            const uint16_t *y)
++{
++    if (n && !z63_touch_scanning(t)) {
++        t->dropped++;
++        if (!t->drop_named) {
++            t->drop_named = true;
++            error_report("Z63_TOUCH: touch at %u:%u dropped -- the "
++                         "controller is %s", x[0], y[0], !t->powered ? "off" :
++                         !t->booted ? "starting" : "not scanning");
++        }
++        return;
++    }
++    if (!n) {
++        t->drop_named = false;
++        if (t->fingers) {
++            t->release_pending = true;
++        }
++    }
++    t->fingers = n;
++    memcpy(t->x, x, sizeof(x[0]) * n);
++    memcpy(t->y, y, sizeof(y[0]) * n);
++    if (z63_touch_scanning(t) && !timer_pending(t->timer)) {
++        z63_touch_tick(t);
++    }
++}
++
+ /* "x:y", "x:y+x:y", "" or "up". */
+ static bool z63_touch_set(Z63Touch *t, const char *text, Error **errp)
+ {
+@@ -206,22 +243,7 @@ static bool z63_touch_set(Z63Touch *t, const char *text, Error **errp)
+             y[n] = fy;
+         }
+     }
+-    if (n && !z63_touch_scanning(t)) {
+-        t->dropped++;
+-        error_report("Z63_TOUCH: touch at %u:%u dropped -- the controller "
+-                     "is %s", x[0], y[0], !t->powered ? "off" :
+-                     !t->booted ? "starting" : "not scanning");
+-        return true;
+-    }
+-    if (!n && t->fingers) {
+-        t->release_pending = true;
+-    }
+-    t->fingers = n;
+-    memcpy(t->x, x, sizeof(x[0]) * n);
+-    memcpy(t->y, y, sizeof(y[0]) * n);
+-    if (z63_touch_scanning(t) && !timer_pending(t->timer)) {
+-        z63_touch_tick(t);
+-    }
++    z63_touch_apply(t, n, x, y);
+     return true;
+ 
+ bad:
+@@ -230,6 +252,72 @@ bad:
+     return false;
+ }
+ 
++/* QEMU's multi-touch input: contacts per slot, applied at the sync. One
++ * machine, so one handler; it finds its panel through this pointer. */
++static Z63Touch *z63_touch_input_owner;
++
++static void z63_touch_input_event(DeviceState *dev, QemuConsole *src,
++                                  InputEvent *evt)
++{
++    Z63Touch *t = z63_touch_input_owner;
++    InputMultiTouchEvent *mtt;
++
++    if (!t || evt->type != INPUT_EVENT_KIND_MTT) {
++        return;
++    }
++    mtt = evt->u.mtt.data;
++    if (mtt->slot < 0 || mtt->slot >= Z63_TOUCH_FINGERS) {
++        return;
++    }
++    switch (mtt->type) {
++    case INPUT_MULTI_TOUCH_TYPE_BEGIN:
++    case INPUT_MULTI_TOUCH_TYPE_UPDATE:
++        t->mt_down[mtt->slot] = true;
++        break;
++    case INPUT_MULTI_TOUCH_TYPE_END:
++    case INPUT_MULTI_TOUCH_TYPE_CANCEL:
++        t->mt_down[mtt->slot] = false;
++        break;
++    case INPUT_MULTI_TOUCH_TYPE_DATA:
++        if (mtt->axis == INPUT_AXIS_X) {
++            t->mt_x[mtt->slot] = qemu_input_scale_axis(mtt->value,
++                INPUT_EVENT_ABS_MIN, INPUT_EVENT_ABS_MAX, 0, Z63_TOUCH_WIDTH);
++        } else if (mtt->axis == INPUT_AXIS_Y) {
++            t->mt_y[mtt->slot] = qemu_input_scale_axis(mtt->value,
++                INPUT_EVENT_ABS_MIN, INPUT_EVENT_ABS_MAX, 0, Z63_TOUCH_HEIGHT);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static void z63_touch_input_sync(DeviceState *dev)
++{
++    Z63Touch *t = z63_touch_input_owner;
++    uint16_t x[Z63_TOUCH_FINGERS], y[Z63_TOUCH_FINGERS];
++    unsigned n = 0;
++
++    if (!t) {
++        return;
++    }
++    for (unsigned i = 0; i < Z63_TOUCH_FINGERS; i++) {
++        if (t->mt_down[i]) {
++            x[n] = t->mt_x[i];
++            y[n] = t->mt_y[i];
++            n++;
++        }
++    }
++    z63_touch_apply(t, n, x, y);
++}
++
++static const QemuInputHandler z63_touch_input = {
++    .name  = "Nikon Z 6III touch panel",
++    .mask  = INPUT_EVENT_MASK_MTT,
++    .event = z63_touch_input_event,
++    .sync  = z63_touch_input_sync,
++};
++
+ /* The I2C endpoint (bank 0, slave 0x55). */
+ static bool z63_touch_start(Z63Touch *t, bool receive)
+ {
+@@ -319,6 +407,9 @@ static void z63_touch_init(Z63Touch *t, Z63ExtInt *extint)
+     t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_touch_tick, t);
+     t->regs[0x21] = 0x01;       /* version 1.00.00, DECLARED */
+     z63_touch_int(t, false);    /* the line idles high */
++    z63_touch_input_owner = t;
++    t->input = qemu_input_handler_register(NULL, &z63_touch_input);
++    qemu_input_handler_activate(t->input);
+ }
+ 
+ #endif /* HW_ARM_NIKON_Z63_TOUCH_H */
+-- 
+2.55.0
+

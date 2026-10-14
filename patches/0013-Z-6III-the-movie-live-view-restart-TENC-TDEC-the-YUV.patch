@@ -1,0 +1,565 @@
+From ba55ee06882150de910e09b85307299b48bad9b2 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 03:49:38 +0000
+Subject: [PATCH 13/47] Z 6III: the movie live-view restart -- TENC, TDEC, the
+ YUV codecs, device 0x190
+
+With the stop acknowledged, CaptureSequence's restart in movie mode
+reaches blocks nothing had touched before. Each was the next stop:
+
+- Reset controller. Route 1 (word 0 bit 1 of the set window, +0x340) is
+  pulsed before TENC's init; the model took bits 1..3 of any word as a
+  CPU core reset and stopped. Core bits are only in the offset-4 word.
+- TENC, 0x152c0000 + 0x15ac0000 (device 0x1fb, INTID 0x10b), and TDEC,
+  0x15300000 + 0x15b00000 (device 0x1fa, INTID 0x10c) -- names from the
+  image's interrupt table; what they code is not known. Register windows
+  from z63-tools/make_window.py plus what it cannot see: loop-indexed
+  address pairs (+0x120.., +0x220.., +0x320..), the two five-word groups a
+  helper fills through a computed pointer (+0x500, +0x514), TDEC's
+  read-back of +0x400/+0x414, and the second block behind descriptor
+  +0x10 (nikon-z63-tenc.h, -tdec.h).
+- YUV_COMP at 0x15648000 (devices 0x1f2/0x1f3, INTID 0x75) and
+  CODEC_DECOMP at 0x15660000 (0x1f4..0x1f6, INTID 0x77), one driver
+  (0x40c71ac4..0x40c75178) choosing the base per device in each switch
+  case: one layout for both, top registers and four groups of two
+  sub-units each, including eight 36-bit address registers per sub-unit
+  that the driver read-modify-writes as single 64-bit accesses
+  (nikon-z63-yuvcomp.h). nikon-z63-regwindow.h gains a 64-bit-capable
+  variant: QEMU splits the access and each half is checked against the
+  set like any other.
+- The sensor interface's device 0x190 ({0x15081000, 0x15084000,
+  0x15085000}). The harvest in nikon-z63-sensorif.h took every
+  descriptor's +8 base for 0x15080000, so 0x190's offsets (its functions
+  are the ones the HAL calls with [0xa030578f8]) were filed a page low;
+  they now also sit at +0x1000, and its +16 bank's at +0x4000. Found by
+  sub_40C2A6BC writing +0x268 of 0x15081000. handle_offsets.py's
+  --field only worked for 8 -- IDA prints #0x10, not #16 -- and still
+  misses LDP X8, X9, [X0,#8] and per-branch pointers, so each list is the
+  union with a branch-merging pass that follows those.
+
+All storage, all declared: the read-only offsets answer 0 (idle, nothing
+pending) and none of these blocks raises its interrupt or moves data.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-regwindow.h |  34 +++++++++---
+ hw/arm/nikon-z63-sensorif.h  |  44 +++++++++++++++
+ hw/arm/nikon-z63-tdec.h      |  78 +++++++++++++++++++++++++++
+ hw/arm/nikon-z63-tenc.h      |  83 ++++++++++++++++++++++++++++
+ hw/arm/nikon-z63-yuvcomp.h   | 102 +++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63.c           |  63 +++++++++++++++++++---
+ z63-tools/handle_offsets.py  |   4 +-
+ 7 files changed, 395 insertions(+), 13 deletions(-)
+ create mode 100644 hw/arm/nikon-z63-tdec.h
+ create mode 100644 hw/arm/nikon-z63-tenc.h
+ create mode 100644 hw/arm/nikon-z63-yuvcomp.h
+
+diff --git a/hw/arm/nikon-z63-regwindow.h b/hw/arm/nikon-z63-regwindow.h
+index d4ea7bf..04d4a91 100644
+--- a/hw/arm/nikon-z63-regwindow.h
++++ b/hw/arm/nikon-z63-regwindow.h
+@@ -136,11 +136,23 @@ static const MemoryRegionOps z63_regwindow_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
+-static void z63_regwindow_init_strided(Object *owner, MemoryRegion *sysmem,
+-                                       Z63RegWindow *w, const char *name,
+-                                       hwaddr base, unsigned size,
+-                                       unsigned stride,
+-                                       const uint16_t *offsets, size_t n)
++/* For a block whose driver loads a register pair as one 64-bit access
++ * (named where the window is created): QEMU splits it into two 32-bit
++ * halves, and each half must be in the set like any other access. */
++static const MemoryRegionOps z63_regwindow_ops64 = {
++    .read = z63_regwindow_read,
++    .write = z63_regwindow_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 8 },
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void z63_regwindow_init_ops(Object *owner, MemoryRegion *sysmem,
++                                   Z63RegWindow *w, const char *name,
++                                   hwaddr base, unsigned size,
++                                   unsigned stride,
++                                   const uint16_t *offsets, size_t n,
++                                   const MemoryRegionOps *ops)
+ {
+     unsigned span = stride ? stride : size;
+ 
+@@ -155,10 +167,20 @@ static void z63_regwindow_init_strided(Object *owner, MemoryRegion *sysmem,
+         assert(offsets[i] < span && !(offsets[i] & 3));
+         set_bit(offsets[i] / 4, w->modelled);
+     }
+-    memory_region_init_io(&w->mr, owner, &z63_regwindow_ops, w, name, size);
++    memory_region_init_io(&w->mr, owner, ops, w, name, size);
+     memory_region_add_subregion(sysmem, base, &w->mr);
+ }
+ 
++static void z63_regwindow_init_strided(Object *owner, MemoryRegion *sysmem,
++                                       Z63RegWindow *w, const char *name,
++                                       hwaddr base, unsigned size,
++                                       unsigned stride,
++                                       const uint16_t *offsets, size_t n)
++{
++    z63_regwindow_init_ops(owner, sysmem, w, name, base, size, stride,
++                           offsets, n, &z63_regwindow_ops);
++}
++
+ static void z63_regwindow_init(Object *owner, MemoryRegion *sysmem,
+                                Z63RegWindow *w, const char *name,
+                                hwaddr base, unsigned size,
+diff --git a/hw/arm/nikon-z63-sensorif.h b/hw/arm/nikon-z63-sensorif.h
+index 9c8fc54..9a121b1 100644
+--- a/hw/arm/nikon-z63-sensorif.h
++++ b/hw/arm/nikon-z63-sensorif.h
+@@ -178,4 +178,48 @@ static const uint16_t z63_sensorif_status_offsets[] = {
+     0x0538,
+ };
+ 
++/*
++ * Device 0x190 -- the descriptor at 0xa0280d880, {0x190, 0x15081000,
++ * 0x15084000, 0x15085000} -- is served by sub_40C29DF8..sub_40C2B364 (the
++ * functions the HAL calls with [0xa030578f8]), and its bases are not this
++ * window's: +8 is 0x15081000 and +16 is 0x15084000. The harvest above took
++ * every [X0,#8] base for 0x15080000, so these functions' offsets landed
++ * one page low; they stay there (most are 0x18e's too), and the two lists
++ * below put them where device 0x190 actually writes. Found when live view
++ * restarted and sub_40C2A6BC wrote +0x268 of 0x15081000 (pc 0x40c2a708).
++ * Each is the union of z63-tools/handle_offsets.py (--field 8 / --field
++ * 16; the latter needed the hex/decimal fix in its handle pattern) and a
++ * branch-merging pass that also follows LDP X8, X9, [X0,#8] and pointers
++ * chosen per branch (sub_40C2A170: +16 base + 0x30 or +8 base + 0x250).
++ */
++/* Relative to 0x15081000 (descriptor +8). */
++static const uint16_t z63_sensorif_dev190_offsets[] = {
++    0x0000, 0x0004, 0x0010, 0x0014, 0x0018, 0x001c, 0x0020, 0x0024,
++    0x0028, 0x002c, 0x0030, 0x0034, 0x0038, 0x003c, 0x0040, 0x0044,
++    0x0048, 0x0064, 0x0068, 0x006c, 0x0070, 0x0074, 0x0078, 0x007c,
++    0x0080, 0x0084, 0x0088, 0x008c, 0x0090, 0x0094, 0x0098, 0x009c,
++    0x00c0, 0x00c4, 0x00c8, 0x00cc, 0x00d0, 0x00d4, 0x00d8, 0x00dc,
++    0x00f0, 0x00f4, 0x00fc, 0x0100, 0x0104, 0x0108, 0x010c, 0x0110,
++    0x0114, 0x0118, 0x011c, 0x0120, 0x0124, 0x0128, 0x0134, 0x0138,
++    0x013c, 0x0140, 0x0200, 0x021c, 0x0220, 0x0224, 0x0228, 0x022c,
++    0x0230, 0x0234, 0x0238, 0x023c, 0x0240, 0x0244, 0x0248, 0x024c,
++    0x0250, 0x0254, 0x0258, 0x025c, 0x0260, 0x0264, 0x0268, 0x026c,
++    0x0270, 0x0274, 0x0278, 0x027c, 0x0300, 0x0304, 0x0308, 0x030c,
++    0x0310, 0x0314, 0x0318, 0x031c, 0x0324, 0x0328, 0x032c, 0x0330,
++    0x0334, 0x0338, 0x035c, 0x0360, 0x0364, 0x0368, 0x036c, 0x0370,
++    0x0374, 0x0378, 0x037c, 0x0380, 0x0384, 0x0388, 0x038c, 0x03b8,
++    0x03bc, 0x03c0, 0x03c8, 0x03cc, 0x03f0, 0x03f4, 0x03f8, 0x03fc,
++    0x0420, 0x0424, 0x0428, 0x042c, 0x0450, 0x0454, 0x0458, 0x045c,
++    0x0480, 0x0484, 0x0488, 0x048c,
++};
++
++/* Relative to 0x15084000 (descriptor +16). */
++static const uint16_t z63_sensorif_dev190_bank1_offsets[] = {
++    0x0000, 0x0004, 0x0010, 0x0014, 0x0018, 0x001c, 0x0020, 0x0024,
++    0x0028, 0x002c, 0x0030, 0x0034, 0x0038, 0x003c, 0x0040, 0x0044,
++    0x0048, 0x004c, 0x0050, 0x0054, 0x0058, 0x005c, 0x00e0, 0x00e4,
++    0x00e8, 0x00ec, 0x00f0, 0x00f4, 0x00f8, 0x00fc, 0x0104, 0x0108,
++    0x010c, 0x0110, 0x0114, 0x0118, 0x013c, 0x0144,
++};
++
+ #endif /* HW_ARM_NIKON_Z63_SENSORIF_H */
+diff --git a/hw/arm/nikon-z63-tdec.h b/hw/arm/nikon-z63-tdec.h
+new file mode 100644
+index 0000000..0269048
+--- /dev/null
++++ b/hw/arm/nikon-z63-tdec.h
+@@ -0,0 +1,78 @@
++/*
++ * Nikon Z 6III -- the TDEC block at 0x15300000, and its second window at
++ * 0x15b00000.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Device 0x1fa, TENC's sibling (nikon-z63-tenc.h). Its init, sub_40C30394,
++ * builds the descriptor at 0xa02dc5a70 = {0x1fa, 0x15300000, 0x15b00000}
++ * and installs the handler sub_40C30400 on INTID 0x10c -- TDEC in this
++ * image's interrupt-name table (Z63_SPI_TDEC). Reached right after TENC
++ * when the live view restarts in movie mode: reset route 0x15 is pulsed
++ * (sub_40C30434) and sub_40C305D8 initialises the block (pc 0x40c305e4,
++ * +0x404). The driver, 0x40c30394-0x40c30a44, is TENC's almost line for
++ * line; what the pair does is not known, the names are the image's.
++ *
++ * The register set, from `eg2010_0200i1.bi` (md5
++ * b024ec7148e24ec0493e27d4d0f20b0e) read through `z63_eg.elf` (md5
++ * 0fedcc0523da1dac8127a8010ccf978b):
++ *
++ *   - 39 offsets from z63-tools/make_window.py (descriptor base at +8);
++ *   - added by hand: +0x120..+0x15c, +0x220..+0x25c, +0x320..+0x35c, the
++ *     loop-indexed address/high-nibble pairs of sub_40C307C0 (+ 32 * bank
++ *     + 8 * i); +0x500..+0x524, the two five-word groups the helper
++ *     sub_40C306C4 fills through a pointer (sub_40C3068C: +0x500,
++ *     sub_40C30720: +0x514); +0x400 and +0x414, read by sub_40C309CC;
++ *   - the second window, the descriptor's +0x10 base 0x15b00000: +0x38
++ *     (start), and what sub_40C308E8 writes and sub_40C309CC reads back:
++ *     +0x14 +0x1c +0x2c +0x3c +0x44 +0x48 +0x4c +0x58 +0x84 +0xa0..+0xac
++ *     +0x100 +0x11c +0x120.
++ *
++ * The handler reads +0x1c, writes it back (W1C; mask +0x18) and calls the
++ * client with "(status & 0x700) != 0", as TENC's does.
++ *
++ * What is a declared choice: storage throughout. The offsets the firmware
++ * only reads answer their reset value, 0; nothing here raises the
++ * interrupt or produces anything.
++ *
++ * An offset not in these sets still stops the machine with its PC.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_TDEC_H
++#define HW_ARM_NIKON_Z63_TDEC_H
++
++#define Z63_TDEC_BASE    0x15300000ULL
++#define Z63_TDEC_SIZE    0x1000
++#define Z63_TDEC2_BASE   0x15b00000ULL
++#define Z63_TDEC2_SIZE   0x1000
++
++static const uint16_t z63_tdec_offsets[] = {
++    0x0000, 0x0004, 0x0008, 0x000c, 0x0014, 0x0018, 0x001c, 0x0100,
++    0x0104, 0x0108, 0x010c, 0x0110, 0x0114, 0x0118,
++    0x0120, 0x0124, 0x0128, 0x012c, 0x0130, 0x0134, 0x0138, 0x013c,
++    0x0140, 0x0144, 0x0148, 0x014c, 0x0150, 0x0154, 0x0158, 0x015c,
++    0x0160, 0x0164, 0x0170, 0x0174, 0x0178, 0x017c,
++    0x0220, 0x0224, 0x0228, 0x022c, 0x0230, 0x0234, 0x0238, 0x023c,
++    0x0240, 0x0244, 0x0248, 0x024c, 0x0250, 0x0254, 0x0258, 0x025c,
++    0x0270, 0x0274, 0x0278, 0x027c,
++    0x0320, 0x0324, 0x0328, 0x032c, 0x0330, 0x0334, 0x0338, 0x033c,
++    0x0340, 0x0344, 0x0348, 0x034c, 0x0350, 0x0354, 0x0358, 0x035c,
++    0x0370, 0x0374, 0x0378, 0x037c, 0x0400, 0x0404, 0x0414,
++    0x0500, 0x0504, 0x0508, 0x050c, 0x0510,
++    0x0514, 0x0518, 0x051c, 0x0520, 0x0524, 0x0528, 0x052c,
++    0x0530, 0x0534, 0x0544, 0x0548, 0x054c, 0x0550, 0x0554, 0x0558,
++};
++
++/* Only ever read by the firmware -- the declared choice above. */
++static const uint16_t z63_tdec_status_offsets[] = {
++    0x0160, 0x0164, 0x0170, 0x0174, 0x0178, 0x017c, 0x0270, 0x0274,
++    0x0278, 0x027c, 0x0370, 0x0374, 0x0378, 0x037c, 0x0400, 0x0414,
++};
++
++static const uint16_t z63_tdec2_offsets[] = {
++    0x0014, 0x001c, 0x002c, 0x0038, 0x003c, 0x0044, 0x0048, 0x004c,
++    0x0058, 0x0084, 0x00a0, 0x00a4, 0x00a8, 0x00ac, 0x0100, 0x011c,
++    0x0120,
++};
++
++#endif /* HW_ARM_NIKON_Z63_TDEC_H */
+diff --git a/hw/arm/nikon-z63-tenc.h b/hw/arm/nikon-z63-tenc.h
+new file mode 100644
+index 0000000..600b4f4
+--- /dev/null
++++ b/hw/arm/nikon-z63-tenc.h
+@@ -0,0 +1,83 @@
++/*
++ * Nikon Z 6III -- the TENC block at 0x152c0000, and its second window at
++ * 0x15ac0000.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Device 0x1fb. Its init, sub_40C30B5C, builds the descriptor at
++ * 0xa02dc5a98 = {0x1fb, 0x152c0000, 0x15ac0000} and installs the handler
++ * sub_40C30BC8 on INTID 0x10b -- TENC in this image's interrupt-name table
++ * (Z63_SPI_TENC). It is reached once the live view restarts in movie mode:
++ * route 1 of the reset controller is pulsed (sub_40C30C24) and
++ * sub_40C30D60 initialises the block, the first access the board could not
++ * answer (pc 0x40c30d68). ../z9-qemu never reached it. What it encodes is
++ * not known; the name is the image's.
++ *
++ * The register set, from `eg2010_0200i1.bi` (md5
++ * b024ec7148e24ec0493e27d4d0f20b0e) read through `z63_eg.elf` (md5
++ * 0fedcc0523da1dac8127a8010ccf978b), the driver 0x40c30b5c-0x40c312bc:
++ *
++ *   - 41 offsets from z63-tools/make_window.py (descriptor base at +8);
++ *   - added by hand, because the driver computes them in loops that no
++ *     constant-offset scan sees: +0x120..+0x15c (sub_40C30F48, +0x120 +
++ *     32 * bank + 8 * i, address/high-nibble pairs), +0x220..+0x25c (+0x220
++ *     + 32 * bank + 8 * i) and +0x320..+0x35c (the same + 0x100); and
++ *     +0x500..+0x510, +0x514..+0x524, the two five-word groups the helper
++ *     sub_40C30E50 fills through a pointer its callers compute
++ *     (sub_40C30E18: base + 0x500, sub_40C30EAC: base + 0x514);
++ *   - the second window, the descriptor's +0x10 base 0x15ac0000:
++ *     +0x38 (sub_40C30DA8 / sub_40C30DD4, written 1 at start) and
++ *     +0x14..+0xb4 (sub_40C31074; +0x50 is written once per word of a
++ *     table, a FIFO-shaped port).
++ *
++ * The handler reads +0x1c, writes the value back (W1C, the mask is +0x18,
++ * written 0x7ff at init and 0 at reset) and calls the client with
++ * "(status & 0x700) != 0". Start is sub_40C30DA8: second window +0x38 = 1,
++ * +0x404 = 1, +0x14 = 1, +0x404 = 0, +0x8 = 0 then 1.
++ *
++ * What is a declared choice: storage throughout. The offsets the firmware
++ * only reads (below) answer their reset value, 0; nothing here raises the
++ * interrupt or produces anything, so a client waiting on TENC's
++ * completion will wait, and that is the next thing to find.
++ *
++ * An offset not in these sets still stops the machine with its PC.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_TENC_H
++#define HW_ARM_NIKON_Z63_TENC_H
++
++#define Z63_TENC_BASE    0x152c0000ULL
++#define Z63_TENC_SIZE    0x1000
++#define Z63_TENC2_BASE   0x15ac0000ULL
++#define Z63_TENC2_SIZE   0x1000
++
++static const uint16_t z63_tenc_offsets[] = {
++    0x0000, 0x0004, 0x0008, 0x000c, 0x0014, 0x0018, 0x001c, 0x0100,
++    0x0104, 0x0108, 0x010c, 0x0110, 0x0114, 0x0118,
++    0x0120, 0x0124, 0x0128, 0x012c, 0x0130, 0x0134, 0x0138, 0x013c,
++    0x0140, 0x0144, 0x0148, 0x014c, 0x0150, 0x0154, 0x0158, 0x015c,
++    0x0160, 0x0164, 0x0170, 0x0174, 0x0178, 0x017c, 0x0184,
++    0x0220, 0x0224, 0x0228, 0x022c, 0x0230, 0x0234, 0x0238, 0x023c,
++    0x0240, 0x0244, 0x0248, 0x024c, 0x0250, 0x0254, 0x0258, 0x025c,
++    0x0270, 0x0274, 0x0278, 0x027c,
++    0x0320, 0x0324, 0x0328, 0x032c, 0x0330, 0x0334, 0x0338, 0x033c,
++    0x0340, 0x0344, 0x0348, 0x034c, 0x0350, 0x0354, 0x0358, 0x035c,
++    0x0370, 0x0374, 0x0378, 0x037c, 0x0404,
++    0x0500, 0x0504, 0x0508, 0x050c, 0x0510,
++    0x0514, 0x0518, 0x051c, 0x0520, 0x0524, 0x0528, 0x052c,
++    0x0530, 0x0534, 0x0538, 0x053c, 0x0540, 0x0544, 0x0548, 0x054c,
++    0x0550,
++};
++
++/* Only ever read by the firmware -- the declared choice above. */
++static const uint16_t z63_tenc_status_offsets[] = {
++    0x0160, 0x0164, 0x0170, 0x0174, 0x0178, 0x017c, 0x0270, 0x0274,
++    0x0278, 0x027c, 0x0370, 0x0374, 0x0378, 0x037c,
++};
++
++static const uint16_t z63_tenc2_offsets[] = {
++    0x0014, 0x001c, 0x002c, 0x0038, 0x003c, 0x0044, 0x0048, 0x004c,
++    0x0050, 0x00a0, 0x00a4, 0x00a8, 0x00ac, 0x00b0, 0x00b4,
++};
++
++#endif /* HW_ARM_NIKON_Z63_TENC_H */
+diff --git a/hw/arm/nikon-z63-yuvcomp.h b/hw/arm/nikon-z63-yuvcomp.h
+new file mode 100644
+index 0000000..2bc2c61
+--- /dev/null
++++ b/hw/arm/nikon-z63-yuvcomp.h
+@@ -0,0 +1,102 @@
++/*
++ * Nikon Z 6III -- the YUV compressor at 0x15648000 and the codec
++ * decompressor at 0x15660000.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * One driver, 0x40c71ac4-0x40c75178, serves both. Its init sub_40C71AC4
++ * registers devices 0x1f2..0x1f6 (descriptors 0xa0280f1c8.., no base in
++ * them) and one handler, sub_40C71B74, on INTIDs 0x75 and 0x77 -- YUV_COMP
++ * and CODEC_DECOMP in this image's interrupt-name table. The bases are
++ * materialised in the code and in three per-device tables of register
++ * addresses at 0x4185b620 (+0x00), 0x4185b648 (+0x70) and 0x4185b688
++ * (+0x20): devices 0x1f2/0x1f3 are the 0x15648000 block, 0x1f4..0x1f6 the
++ * 0x15660000 one. Reached when the live view restarts in movie mode, after
++ * TENC and TDEC: sub_40C74D70 sets bit 0 of +0x00 (pc 0x40c74d94).
++ *
++ * The register set, from `eg2010_0200i1.bi` (md5
++ * b024ec7148e24ec0493e27d4d0f20b0e) read through `z63_eg.elf` (md5
++ * 0fedcc0523da1dac8127a8010ccf978b). Both blocks are driven by the same
++ * code with the base chosen per device -- sub_40C71E68 switches on the
++ * device id and builds a different base in each case before a shared
++ * body -- so one layout is applied to both:
++ *
++ *   +0x00  enable (bit 0, RMW)            +0x10  written
++ *   +0x20  status, read by the handler    +0x28  cause, read with it
++ *   +0x50  state word                     +0x58  36-bit address, read as
++ *   +0x64  read                                  one 64-bit load (+0x5c)
++ *   +0x70  start (bit 0 set, RMW)
++ *   +0x1000 + 0x400 * k, k = 0..3: +0x00 +0x04 +0x08 +0x0c +0x20, and two
++ *   sub-units at +0x200 and +0x300, each +0x00 +0x18 +0x1c +0x20 +0x28 +0x2c
++ *   +0x30 +0x40 +0x44 +0x48 +0x4c +0x64 +0x68 +0x7c and eight 36-bit
++ *   addresses at +0x80..+0xbf
++ *
++ * Extracted by following the MOV/MOVK-built bases, and pointers ADDed to
++ * them, to every load and store through them; the groups were seen at
++ * k = 0..3 in the 0x15660000 block and k = 2, 3 in the 0x15648000 one,
++ * whose k = 0, 1 copies the same code reaches through the other switch
++ * cases (0x1564900c.. for device 0x1f2, 0x1564980c.. for 0x1f3).
++ *
++ * The +0x58 load (0x40c74ef4) and the address registers are 64-bit
++ * accesses, so these windows take them as two 32-bit halves, each checked
++ * against the set.
++ *
++ * What is a declared choice: storage throughout. Status, cause and state
++ * read their reset value, 0 -- idle, nothing pending; nothing here
++ * compresses, decompresses or interrupts.
++ *
++ * An offset not in this set still stops the machine with its PC.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_YUVCOMP_H
++#define HW_ARM_NIKON_Z63_YUVCOMP_H
++
++#define Z63_YUVCOMP_BASE     0x15648000ULL
++#define Z63_CODECDEC_BASE    0x15660000ULL
++#define Z63_YUVCOMP_SIZE     0x2000
++
++static const uint16_t z63_yuvcomp_top[] = {
++    0x000, 0x010, 0x020, 0x028, 0x050, 0x058, 0x05c, 0x064, 0x070,
++};
++static const uint16_t z63_yuvcomp_group[] = {
++    0x000, 0x004, 0x008, 0x00c, 0x020,
++};
++static const uint16_t z63_yuvcomp_sub[] = {
++    0x00, 0x18, 0x1c, 0x20, 0x28, 0x2c, 0x30, 0x40, 0x44, 0x48, 0x4c,
++    0x64, 0x68, 0x7c,
++    /* eight 36-bit addresses, each read-modify-written as one 64-bit
++     * access (sub_40C738AC: 0x40c73954.., through ADD Xn, X8, #0x274..) */
++    0x80, 0x84, 0x88, 0x8c, 0x90, 0x94, 0x98, 0x9c,
++    0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc,
++};
++
++/* The full offset list for one block, built from the three pieces. */
++static size_t z63_yuvcomp_offsets(uint16_t *out, size_t max)
++{
++    size_t n = 0;
++
++    for (size_t i = 0; i < ARRAY_SIZE(z63_yuvcomp_top) && n < max; i++) {
++        out[n++] = z63_yuvcomp_top[i];
++    }
++    for (unsigned k = 0; k < 4; k++) {
++        unsigned g = 0x1000 + 0x400 * k;
++
++        for (size_t i = 0; i < ARRAY_SIZE(z63_yuvcomp_group) && n < max;
++             i++) {
++            out[n++] = g + z63_yuvcomp_group[i];
++        }
++        for (unsigned u = 0x200; u <= 0x300; u += 0x100) {
++            for (size_t i = 0; i < ARRAY_SIZE(z63_yuvcomp_sub) && n < max;
++                 i++) {
++                out[n++] = g + u + z63_yuvcomp_sub[i];
++            }
++        }
++    }
++    return n;
++}
++
++#define Z63_YUVCOMP_NOFFS (ARRAY_SIZE(z63_yuvcomp_top) + 4 * \
++                           (ARRAY_SIZE(z63_yuvcomp_group) + \
++                            2 * ARRAY_SIZE(z63_yuvcomp_sub)))
++
++#endif /* HW_ARM_NIKON_Z63_YUVCOMP_H */
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 174c562..8ba5981 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -607,6 +607,9 @@ static uint64_t z63_current_pc(void);
+ #include "hw/arm/nikon-z63-wlsd.h"
+ #include "hw/arm/nikon-z63-stream154c.h"
+ #include "hw/arm/nikon-z63-dev199.h"
++#include "hw/arm/nikon-z63-tenc.h"
++#include "hw/arm/nikon-z63-tdec.h"
++#include "hw/arm/nikon-z63-yuvcomp.h"
+ #include "hw/arm/nikon-z63-ispfam.h"
+ 
+ typedef struct NikonZ63State NikonZ63State;
+@@ -734,6 +737,9 @@ typedef struct NikonZ63State {
+     Z63RegWindow top_sel;      /* TOP +0x500 */
+     Z63RegWindow stream154c;   /* nikon-z63-stream154c.h */
+     Z63RegWindow dev199;       /* nikon-z63-dev199.h */
++    Z63RegWindow tenc, tenc2;  /* nikon-z63-tenc.h */
++    Z63RegWindow tdec, tdec2;  /* nikon-z63-tdec.h */
++    Z63RegWindow yuvcomp, codecdec; /* nikon-z63-yuvcomp.h */
+     Z63RegWindow ispfam[17];   /* nikon-z63-ispfam.h */
+ 
+     Z63RegWindow aux;
+@@ -2974,8 +2980,11 @@ static void z63_release_write(void *opaque, hwaddr offset, uint64_t value,
+     if (win == 1) {
+         /* Writing a core bit in the set window holds that core in reset.
+          * No image path does it and the model does not implement it, so
+-         * report rather than silently swallow it. */
+-        if (value & UINT64_C(0x0e)) {
++         * report rather than silently swallow it. The core bits are bits
++         * 1..3 of the offset-4 word only: the same bits of words 0 and 2
++         * are other routes of the table at 0x4184BD5C (word 0 bit 1 is
++         * route 1), which are latched like every other route. */
++        if (idx == 1 && (value & UINT64_C(0x0e))) {
+             error_report("Z63_RESET: core reset asserted with 0x%" PRIx64
+                          " at +0x%" PRIx64 " -- not modelled, stopping",
+                          value, (uint64_t)offset);
+@@ -4142,10 +4151,25 @@ static void z63_init(MachineState *machine)
+     /* Two blocks whose register sets were read out of the firmware; see
+      * nikon-z63-regwindow.h for the contract and each header for the
+      * evidence behind its offset set. */
+-    z63_regwindow_init(OBJECT(machine), sysmem, &s->sensorif, "SENSOR-IF",
+-                       Z63_SENSORIF_BASE, Z63_SENSORIF_SIZE,
+-                       z63_sensorif_offsets,
+-                       ARRAY_SIZE(z63_sensorif_offsets));
++    {
++        /* The harvested set plus device 0x190's two pages (the comment
++         * above z63_sensorif_dev190_offsets). */
++        size_t n0 = ARRAY_SIZE(z63_sensorif_offsets);
++        size_t n1 = ARRAY_SIZE(z63_sensorif_dev190_offsets);
++        size_t n2 = ARRAY_SIZE(z63_sensorif_dev190_bank1_offsets);
++        g_autofree uint16_t *offs = g_new(uint16_t, n0 + n1 + n2);
++
++        memcpy(offs, z63_sensorif_offsets, sizeof(z63_sensorif_offsets));
++        for (size_t i = 0; i < n1; i++) {
++            offs[n0 + i] = 0x1000 + z63_sensorif_dev190_offsets[i];
++        }
++        for (size_t i = 0; i < n2; i++) {
++            offs[n0 + n1 + i] = 0x4000 + z63_sensorif_dev190_bank1_offsets[i];
++        }
++        z63_regwindow_init(OBJECT(machine), sysmem, &s->sensorif,
++                           "SENSOR-IF", Z63_SENSORIF_BASE, Z63_SENSORIF_SIZE,
++                           offs, n0 + n1 + n2);
++    }
+     z63_regwindow_init(OBJECT(machine), sysmem, &s->isp_apb_1a0,
+                        "ISP-APB-DEV-0x1A0", Z63_ISP_APB_1A0_BASE,
+                        Z63_ISP_APB_DEV_SIZE, z63_isp_apb_offsets,
+@@ -4201,6 +4225,33 @@ static void z63_init(MachineState *machine)
+                                "STREAM154C", Z63_STRM_BASE, Z63_STRM_SIZE,
+                                Z63_STRM_STRIDE, z63_strm_offsets,
+                                ARRAY_SIZE(z63_strm_offsets));
++    z63_regwindow_init(OBJECT(machine), sysmem, &s->tenc, "TENC",
++                       Z63_TENC_BASE, Z63_TENC_SIZE, z63_tenc_offsets,
++                       ARRAY_SIZE(z63_tenc_offsets));
++    z63_regwindow_init(OBJECT(machine), sysmem, &s->tenc2, "TENC-2",
++                       Z63_TENC2_BASE, Z63_TENC2_SIZE, z63_tenc2_offsets,
++                       ARRAY_SIZE(z63_tenc2_offsets));
++    z63_regwindow_init(OBJECT(machine), sysmem, &s->tdec, "TDEC",
++                       Z63_TDEC_BASE, Z63_TDEC_SIZE, z63_tdec_offsets,
++                       ARRAY_SIZE(z63_tdec_offsets));
++    z63_regwindow_init(OBJECT(machine), sysmem, &s->tdec2, "TDEC-2",
++                       Z63_TDEC2_BASE, Z63_TDEC2_SIZE, z63_tdec2_offsets,
++                       ARRAY_SIZE(z63_tdec2_offsets));
++    {
++        /* One layout for both blocks; +0x58 is read as one 64-bit load
++         * (0x40c74ef4), hence the 64-bit-capable ops. */
++        uint16_t offs[Z63_YUVCOMP_NOFFS];
++        size_t n = z63_yuvcomp_offsets(offs, ARRAY_SIZE(offs));
++
++        z63_regwindow_init_ops(OBJECT(machine), sysmem, &s->yuvcomp,
++                               "YUV-COMP", Z63_YUVCOMP_BASE,
++                               Z63_YUVCOMP_SIZE, 0, offs, n,
++                               &z63_regwindow_ops64);
++        z63_regwindow_init_ops(OBJECT(machine), sysmem, &s->codecdec,
++                               "CODEC-DECOMP", Z63_CODECDEC_BASE,
++                               Z63_YUVCOMP_SIZE, 0, offs, n,
++                               &z63_regwindow_ops64);
++    }
+ 
+     /* Display complex (see docs/display-registers.md). */
+     z63_display_init(OBJECT(machine), sysmem, s->gic, &s->display);
+diff --git a/z63-tools/handle_offsets.py b/z63-tools/handle_offsets.py
+index 843487d..3288629 100644
+--- a/z63-tools/handle_offsets.py
++++ b/z63-tools/handle_offsets.py
+@@ -187,7 +187,9 @@ print(f"{len(fns)} functions, {len(multi)} with branches, "
+       f"{sum(len(v) for v in succ.values())} edges")
+ 
+ IMM = r'#(-?0x[0-9A-Fa-f]+|-?\d+)'
+-re_handle = re.compile(r'^LDR\s+(X\d+),\s*\[(X\d+),#%d\]$' % field)
++# IDA prints small offsets in decimal and larger ones in hex (#8, #0x10).
++re_handle = re.compile(r'^LDR\s+(X\d+),\s*\[(X\d+),#(?:%d|0x%X)\]$'
++                       % (field, field))
+ re_mov_r  = re.compile(r'^MOV\s+([WX]\d+),\s*([WX]\d+)$')
+ re_mov_i  = re.compile(r'^(?:MOV|MOVZ)\s+([WX]\d+),\s*' + IMM + r'$')
+ re_movk   = re.compile(r'^MOVK\s+([WX]\d+),\s*' + IMM + r'(?:,LSL#(\d+))?$')
+-- 
+2.55.0
+

@@ -1,0 +1,524 @@
+From cf35437fbcc39dac3786ec48515cc8d62bc81b8b Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 01:50:09 +0000
+Subject: [PATCH 09/47] Z 6III: the sensor streams -- live view starts and runs
+ frame by frame
+
+CaptureSequence powers the sensor and gives the front end 1 s to report
+ready (CSEQEV10 bit 3, else error 0x1EA7). Four things stood between them:
+
+- The battery data line. The MCU's fuel-gauge task polls PD13 and only
+  talks to the battery after reading it high; the floating 0 made it give
+  up after 300 polls (~2.8 s), and only then did the power report (family
+  4 kind 3) reach the EXPEED, whose start sequence waits for it before it
+  asks for live view. mcu-pins now defaults to D13=1, the line's idle
+  level; FrontEnd's mode-1 start moves from ~4 s to ~1.3 s.
+- Engine 0x150c's start acknowledgement. The job thread waits, for jobs
+  that enable engine bit 1, for +0x24c bits 5 and 6 on INTID 0x107 before
+  it tells FrontEnd 0x41D0001, which FrontEnd's 400 ms wait needs.
+  ../z9-qemu models that bank for its Zr profile (zr-primary-bank1-model);
+  the attachment section wires it on this board and raises the two bits
+  when engine bit 1 becomes active. They cannot be frame events: the
+  sensor is only started after the ready report this unblocks.
+- The sensor's control port: SIO instance 8 (logical channel 6), register
+  writes as 0x81/address/data, each transfer waited on. Attached as a
+  write-only sink (default sio-sink=9:8); its read command 0x82 is used
+  only by adjustment handlers not reached.
+- SDES channel words: event1508-aux-config-model (retention of +0/+4/+8/
+  +0xc) and event1508-aux-status-input of zeros (error status reads "no
+  error") join the defaults.
+
+With these, CSEQ starts the SDES channel (sub_40C29DF8 -> IF +0x10), the
+z9 frame-timing model streams, the sensor-IF interrupt fires every ~35 ms,
+the sensor module and CSEQ log every frame, and engine 0x150c takes a
+statistics job whose first frame the statistics model fills.
+
+The error dialog that remains on the original body is not this path: the
+first sensor power-up checks the version bytes of the sensor parameter
+record (record 0x63, +0x117ab4), which the RAM-derived SNOR_USER body
+holds as zeros (as it holds most of that record), and reports error 0x45.
+z63-tools/snor_user_sensor_version.py writes a copy with a declared
+version (0x160). gdb_probe/mcu_probe LIGHT lines carry host seconds;
+mcu_probe gains MEMR=r:n.
+
+Still to do: the display shows nothing over live view yet (the GUI draws
+no shooting screen once live view runs; the image pipeline has no output).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-sio.h                |  3 +-
+ hw/arm/nikon-z63-z9lab.c              | 54 +++++++++++++++++++++++
+ hw/arm/nikon-z63-z9lab.h              | 19 +++++++-
+ hw/arm/nikon-z63.c                    | 31 ++++++++++++--
+ z63-tools/gdb_probe.py                |  9 ++--
+ z63-tools/gui.sh                      |  9 +++-
+ z63-tools/mcu_probe.py                | 15 +++++--
+ z63-tools/snor_user_sensor_version.py | 62 +++++++++++++++++++++++++++
+ z63-tools/z9lab_attach.c.in           | 54 +++++++++++++++++++++++
+ 9 files changed, 240 insertions(+), 16 deletions(-)
+ create mode 100755 z63-tools/snor_user_sensor_version.py
+
+diff --git a/hw/arm/nikon-z63-sio.h b/hw/arm/nikon-z63-sio.h
+index 3650ba8..fe03f75 100644
+--- a/hw/arm/nikon-z63-sio.h
++++ b/hw/arm/nikon-z63-sio.h
+@@ -70,7 +70,8 @@
+  * panel accepted anything; a driver that read the RX word as data would be
+  * reading an invented zero, which is why sinks are only attached where the
+  * request has been checked to be write-only (-machine sio-sink=, default
+- * "9", several as "9:7"; an empty list attaches none).
++ * "9:8" -- 8 is the image sensor's control port, see nikon-z63.c -- several
++ * as "9:8:7"; an empty list attaches none).
+  */
+ 
+ #ifndef HW_ARM_NIKON_Z63_SIO_H
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index 49229a1..7b18cfa 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -14161,6 +14161,7 @@ type_init(nikon_z9_register_types)
+  *   0xfe/0xff/0x101/0x102/0x104 SIF_0/1/3/4/6  the 0x1508 event block
+  *   0x134 MVD     engine1524 MVD
+  *   0x9b..0xa4 TIMER_0..9  the multi-IO timer block (multi-io-counter-model)
++ *   0x107 PPC_1   engine150c's second status bank (zr-primary-bank1-model)
+  *
+  * Switches the Z 9 profile has that belong to blocks this board models
+  * itself are refused: the display (engine1548-*), graphics, NOR, NAND,
+@@ -14218,6 +14219,46 @@ static void z63_z9lab_boundary_tick(void *opaque)
+     timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + b->period_ns);
+ }
+ 
++/*
++ * Engine 0x150c's start acknowledgement. ../z9-qemu models the engine's
++ * second status bank -- +0x24c, mask +0x248, W1C, on INTID 0x107 -- for its
++ * Zr profile only, fed from outside (zr-primary-bank1-input). This image
++ * uses the same bank the same way: its 0x107 handler sub_40C1FAD4 reads and
++ * acknowledges +0x24c/+0x258/+0x264, and the callback sub_40CAE850
++ * accumulates +0x24c bits 5 and 6 and, once both have been seen, sets flag
++ * 0x10 of the engine's event object 0xA03051B60. The job thread
++ * (sub_40CADFD0) starts the engine (sub_40CAF2E4: +0x64, then +0x08) and,
++ * when the job enables engine bit 1, waits for that flag before it calls
++ * the start callback (0xA03051B88 = sub_410AC0E8, 0x422D0001), which tells
++ * FrontEnd 0x41D0001; FrontEnd sets 0xA04072F10 bit 2, which its mode-1
++ * start (sub_41031258) waits 400 ms for before it reports the front end
++ * ready to CaptureSequence (CSEQEV10 bit 3).
++ *
++ * What the two bits are is read from where the firmware needs them, not
++ * from a register description: CaptureSequence only starts the sensor
++ * streaming (sub_41166E50 -> the SDES channel start sub_40C29DF8, which
++ * sets the sensor interface's +0x10) after that ready report, so the bits
++ * cannot be frame events from the sensor. They are treated as the engine
++ * acknowledging the start of its primary path: raised once each time
++ * engine bit 1 becomes active (z9 model state engine150c_active), through
++ * the Zr model's own pending/mask/W1C, which then behaves as ../z9-qemu
++ * wrote it. The firmware programs +0x248 = 0x70 before the first start.
++ */
++static void z63_z9lab_150c_started(NikonZ9State *s)
++{
++    static bool named;
++
++    s->zr_primary_bank1_pending |= 0x60;
++    s->zr_primary_bank1_inputs++;
++    zr_primary_bank1_irq_update(s);
++    if (!named) {
++        named = true;
++        fprintf(stderr, "Z63_150C: primary path started; start acknowledged "
++                "(+0x24c bits 5,6, mask 0x%x, INTID 0x107) -- see "
++                "z9lab_attach.c.in\n", s->engine_150c_init[0x248 / 4]);
++    }
++}
++
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                       const char *props, Error **errp);
+ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size,
+@@ -14289,6 +14330,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         timer_mod(s->raw_pipeline_timer,
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
+     }
++    if (s->zr_primary_bank1_model) {
++        if (!s->engine150c_stop_model) {
++            error_setg(errp, "z9-capture: zr-primary-bank1-model needs "
++                       "engine150c-stop-model");
++            goto fail;
++        }
++        s->zr_primary_bank1_irq = qdev_get_gpio_in(gic, 0x107 - 32);
++    }
+     s->event_aux0_irq = qdev_get_gpio_in(gic, 0x102 - 32);
+     s->event_aux1_irq = qdev_get_gpio_in(gic, 0x104 - 32);
+     s->event_channel_irq = qdev_get_gpio_in(gic, 0xfe - 32);
+@@ -14348,9 +14397,14 @@ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size, uint64_t *value)
+ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+ {
+     NikonZ9State *s = NIKON_Z9_LAB(obj);
++    uint32_t was = s->engine150c_active;
+ 
+     s->compat_miss = false;
+     unknown_write(s, addr, value, size);
++    if (addr == 0x150c0008 && s->zr_primary_bank1_model &&
++        (s->engine150c_active & ~was & 2)) {
++        z63_z9lab_150c_started(s);
++    }
+     return !s->compat_miss;
+ }
+ 
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index 4d9bad4..a180783 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -36,8 +36,20 @@
+  * for blocks this board models itself (the attachment refuses those; see
+  * the end of nikon-z63-z9lab.c), plus z63-boundary-ms=33: the periodic
+  * frame-boundary input ../z9-qemu's run loop delivered from outside (its
+- * tools/z9_global1_boundary_input.py), done here by a timer. -machine z9-capture-props= replaces the
+- * list (items separated by ';'). The statistics and RAW models need an
++ * tools/z9_global1_boundary_input.py), done here by a timer. Two switches
++ * the Z 9 profile leaves off are on here, because this image reaches what
++ * they model: zr-primary-bank1-model, engine 0x150c's second status bank
++ * on INTID 0x107, which the front-end start waits on (the start
++ * acknowledgement in nikon-z63-z9lab.c's attachment section explains what
++ * raises it); and event1508-aux-config-model, plain retention of the SDES
++ * channel words +0/+4/+8/+0xc in both banks, which live-view start writes
++ * read-modify-write (sub_40C2ADEC: bank 1 +0 = 0x10001) and which nothing
++ * else on the board answers. And one input: event1508-aux-status-input
++ * with eight zero words, which makes the SDES error-status words (+0x24,
++ * +0x110, +0x118, +0x11c of both banks; W1C) readable as "no error" --
++ * the link to the virtual sensor is healthy -- instead of not answering;
++ * live-view start reads bank 1 +0x24 (sub_40C2B218). -machine
++ * z9-capture-props= replaces the list (items separated by ';'). The statistics and RAW models need an
+  * NZ9RAW1 Bayer file: -machine z9-capture-raw=<path>; z63-tools/make_raw.py
+  * writes a synthetic one. That picture is an input chosen for the run, not
+  * anything the camera's sensor produces.
+@@ -60,6 +72,8 @@ static const char z63_z9lab_default_props[] =
+     "engine150c-control-model=on;"
+     "event1508-front-model=on;"
+     "event1508-aux-model=on;"
++    "event1508-aux-config-model=on;"
++    "event1508-aux-status-input=0:0:0:0:0:0:0:0;"
+     "event1508-channel-model=on;"
+     "event1508-timing-model=on;"
+     "event1508-timing-period-ns=33333333;"
+@@ -90,6 +104,7 @@ static const char z63_z9lab_default_props[] =
+     "raw-pipeline-model=on;"
+     "engine150d-control-model=on;"
+     "engine150c-stop-model=on;"
++    "zr-primary-bank1-model=on;"
+     "statistics-model=on;"
+     "primary-empty-end-model=on;"
+     "engine150c-bit6-model=on;"
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 486c73f..b617eed 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -4576,7 +4576,29 @@ static void z63_machine_instance_init(Object *obj)
+     s->mcu_wires = g_strdup("B12=a3:2+E3=a3:3+D12=a4:3+G6=a4:7"
+                             "+F4=a3:12+D7=a3:7");
+     s->mcu_spi_peer = g_strdup("1:0+4:1");    /* see Z63McuSpiLink */
+-    s->sio_sink = g_strdup("9"); /* the rear panel; nikon-z63-sio.h */
++    /* The battery's data line idles high (a pulled-up single-wire bus).
++     * The MCU's fuel-gauge task (sub_80266A0, event 0x2000 -> sub_80258E8)
++     * polls PD13 (pin descriptor at 0x2001A878) every ~10 ms and talks to
++     * the battery only after it has read 1 several times in a row; reading
++     * the floating 0 instead, it gives up after 300 polls, ~2.8 s, and only
++     * then sends the power report (family 4 kind 3) that the EXPEED's start
++     * sequence waits for before it asks for live view. That is long past the
++     * 1 s CaptureSequence gives the front end after powering the sensor
++     * (error 0x1EA7). Nothing answers on the line itself; what the battery
++     * would say is a separate matter. Overridable with mcu-pins=. */
++    s->mcu_pins = g_strdup("D13=1");
++    /* Write-only serial devices (nikon-z63-sio.h): 9 is the rear panel;
++     * 8 is the image sensor's control port -- logical serial channel 6
++     * (sub_4115B8FC: sub_40C0040C(6)), chip select on the GPIO behind
++     * resource 69. Every register write goes through sub_4115BBB8 with no
++     * receive buffer: command 0x81, a 16-bit register address, then data
++     * bytes, one per 16-bit word. Live-view start (sub_41167A48) sends such
++     * packets and waits on each transfer, so unclocked it stopped at its
++     * first one. The port also has a read command, 0x82 (sub_4115BD14,
++     * from sub_4116D150), used by the sensor module's adjustment messages
++     * (sub_4115E420) and not on any path reached so far; a sink would answer
++     * it with zeros, which is the declared limit of this choice. */
++    s->sio_sink = g_strdup("9:8");
+     s->storage_caps_stub = true; /* nikon-z63-storage.h, declared values */
+     s->soc_chip_id = Z63_SOC_CHIP_ID_DEFAULT;
+ }
+@@ -5170,8 +5192,8 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+     object_class_property_set_description(oc, "sio-sink",
+         "Serial-bus instances to clock as write-only devices, separated by "
+         "colons: each word sent is logged and a zero word comes back. "
+-        "Default \"9\", the rear panel's; empty attaches none. See "
+-        "nikon-z63-sio.h.");
++        "Default \"9:8\", the rear panel's and the image sensor's control "
++        "port; empty attaches none. See nikon-z63-sio.h.");
+     object_class_property_add_bool(oc, "storage-caps-stub",
+                                    z63_prop_get_storage_caps_stub,
+                                    z63_prop_set_storage_caps_stub);
+@@ -5209,7 +5231,8 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+     object_class_property_set_description(oc, "mcu-pins",
+         "\"G7=1,C5=0\": levels to drive on the real MCU's own input pins at "
+         "reset, standing in for the wires the EXPEED holds. Only meaningful "
+-        "with mcu-image=. See nikon-z63-stm32.h.");
++        "with mcu-image=. Default \"D13=1\" (the battery data line's idle "
++        "level); a value replaces it. See nikon-z63-stm32.h.");
+     object_class_property_add_str(oc, "mcu-wires", z63_prop_get_mcu_wires,
+                                   z63_prop_set_mcu_wires);
+     object_class_property_set_description(oc, "mcu-wires",
+diff --git a/z63-tools/gdb_probe.py b/z63-tools/gdb_probe.py
+index 3487b02..2499281 100755
+--- a/z63-tools/gdb_probe.py
++++ b/z63-tools/gdb_probe.py
+@@ -8,7 +8,8 @@ on /tmp/bt-qmp.sock while it runs. Environment:
+ 
+   COND=r=v     report only hits with x<r> == v (others are stepped over)
+   SKIP=r=v:v   step over hits with x<r> equal to any listed value
+-  LIGHT=1      one line per hit: pc, x0..x3, lr -- for tracing a function's
++  LIGHT=1      one line per hit: host seconds since the start, pc, x0..x3,
++               lr -- for tracing a function's
+                every call, e.g. the capture modules' trace sub_40FD183C
+                (x0 category, x1 code, x2/x3 arguments)
+   MEMREG=r:n   also dump n bytes at the address in x<r>
+@@ -99,7 +100,8 @@ if KEYS:
+             while time.time() - t0 < float(delay): time.sleep(0.2)
+             print("inject", keys, qc("qom-set", path="/machine", property="mcu-keys", value=keys), flush=True)
+     threading.Thread(target=inject, daemon=True).start()
+-deadline = time.time() + float(secs)
++t_start = time.time()
++deadline = t_start + float(secs)
+ hits = 0
+ while time.time() < deadline and hits < maxhits:
+     try:
+@@ -118,7 +120,8 @@ while time.time() < deadline and hits < maxhits:
+         r.send(b"c")
+         continue
+     if os.environ.get("LIGHT"):
+-        print("T %x %x %x %x %x lr=%x" % (pc, regs[0], regs[1], regs[2], regs[3], regs[30]), flush=True)
++        print("T %.3f %x %x %x %x %x lr=%x" % (time.time() - t_start, pc, regs[0],
++              regs[1], regs[2], regs[3], regs[30]), flush=True)
+         hits += 1
+         for a in addrs:
+             r.cmd("z1,%x,4" % a)
+diff --git a/z63-tools/gui.sh b/z63-tools/gui.sh
+index 52949bf..7d1a3a9 100755
+--- a/z63-tools/gui.sh
++++ b/z63-tools/gui.sh
+@@ -14,7 +14,8 @@
+ # CPU and QEMU sizes its TCG context array from max_cpus -- which this
+ # script supplies automatically. MCU_PINS=G7=1:C5=0 drives the MCU's own
+ # input pins, standing in for the wires the EXPEED holds; the separator is
+-# ":" because "," separates -machine properties.
++# ":" because "," separates -machine properties. It replaces the default,
++# D13=1 (the battery data line idling high), so keep D13=1 in the list.
+ #
+ # MCU_SPI_PEER bridges the MCU's SPI<n> to this board's serial instance
+ # <m>, which is the link between the two chips (nikon-z63-sio.h). The
+@@ -43,7 +44,11 @@
+ # (OK), M (MENU), P (playback), Backspace (delete), H (half-press), Space
+ # (full press), D (DISP), F1-F3 (Fn), R (movie), A (AF-ON). With the
+ # original SNOR_USER body the camera shows Err (a fault saved in that dump);
+-# z63-tools/snor_user_clear_error.py writes a copy without it.
++# z63-tools/snor_user_clear_error.py writes a copy without it. The dump also
++# lacks the image sensor's parameter record (zero pages), so the first sensor
++# power-up fails its version check and the camera shows "Error. Turn the
++# camera off and then on again"; z63-tools/snor_user_sensor_version.py writes
++# a copy with a declared version in place (run it on the cleared copy).
+ #
+ # The window stays blank until the firmware programs the display controller:
+ # nikon-z63-scanout.h refuses to compose a frame from a register file that
+diff --git a/z63-tools/mcu_probe.py b/z63-tools/mcu_probe.py
+index 6a1e21c..96dda69 100755
+--- a/z63-tools/mcu_probe.py
++++ b/z63-tools/mcu_probe.py
+@@ -16,7 +16,8 @@ the application (odd, 0x08020000..0x08060000). The machine is paused while
+ the script is attached, and resumes when it exits. Environment:
+ 
+   MEM=a:n[,a:n]  also dump n bytes at each address a, per hit
+-  LIGHT=1        one line per hit (pc, r0..r3, lr)
++  LIGHT=1        one line per hit (host seconds since attach, pc, r0..r3, lr)
++  MEMR=r:n       with LIGHT, also n bytes at the address in r<r>
+ """
+ 
+ import os, socket, struct, sys, time
+@@ -86,7 +87,8 @@ def resume():
+ 
+ 
+ r.send(b"vCont;c")
+-deadline = time.time() + float(secs)
++t_start = time.time()
++deadline = t_start + float(secs)
+ hits = 0
+ while time.time() < deadline and hits < maxhits:
+     try:
+@@ -105,8 +107,13 @@ while time.time() < deadline and hits < maxhits:
+     pc, lr, sp = regs[15], regs[14], regs[13]
+     hits += 1
+     if os.environ.get("LIGHT"):
+-        print("T %08x r0=%x r1=%x r2=%x r3=%x lr=%x" %
+-              (pc, regs[0], regs[1], regs[2], regs[3], lr), flush=True)
++        extra = ""
++        if os.environ.get("MEMR"):
++            mr, ml = os.environ["MEMR"].split(":")
++            extra = " mem@r%s=%s" % (mr, r.mem(regs[int(mr)], int(ml, 0)).hex())
++        print("T %.3f %08x r0=%x r1=%x r2=%x r3=%x lr=%x%s" %
++              (time.time() - t_start, pc, regs[0], regs[1], regs[2], regs[3],
++               lr, extra), flush=True)
+     else:
+         print("hit pc=%08x lr=%08x sp=%08x" % (pc, lr, sp))
+         print("  " + " ".join("r%d=%x" % (i, regs[i]) for i in range(13)))
+diff --git a/z63-tools/snor_user_sensor_version.py b/z63-tools/snor_user_sensor_version.py
+new file mode 100755
+index 0000000..58b42a2
+--- /dev/null
++++ b/z63-tools/snor_user_sensor_version.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++"""Write a copy of a SNOR_USER body whose sensor-parameter record carries a
++version the firmware accepts.
++
++The first sensor power-up (sub_4115EDF4, from CaptureSequence's start via
++sub_40F45BE4) runs, once, sub_411781F4: it takes record 0x63 -- the image
++sensor's parameter block, ~1.3 MB, found through sub_40D7185C(0x63) and
++kept at 0xA04CE13A0 by sub_4115EDC4 -- and reads the two bytes at
+++0x117ab4 as a 12-bit version, (b0 << 4) | (b1 >> 4). Below 0x104 the
++power-up returns error bit 0x400 (b0 other than 0x16 gives 0x200);
++sub_40F422E8 turns that into CaptureSequence event 0x4110181, which
++sub_40F2FA70 reports as error 0x45 (sub_40F35AD4 -> sub_40EB1414): the
++"Error. Turn the camera off and then on again" dialog over everything.
++
++The SNOR_USER body is not a flash dump: z63-tools/snor_user_extract.py
++takes it from a RAM image of the body (snor_user.json: region 0x45980000,
++size 0x2680000), and in that image record 0x63 is mostly zero pages -- in
++all four copies (file offsets 0x120000, 0x500000, 0x2120000, 0x2500000;
++the firmware uses the last, RAM 0x47e80000), including these two bytes and
++the sensor register tables from +0x119510. The camera's real values are
++therefore not known. This writes a NEW file with the two bytes set to 0x16
++0x00 (version 0x160, the byte the code names and the smallest such version
++both checks accept) in every copy where both are zero. It is a declared
++edit of the input, like snor_user_clear_error.py, not a model; the original
++file is never touched. The register tables stay zero: the sensor's control
++port is a write-only sink (nikon-z63.c, sio-sink), so nothing consumes
++them.
++
++    snor_user_sensor_version.py <snor_user.bin> <out.bin>
++"""
++import sys
++
++REGION = 0x45980000            # snor_user.json "region.base"
++RECORD = 0x47E80000 - REGION   # record 0x63, the copy the firmware reads
++VERSION = 0x117AB4
++
++src, dst = sys.argv[1:3]
++if src == dst:
++    sys.exit("refusing to overwrite the input; give a different output path")
++data = bytearray(open(src, "rb").read())
++if len(data) < RECORD + VERSION + 2:
++    sys.exit("input is too short to hold record 0x63 at %#x" % RECORD)
++head = bytes(data[RECORD:RECORD + 16])
++if not any(head):
++    sys.exit("no record header at %#x; is this a SNOR_USER body?" % RECORD)
++n = 0
++i = data.find(head)
++while i >= 0:
++    v = i + VERSION
++    if v + 2 <= len(data):
++        if data[v] or data[v + 1]:
++            print("copy at %#x: version bytes %s, left as they are"
++                  % (i, data[v:v + 2].hex(" ")))
++        else:
++            data[v], data[v + 1] = 0x16, 0x00
++            print("copy at %#x: version bytes 00 00 -> 16 00" % i)
++            n += 1
++    i = data.find(head, i + 1)
++if not n:
++    sys.exit("no copy with zero version bytes; nothing written")
++open(dst, "wb").write(data)
++print("wrote %s (%d copies set)" % (dst, n))
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 316bfc7..bcc38b6 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -17,6 +17,7 @@
+  *   0xfe/0xff/0x101/0x102/0x104 SIF_0/1/3/4/6  the 0x1508 event block
+  *   0x134 MVD     engine1524 MVD
+  *   0x9b..0xa4 TIMER_0..9  the multi-IO timer block (multi-io-counter-model)
++ *   0x107 PPC_1   engine150c's second status bank (zr-primary-bank1-model)
+  *
+  * Switches the Z 9 profile has that belong to blocks this board models
+  * itself are refused: the display (engine1548-*), graphics, NOR, NAND,
+@@ -74,6 +75,46 @@ static void z63_z9lab_boundary_tick(void *opaque)
+     timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + b->period_ns);
+ }
+ 
++/*
++ * Engine 0x150c's start acknowledgement. ../z9-qemu models the engine's
++ * second status bank -- +0x24c, mask +0x248, W1C, on INTID 0x107 -- for its
++ * Zr profile only, fed from outside (zr-primary-bank1-input). This image
++ * uses the same bank the same way: its 0x107 handler sub_40C1FAD4 reads and
++ * acknowledges +0x24c/+0x258/+0x264, and the callback sub_40CAE850
++ * accumulates +0x24c bits 5 and 6 and, once both have been seen, sets flag
++ * 0x10 of the engine's event object 0xA03051B60. The job thread
++ * (sub_40CADFD0) starts the engine (sub_40CAF2E4: +0x64, then +0x08) and,
++ * when the job enables engine bit 1, waits for that flag before it calls
++ * the start callback (0xA03051B88 = sub_410AC0E8, 0x422D0001), which tells
++ * FrontEnd 0x41D0001; FrontEnd sets 0xA04072F10 bit 2, which its mode-1
++ * start (sub_41031258) waits 400 ms for before it reports the front end
++ * ready to CaptureSequence (CSEQEV10 bit 3).
++ *
++ * What the two bits are is read from where the firmware needs them, not
++ * from a register description: CaptureSequence only starts the sensor
++ * streaming (sub_41166E50 -> the SDES channel start sub_40C29DF8, which
++ * sets the sensor interface's +0x10) after that ready report, so the bits
++ * cannot be frame events from the sensor. They are treated as the engine
++ * acknowledging the start of its primary path: raised once each time
++ * engine bit 1 becomes active (z9 model state engine150c_active), through
++ * the Zr model's own pending/mask/W1C, which then behaves as ../z9-qemu
++ * wrote it. The firmware programs +0x248 = 0x70 before the first start.
++ */
++static void z63_z9lab_150c_started(NikonZ9State *s)
++{
++    static bool named;
++
++    s->zr_primary_bank1_pending |= 0x60;
++    s->zr_primary_bank1_inputs++;
++    zr_primary_bank1_irq_update(s);
++    if (!named) {
++        named = true;
++        fprintf(stderr, "Z63_150C: primary path started; start acknowledged "
++                "(+0x24c bits 5,6, mask 0x%x, INTID 0x107) -- see "
++                "z9lab_attach.c.in\n", s->engine_150c_init[0x248 / 4]);
++    }
++}
++
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                       const char *props, Error **errp);
+ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size,
+@@ -145,6 +186,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         timer_mod(s->raw_pipeline_timer,
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
+     }
++    if (s->zr_primary_bank1_model) {
++        if (!s->engine150c_stop_model) {
++            error_setg(errp, "z9-capture: zr-primary-bank1-model needs "
++                       "engine150c-stop-model");
++            goto fail;
++        }
++        s->zr_primary_bank1_irq = qdev_get_gpio_in(gic, 0x107 - 32);
++    }
+     s->event_aux0_irq = qdev_get_gpio_in(gic, 0x102 - 32);
+     s->event_aux1_irq = qdev_get_gpio_in(gic, 0x104 - 32);
+     s->event_channel_irq = qdev_get_gpio_in(gic, 0xfe - 32);
+@@ -204,9 +253,14 @@ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size, uint64_t *value)
+ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+ {
+     NikonZ9State *s = NIKON_Z9_LAB(obj);
++    uint32_t was = s->engine150c_active;
+ 
+     s->compat_miss = false;
+     unknown_write(s, addr, value, size);
++    if (addr == 0x150c0008 && s->zr_primary_bank1_model &&
++        (s->engine150c_active & ~was & 2)) {
++        z63_z9lab_150c_started(s);
++    }
+     return !s->compat_miss;
+ }
+ 
+-- 
+2.55.0
+

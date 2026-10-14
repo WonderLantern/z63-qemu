@@ -1,0 +1,633 @@
+From d8c6b11199a0063fbda1f2651c4aae49ac2eb3d7 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 15:42:54 +0000
+Subject: [PATCH 36/47] Z 6III: the top LCD -- the MCU's SPI2 by DMA, a 128x128
+ memory LCD
+
+The control panel on the right shoulder never showed anything: the body
+MCU drives it over SPI2 by DMA, and nothing pulled that stream, so the
+first transfer never completed. Followed through the MCU image:
+
+  - the EXPEED sends the panel's content as state, not pixels: family 8
+    kind 4, 192 bytes (with kind 1, 20 bytes of flags). The MCU's display
+    task keeps it (sub_80327D8 -> 0x2001A9FA, event 8), checks its 83
+    fields (sub_8030350), renders a 2048-byte frame from it with its own
+    glyphs (sub_8030E0C) and hands that to sub_8032554, which compares it
+    line by line with the last frame sent and packs only the lines that
+    changed;
+  - what it sends is the write protocol of a Sharp memory-in-pixel LCD:
+    0x80 (M0, data update), then per line the gate address, 16 bytes and
+    a dummy, a trailing dummy; at power-on 0x20 0x00 (M2, all clear,
+    sub_8032058). The frame is 128 lines of 16 bytes and line i's address
+    is table 0x8058A10[i] = bit-reversed 128 - i: a 128x128 panel taking
+    its address LSB first, with the MCU's row 0 at its line 128;
+  - HAL_SPI_Transmit_DMA (sub_804D580, from sub_8032704) on SPI2, DMA1
+    stream 4, framed by an active-high chip select that the begin and end
+    hooks move (sub_8032350 / sub_8032360: PA4), DISP raised once the
+    clear is out (sub_8031FA8: PE8).
+
+nikon-z63-stm32.h: an SPI can have a listening device (a "sink", no
+MISO). With CR2.TXDMAEN it takes the armed stream's words itself, at its
+own bit rate (CR1.BR from APB1/APB2, CR1.DFF), so TC and the firmware's
+chip-select drop come when they would; DR writes reach the sink too. The
+link's SPI1/SPI4 are untouched -- the board still clocks those.
+
+nikon-z63-toplcd.h: the panel -- SCS, DISP, the three modes, its memory
+-- publishing what it shows to -machine toplcd-live=<file> in
+scanout-live's layout (128x128, white for a 1 bit, the panel's own
+order; z63ui turns it a quarter clockwise, as it sits in the body).
+
+One line is not the panel's: after the clear the MCU pulses PD11 for
+1 ms and arms PD1 -- input, pull-up, EXTI rising (sub_8032690) -- and
+sends no line until that edge sets 0x2001BB84 (sub_8032908 -> event 0x80
+-> sub_8032264). Without it the packets queue, the queue stays full and
+the task renders nothing more. A memory LCD has no output, so what drives
+PD1 is not known; the pull-up and rising edge read like an open-drain
+ready from the panel's supply. DECLARED: PD11's pulse pulls PD1 low and
+it is let go 5 ms after the pulse ends.
+
+Now the panel shows what the body's would: 1.6" F--, ISO-A 64000, the
+release mode S, the mains-power icon and [-E-] for no card, updating as
+the EXPEED's state changes (ISO-A 100 a little later, the exposure
+readout gone when the meters time out). smoke.sh passes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-scanout.h |   3 +-
+ hw/arm/nikon-z63-stm32.h   | 103 ++++++++++++++
+ hw/arm/nikon-z63-toplcd.h  | 272 +++++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63.c         |  53 ++++++++
+ 4 files changed, 430 insertions(+), 1 deletion(-)
+ create mode 100644 hw/arm/nikon-z63-toplcd.h
+
+diff --git a/hw/arm/nikon-z63-scanout.h b/hw/arm/nikon-z63-scanout.h
+index fa98782..d153f17 100644
+--- a/hw/arm/nikon-z63-scanout.h
++++ b/hw/arm/nikon-z63-scanout.h
+@@ -261,7 +261,8 @@ static void z63_scanout_live(Z63Scanout *s, const uint32_t *px,
+     z63_live_end(l);
+ }
+ 
+-/* Make and map a live file with room for `capacity` bytes of pixels. */
++/* Make and map a live file with room for `capacity` bytes of pixels. The
++ * top LCD (nikon-z63-toplcd.h) publishes in the same format. */
+ static Z63LiveHeader *z63_live_open(const char *path, uint32_t capacity,
+                                     const char *option)
+ {
+diff --git a/hw/arm/nikon-z63-stm32.h b/hw/arm/nikon-z63-stm32.h
+index a20ca11..4dbcd39 100644
+--- a/hw/arm/nikon-z63-stm32.h
++++ b/hw/arm/nikon-z63-stm32.h
+@@ -113,6 +113,14 @@ typedef struct Z63Stm32Spi {
+      * unconnected bus. See the board's mcu-spi-peer=. */
+     uint16_t (*peer)(void *opaque, unsigned inst, uint16_t out);
+     void *peer_opaque;
++    /* A device that only listens -- no MISO -- if the board wired one:
++     * every word shifted out is handed to it, and with CR2.TXDMAEN the
++     * SPI fetches those words from the DMA itself, at its own bit rate
++     * (z63_stm32_spi_tx_dma). The top LCD on SPI2 is one. */
++    void (*sink)(void *opaque, unsigned inst, uint16_t out);
++    void *sink_opaque;
++    QEMUTimer *tx_timer;            /* the DMA words still on the wire */
++    uint32_t tx_owed;               /* ... and how many */
+ } Z63Stm32Spi;
+ 
+ struct Z63Stm32 {
+@@ -281,6 +289,7 @@ static const struct {
+ static bool z63_stm32_dma_tx(Z63Stm32 *m, uint32_t par, uint32_t *value);
+ static bool z63_stm32_dma_rx(Z63Stm32 *m, uint32_t par, uint32_t value);
+ static void z63_stm32_dma_kick(Z63Stm32 *m);
++static uint32_t z63_stm32_dma_left(Z63Stm32 *m, uint32_t par, bool to_periph);
+ 
+ static uint32_t z63_stm32_pc(void)
+ {
+@@ -1891,6 +1900,63 @@ static uint64_t z63_stm32_spi_read(void *opaque, hwaddr off, unsigned size)
+     }
+ }
+ 
++/* How long one word takes on the wire: CR1.BR divides the bus clock by
++ * 2^(BR+1), and CR1.DFF picks 8- or 16-bit frames (RM0386 28.5.1). SPI2
++ * and SPI3 hang off APB1 (45 MHz here), the rest off APB2 (90 MHz). */
++static int64_t z63_stm32_spi_word_ns(Z63Stm32Spi *sp)
++{
++    uint32_t cr1 = sp->r[Z63_SPI_CR1 / 4];
++    uint64_t hz = (sp->inst == 1 || sp->inst == 2) ? 45000000 : 90000000;
++    unsigned bits = (cr1 & (1u << 11)) ? 16 : 8;
++
++    return (int64_t)bits * (2u << ((cr1 >> 3) & 7)) *
++           NANOSECONDS_PER_SECOND / hz;
++}
++
++/*
++ * A transmit by DMA to a listening device (sp->sink). On the part, TXE
++ * with CR2.TXDMAEN is a request, and the stream answers it as fast as the
++ * shift register empties; here the words armed when the transfer starts
++ * leave together, once the time they would take has passed -- so the
++ * stream's TC, and whatever the firmware does on it (chip select back
++ * down), come when they would. Only an SPI with a sink does this: the
++ * link's SPI1/SPI4 are clocked by the board (z63_mcu_link_pump).
++ */
++static void z63_stm32_spi_tx_dma(Z63Stm32Spi *sp)
++{
++    uint32_t par = z63_stm32_spi_base[sp->inst] + Z63_SPI_DR;
++
++    if (!sp->sink || sp->tx_owed ||
++        !(sp->r[Z63_SPI_CR1 / 4] & 0x40) ||           /* SPE */
++        !(sp->r[Z63_SPI_CR2 / 4] & 0x02)) {           /* TXDMAEN */
++        return;
++    }
++    sp->tx_owed = z63_stm32_dma_left(sp->mcu, par, true);
++    if (sp->tx_owed) {
++        timer_mod(sp->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  sp->tx_owed * z63_stm32_spi_word_ns(sp));
++    }
++}
++
++static void z63_stm32_spi_tx_done(void *opaque)
++{
++    Z63Stm32Spi *sp = opaque;
++    uint32_t par = z63_stm32_spi_base[sp->inst] + Z63_SPI_DR;
++    uint32_t v;
++
++    /* Still enabled? A firmware that stops the stream or the SPI early
++     * gets only the words it let go. */
++    while (sp->tx_owed && (sp->r[Z63_SPI_CR1 / 4] & 0x40) &&
++           (sp->r[Z63_SPI_CR2 / 4] & 0x02) &&
++           z63_stm32_dma_tx(sp->mcu, par, &v)) {
++        sp->tx_owed--;
++        sp->words_out++;
++        sp->sink(sp->sink_opaque, sp->inst, v);
++    }
++    sp->tx_owed = 0;
++    z63_stm32_spi_tx_dma(sp);                       /* a circular stream */
++}
++
+ static void z63_stm32_spi_write(void *opaque, hwaddr off, uint64_t value,
+                                 unsigned size)
+ {
+@@ -1902,6 +1968,9 @@ static void z63_stm32_spi_write(void *opaque, hwaddr off, uint64_t value,
+         /* One word out, one word in: the peer clocks the exchange. With no
+          * peer the bus is unconnected, and an unconnected MISO reads 0. */
+         sp->words_out++;
++        if (sp->sink) {
++            sp->sink(sp->sink_opaque, sp->inst, value);
++        }
+         sp->dr = sp->peer ? sp->peer(sp->peer_opaque, sp->inst, value) : 0;
+         z63_stm32_spi_irq_update(sp);
+         return;
+@@ -1922,6 +1991,7 @@ static void z63_stm32_spi_write(void *opaque, hwaddr off, uint64_t value,
+             }
+             z63_stm32_dma_kick(sp->mcu);
+         }
++        z63_stm32_spi_tx_dma(sp);
+         z63_stm32_spi_irq_update(sp);
+         return;
+     }
+@@ -1949,6 +2019,18 @@ static void z63_stm32_spi_peer(Z63Stm32 *m, unsigned inst,
+     m->spi[inst].peer_opaque = opaque;
+ }
+ 
++/* Wire a listening device onto SPI `inst` (1 = SPI2). See sp->sink. */
++static void z63_stm32_spi_sink(Z63Stm32 *m, unsigned inst,
++                               void (*fn)(void *, unsigned, uint16_t),
++                               void *opaque)
++{
++    if (inst >= Z63_STM32_SPI_N) {
++        return;
++    }
++    m->spi[inst].sink = fn;
++    m->spi[inst].sink_opaque = opaque;
++}
++
+ /* USART1, USART2, USART3, UART4, UART5, USART6 (QEMU's stm32f2xx model).
+  * The application programs USART1 first (pc 0x0804e292). */
+ static const hwaddr z63_stm32_usart_base[6] = {
+@@ -2118,6 +2200,22 @@ static bool z63_stm32_dma_rx(Z63Stm32 *m, uint32_t par, uint32_t value)
+     return z63_stm32_dma_serve(m, par, false, &value);
+ }
+ 
++/* Items still to move on the stream armed on this register (0 = none). */
++static uint32_t z63_stm32_dma_left(Z63Stm32 *m, uint32_t par, bool to_periph)
++{
++    for (unsigned c = 0; c < 2; c++) {
++        for (unsigned n = 0; n < 8; n++) {
++            uint32_t cr = m->dma[c].s[n].cr;
++
++            if ((cr & 1) && m->dma[c].s[n].par == par &&
++                ((cr >> 6) & 3) == (to_periph ? 1 : 0)) {
++                return m->dma[c].s[n].ndtr & 0xffff;
++            }
++        }
++    }
++    return 0;
++}
++
+ /* A stream was enabled: a peripheral may already be requesting. */
+ static void z63_stm32_dma_kick(Z63Stm32 *m)
+ {
+@@ -2126,6 +2224,9 @@ static void z63_stm32_dma_kick(Z63Stm32 *m)
+     }
+     z63_stm32_fmpi2c_step(m);
+     z63_stm32_fmpi2c_irq(m);
++    for (unsigned i = 0; i < Z63_STM32_SPI_N; i++) {
++        z63_stm32_spi_tx_dma(&m->spi[i]);
++    }
+     /* And whatever the board has wired to a stream -- the SPI-to-serial
+      * link, if mcu-spi-peer= bridged one. See z63_stm32_dma_item_bytes(). */
+     if (m->link_kick) {
+@@ -2936,6 +3037,8 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+         m->spi[i].inst = i;
+         /* The M4's NVIC input line *is* the qemu_irq, as for USART above. */
+         m->spi[i].irq = qdev_get_gpio_in(armv7m, z63_stm32_spi_irq[i]);
++        m->spi[i].tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                          z63_stm32_spi_tx_done, &m->spi[i]);
+         z63_stm32_map(m, &m->spi[i].mr, owner, &z63_stm32_spi_ops,
+                       &m->spi[i], name, z63_stm32_spi_base[i], 0x400);
+     }
+diff --git a/hw/arm/nikon-z63-toplcd.h b/hw/arm/nikon-z63-toplcd.h
+new file mode 100644
+index 0000000..449a4e4
+--- /dev/null
++++ b/hw/arm/nikon-z63-toplcd.h
+@@ -0,0 +1,272 @@
++/*
++ * Nikon Z 6III -- the top LCD (the control panel on the right shoulder),
++ * as the body MCU drives it.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * What the panel shows is decided on the EXPEED, which sends it to the MCU
++ * as state, not pixels: family 8 kind 4, 192 bytes, with family 8 kind 1
++ * (20 bytes of flags) beside it. The MCU draws that itself: its display
++ * task (sub_8032870) keeps the 192 bytes plus two (0x2001A9FA, the last
++ * ones at +194), renders a 2048-byte frame from them (sub_8030E0C, into
++ * +388) and hands the frame to sub_8032554, which compares it line by line
++ * with the frame last sent (0x2001BC94) and sends only the lines that
++ * changed. The bytes it sends are the write protocol of a Sharp memory-in-
++ * pixel LCD:
++ *
++ *   0x80                      mode: M0 (data update), MSB first on the wire
++ *   addr, 16 bytes, 0x00      a line: gate address, 128 pixels, dummy
++ *   ...                       up to 16 lines a packet
++ *   0x00                      the trailing dummy
++ *
++ * and at power-on (sub_8032058) 0x20 0x00 -- M2, all clear. The frame is
++ * 128 lines of 16 bytes and the address of line i is table 0x8058A10[i]:
++ * 0x01, 0xfe, 0x7e, ... -- 128, 127, 126, ... with the bits reversed, as
++ * the panel takes its address LSB first while this SPI sends MSB first.
++ * So the panel is 128 x 128, and the MCU's row 0 is the panel's line 128.
++ *
++ * The bytes go out on SPI2 by DMA (HAL_SPI_Transmit_DMA = sub_804D580,
++ * called from sub_8032704; DMA1 stream 4). The packet is framed by the
++ * chip select, which on this panel is active high (SCS): the begin hook
++ * sub_8032350 raises it and the end hook sub_8032360, run from the
++ * stream's TC, drops it. DISP is the panel's display-on input, raised by
++ * sub_8031FA8 once the clear has gone out. Both are pins the MCU looks up
++ * through its pin tables (sub_80321C8, ids 4 and 72); the board says which
++ * GPIOs they are (nikon-z63.c, Z63_TOPLCD_SCS / _DISP).
++ *
++ * One more line, and it is not the panel's. At power-on sub_8032058 pulses
++ * PD11 high for 1 ms (id 59), sends the clear, and arms PD1 (id 49) as an
++ * input with a pull-up, interrupting on a rising edge (sub_8032690:
++ * HAL_GPIO_Init(GPIOD, pin 1, IT_RISING, PULLUP)). That edge (sub_8032908,
++ * event 0x80) is waited out for 1 ms and then sets 0x2001BB84 (sub_8032264),
++ * and until it is set the packets sub_8032554 builds are queued but never
++ * sent -- after which the display task, its queue full, draws nothing more.
++ * A memory LCD has no output, so what drives PD1 is not known; a pull-up
++ * and a rising edge read like an open-drain "ready" or power-good from the
++ * panel's supply. DECLARED: PD11's pulse pulls PD1 low, and it is let go
++ * Z63_TOPLCD_READY_NS after the pulse ends.
++ *
++ * Modelled: SCS, DISP, the three modes and the panel's memory; what the
++ * panel shows is published to -machine toplcd-live=<file>, in the same
++ * format as scanout-live (nikon-z63-scanout.h): 128 x 128, 0x00ffffff for
++ * a white pixel (a 1 bit, which is what all clear writes) and 0 for black,
++ * in the panel's own order -- line 1 first, the first pixel shifted in at
++ * the left. How the panel sits in the body is the viewer's business.
++ * Not modelled: VCOM (M1 or EXTCOMIN; a DC-balanced liquid crystal has no
++ * picture to show for it), timing limits, and the reflective look.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_TOPLCD_H
++#define HW_ARM_NIKON_Z63_TOPLCD_H
++
++#define Z63_TOPLCD_W        128
++#define Z63_TOPLCD_H        128
++#define Z63_TOPLCD_STRIDE   (Z63_TOPLCD_W / 8)
++#define Z63_TOPLCD_READY_NS (5 * SCALE_MS)      /* declared, see above */
++
++typedef struct Z63TopLcd {
++    bool scs, disp;
++    enum {
++        Z63_TOPLCD_MODE,            /* the first byte after SCS rises */
++        Z63_TOPLCD_ADDR,
++        Z63_TOPLCD_DATA,
++        Z63_TOPLCD_DUMMY,
++        Z63_TOPLCD_IDLE,            /* the rest of the packet is dummy */
++    } state;
++    unsigned line, at;
++    uint8_t row[Z63_TOPLCD_STRIDE];
++    uint8_t mem[Z63_TOPLCD_H][Z63_TOPLCD_STRIDE];   /* 1 = white */
++    bool dirty;
++    Z63Stm32Gpio *ready_gpio;       /* the ready line, an MCU input */
++    unsigned ready_pin;
++    QEMUTimer *ready_timer;
++    Z63LiveHeader *live;
++    uint64_t packets, lines, clears;
++    unsigned named;                 /* oddities reported so far */
++} Z63TopLcd;
++
++#define Z63_TOPLCD_NAMED    8
++
++static void z63_toplcd_odd(Z63TopLcd *t, const char *fmt, ...)
++    G_GNUC_PRINTF(2, 3);
++
++static void z63_toplcd_odd(Z63TopLcd *t, const char *fmt, ...)
++{
++    va_list ap;
++    g_autofree char *msg = NULL;
++
++    if (t->named >= Z63_TOPLCD_NAMED) {
++        return;
++    }
++    va_start(ap, fmt);
++    msg = g_strdup_vprintf(fmt, ap);
++    va_end(ap);
++    error_report("Z63_TOPLCD: %s%s", msg, ++t->named == Z63_TOPLCD_NAMED ?
++                 " (further oddities not named)" : "");
++}
++
++/* What the panel shows, to the live file, if it changed. */
++static void z63_toplcd_publish(Z63TopLcd *t)
++{
++    Z63LiveHeader *l = t->live;
++    uint32_t *px;
++
++    if (!l || !t->dirty) {
++        return;
++    }
++    t->dirty = false;
++    px = (uint32_t *)((uint8_t *)l + Z63_LIVE_HEADER);
++    z63_live_begin(l);
++    l->width = Z63_TOPLCD_W;
++    l->height = Z63_TOPLCD_H;
++    for (unsigned y = 0; y < Z63_TOPLCD_H; y++) {
++        for (unsigned x = 0; x < Z63_TOPLCD_W; x++) {
++            bool white = (t->mem[y][x / 8] >> (7 - x % 8)) & 1;
++
++            *px++ = white ? 0x00ffffff : 0;
++        }
++    }
++    if (t->disp) {
++        l->note[0] = 0;
++    } else {
++        pstrcpy(l->note, sizeof(l->note), "DISP is low: the panel is "
++                "blank");
++    }
++    l->frames = t->packets;
++    z63_live_end(l);
++}
++
++/* A byte shifted in. Only while SCS is high does the panel listen. */
++static void z63_toplcd_byte(void *opaque, unsigned inst, uint16_t word)
++{
++    Z63TopLcd *t = opaque;
++    uint8_t b = word;
++
++    if (!t->scs) {
++        z63_toplcd_odd(t, "0x%02x arrived with SCS low and was dropped",
++                       b);
++        return;
++    }
++    switch (t->state) {
++    case Z63_TOPLCD_MODE:
++        t->packets++;
++        if (b & 0x80) {                                 /* M0 */
++            t->state = Z63_TOPLCD_ADDR;
++        } else {
++            if (b & 0x20) {                             /* M2 */
++                memset(t->mem, 0xff, sizeof(t->mem));
++                t->clears++;
++                t->dirty = true;
++            }
++            t->state = Z63_TOPLCD_IDLE;
++        }
++        break;
++    case Z63_TOPLCD_ADDR:
++        /* The address goes LSB first: reversed in an MSB-first byte. */
++        t->line = revbit8(b);
++        if (t->line == 0) {                             /* the trailer */
++            t->state = Z63_TOPLCD_IDLE;
++        } else if (t->line > Z63_TOPLCD_H) {
++            z63_toplcd_odd(t, "gate line %u (byte 0x%02x) is past the "
++                           "panel's %u", t->line, b, Z63_TOPLCD_H);
++            t->state = Z63_TOPLCD_IDLE;
++        } else {
++            t->at = 0;
++            t->state = Z63_TOPLCD_DATA;
++        }
++        break;
++    case Z63_TOPLCD_DATA:
++        t->row[t->at++] = b;
++        if (t->at == Z63_TOPLCD_STRIDE) {
++            if (memcmp(t->mem[t->line - 1], t->row, sizeof(t->row))) {
++                memcpy(t->mem[t->line - 1], t->row, sizeof(t->row));
++                t->dirty = true;
++            }
++            t->lines++;
++            t->state = Z63_TOPLCD_DUMMY;
++        }
++        break;
++    case Z63_TOPLCD_DUMMY:
++        t->state = Z63_TOPLCD_ADDR;
++        break;
++    case Z63_TOPLCD_IDLE:
++        break;
++    }
++}
++
++static void z63_toplcd_scs(Z63TopLcd *t, bool level)
++{
++    if (level == t->scs) {
++        return;
++    }
++    t->scs = level;
++    if (level) {
++        t->state = Z63_TOPLCD_MODE;
++        return;
++    }
++    if (t->state == Z63_TOPLCD_DATA) {
++        z63_toplcd_odd(t, "SCS fell %u bytes into line %u", t->at, t->line);
++    }
++    /* The end of a packet: what the panel now shows. */
++    if (t->packets == 1) {
++        error_report("Z63_TOPLCD: the first packet (%" PRIu64 " clear, "
++                     "%" PRIu64 " lines)", t->clears, t->lines);
++    }
++    z63_toplcd_publish(t);
++}
++
++static void z63_toplcd_disp(Z63TopLcd *t, bool level)
++{
++    if (level == t->disp) {
++        return;
++    }
++    t->disp = level;
++    error_report("Z63_TOPLCD: DISP %s after %" PRIu64 " packets",
++                 level ? "high: the panel shows its memory"
++                       : "low: the panel is blank", t->packets);
++    t->dirty = true;
++    z63_toplcd_publish(t);
++}
++
++/* PD11, the start pulse: the ready line goes low with it and comes back
++ * up a little after it (declared, see above). */
++static void z63_toplcd_start(Z63TopLcd *t, bool level)
++{
++    if (level) {
++        timer_del(t->ready_timer);
++        z63_stm32_gpio_drive(t->ready_gpio, t->ready_pin, false);
++    } else {
++        timer_mod(t->ready_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  Z63_TOPLCD_READY_NS);
++    }
++}
++
++static void z63_toplcd_ready(void *opaque)
++{
++    Z63TopLcd *t = opaque;
++
++    error_report("Z63_TOPLCD: ready line P%c%u released (declared: %u ms "
++                 "after the start pulse)", 'A' + t->ready_gpio->port,
++                 t->ready_pin, (unsigned)(Z63_TOPLCD_READY_NS / SCALE_MS));
++    z63_stm32_gpio_drive(t->ready_gpio, t->ready_pin, true);
++}
++
++/* The panel at power-on: memory undefined (shown white; the MCU clears it
++ * before raising DISP), SCS and DISP low, the ready line left to its
++ * pull-up. */
++static void z63_toplcd_init(Z63TopLcd *t, const char *live,
++                            Z63Stm32Gpio *ready, unsigned ready_pin)
++{
++    memset(t->mem, 0xff, sizeof(t->mem));
++    t->ready_gpio = ready;
++    t->ready_pin = ready_pin;
++    t->ready_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_toplcd_ready, t);
++    if (live && *live) {
++        t->live = z63_live_open(live, Z63_TOPLCD_W * Z63_TOPLCD_H * 4,
++                                "toplcd-live");
++        t->dirty = true;
++        z63_toplcd_publish(t);
++    }
++}
++
++#endif
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 5d2ed48..e9b4b3a 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -573,6 +573,7 @@ static const hwaddr z63_dma_bases[Z63_DMA_BANKS] = {
+ #include "hw/arm/nikon-z63-storage.h"
+ #include "hw/arm/nikon-z63-display.h"
+ #include "hw/arm/nikon-z63-scanout.h"
++#include "hw/arm/nikon-z63-toplcd.h"
+ #include "hw/arm/nikon-z63-hdmi.h"
+ #include "hw/arm/nikon-z63-usb.h"
+ #include "hw/arm/nikon-z63-sensorif.h"
+@@ -815,6 +816,8 @@ typedef struct NikonZ63State {
+     bool gfx_skip_unmodelled;    /* nikon-z63-gfx.h, skip_unmodelled */
+     char *scanout_dump;          /* host-side PPM of the scanout */
+     char *scanout_live;          /* host-side live frame file, ditto */
++    char *toplcd_live;           /* the top LCD's, nikon-z63-toplcd.h */
++    Z63TopLcd toplcd;            /* on the real MCU's SPI2 */
+     char *sio_sink;              /* write-only serial sinks, nikon-z63-sio.h */
+     bool audio_codec;            /* nikon-z63-audio.h */
+     bool z9_capture;             /* nikon-z63-z9lab.h */
+@@ -2006,6 +2009,20 @@ static void z63_wires_drive_mcu(NikonZ63State *s, unsigned bank,
+     }
+ }
+ 
++/* The top LCD's lines, as MCU pins (port 0 = A): chip select, display-on,
++ * the start pulse and the ready line (nikon-z63-toplcd.h). The first three
++ * are the pins seen to move from the display module's hooks (sub_8032350
++ * and sub_8032360, sub_8031FA8, sub_8032058); the last is the pin
++ * sub_8032690 hands to HAL_GPIO_Init. */
++#define Z63_TOPLCD_SCS_PORT     0       /* PA4 */
++#define Z63_TOPLCD_SCS_PIN      4
++#define Z63_TOPLCD_DISP_PORT    4       /* PE8 */
++#define Z63_TOPLCD_DISP_PIN     8
++#define Z63_TOPLCD_START_PORT   3       /* PD11 */
++#define Z63_TOPLCD_START_PIN    11
++#define Z63_TOPLCD_READY_PORT   3       /* PD1 */
++#define Z63_TOPLCD_READY_PIN    1
++
+ /* The MCU changed an output pin: on the board that is an edge into the
+  * EXPEED's EXT_INT block (nikon-z63-extint.h). The firmware's own line
+  * descriptors put EXT_INT_n on port 3 bit n, which is why a bank-3 wire
+@@ -2018,6 +2035,15 @@ static void z63_wires_pin_out(void *opaque, unsigned port, unsigned pin,
+ {
+     NikonZ63State *s = opaque;
+ 
++    /* The top LCD's inputs (nikon-z63-toplcd.h). */
++    if (port == Z63_TOPLCD_SCS_PORT && pin == Z63_TOPLCD_SCS_PIN) {
++        z63_toplcd_scs(&s->toplcd, level);
++    } else if (port == Z63_TOPLCD_DISP_PORT && pin == Z63_TOPLCD_DISP_PIN) {
++        z63_toplcd_disp(&s->toplcd, level);
++    } else if (port == Z63_TOPLCD_START_PORT &&
++               pin == Z63_TOPLCD_START_PIN) {
++        z63_toplcd_start(&s->toplcd, level);
++    }
+     if (!s->wires_parsed) {
+         z63_wires_parse(s);
+     }
+@@ -4422,6 +4448,12 @@ static void z63_init(MachineState *machine)
+          * readable bit would be a wire the firmware never notices. */
+         s->real_mcu.pin_out = z63_wires_pin_out;
+         s->real_mcu.pin_out_opaque = s;
++        /* The top LCD: SPI2's data, and some of those pins
++         * (nikon-z63-toplcd.h). */
++        z63_toplcd_init(&s->toplcd, s->toplcd_live,
++                        &s->real_mcu.gpio[Z63_TOPLCD_READY_PORT],
++                        Z63_TOPLCD_READY_PIN);
++        z63_stm32_spi_sink(&s->real_mcu, 1, z63_toplcd_byte, &s->toplcd);
+     } else if (s->mcu_peer) {
+         z63_mcu_init(&s->mcu, &s->sio, &s->extint);
+     }
+@@ -4939,6 +4971,20 @@ static void z63_prop_set_scanout_live(Object *obj, const char *value,
+     s->scanout_live = g_strdup(value);
+ }
+ 
++static char *z63_prop_get_toplcd_live(Object *obj, Error **errp)
++{
++    return g_strdup(NIKON_Z63(obj)->toplcd_live);
++}
++
++static void z63_prop_set_toplcd_live(Object *obj, const char *value,
++                                     Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    g_free(s->toplcd_live);
++    s->toplcd_live = g_strdup(value);
++}
++
+ static bool z63_prop_get_camctl(Object *obj, Error **errp)
+ {
+     return NIKON_Z63(obj)->mcu.camctl_reply;
+@@ -5366,6 +5412,13 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "Keep the composed scanout frame, every frame, in this file for a "
+         "viewer in another process to map (layout in nikon-z63-scanout.h; "
+         "the z63ui repository reads it). Host-side only, like scanout-dump.");
++    object_class_property_add_str(oc, "toplcd-live",
++                                  z63_prop_get_toplcd_live,
++                                  z63_prop_set_toplcd_live);
++    object_class_property_set_description(oc, "toplcd-live",
++        "Keep what the top LCD shows -- the 128x128 panel the real MCU "
++        "drives over SPI2 -- in this file, in scanout-live's layout "
++        "(nikon-z63-toplcd.h). Needs mcu-image=. Host-side only.");
+     object_class_property_add_bool(oc, "mcu-camctl-reply",
+                                    z63_prop_get_camctl, z63_prop_set_camctl);
+     object_class_property_set_description(oc, "mcu-camctl-reply",
+-- 
+2.55.0
+

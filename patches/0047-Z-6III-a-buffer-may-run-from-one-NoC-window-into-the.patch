@@ -1,0 +1,107 @@
+From a229b72057386d5743271001b92abf98a091f07e Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Wed, 14 Oct 2026 23:35:12 +0800
+Subject: [PATCH 47/47] Z 6III: a buffer may run from one NoC window into the
+ next
+
+The graphics driver programs group 15's 512 MiB windows back to back (bus
+0x40000000 and 0x60000000 -> DRAM +0 and +512 MiB), and the menu's
+640x4320 clear at bus 0x5f979000 runs from the first into the second.
+z63_noc_translate wanted the whole span inside one window, so the clear
+was refused and the machine stopped on opening Custom Settings d:
+
+  Z63_GFX: clear geometry (0x48 0xb10) outside what z9 saw -- not modelled
+  Z63 GFX unmodeled write addr=0x015540000 ... pc=0x04026b35c -- stopping
+
+Each beat on the bus is translated by itself, so translate the range
+window by window and take it as one range when the targets are
+contiguous; anything else is refused as before. The clear's refusal now
+also prints its five geometry words.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-gfx.h |  2 ++
+ hw/arm/nikon-z63-noc.h | 41 ++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-gfx.h b/hw/arm/nikon-z63-gfx.h
+index b09afe3..d8160e7 100644
+--- a/hw/arm/nikon-z63-gfx.h
++++ b/hw/arm/nikon-z63-gfx.h
+@@ -1746,6 +1746,8 @@ static const char *z63_gfx_clear_packet(Z63Gfx *g, unsigned reg)
+             p[1] || (p[2] & (bpp - 1)) || (p[4] & 0xffff) || width > 8192 ||
+             height > 8192 || stride > 8192 || bytes > 64 * MiB ||
+             !z63_gfx_bus(g, p[2], bytes, &pa)) {
++            error_report("Z63_GFX: the clear's geometry words: %08x %08x "
++                         "%08x %08x %08x", p[0], p[1], p[2], p[3], p[4]);
+             return "clear geometry (0x48 0xb10) outside what z9 saw";
+         }
+         memcpy(g->clear_geometry, p, sizeof(g->clear_geometry));
+diff --git a/hw/arm/nikon-z63-noc.h b/hw/arm/nikon-z63-noc.h
+index 94778fa..aaeac96 100644
+--- a/hw/arm/nikon-z63-noc.h
++++ b/hw/arm/nikon-z63-noc.h
+@@ -148,8 +148,8 @@ static void z63_noc_provision(Z63Noc *n)
+  * writing (odd slots), as the firmware's own sub_411877B0 would resolve it.
+  * True only when the whole span lies inside one window.
+  */
+-static bool z63_noc_translate(Z63Noc *n, unsigned group, bool write,
+-                              uint32_t bus, uint64_t len, hwaddr *pa)
++static bool z63_noc_window(Z63Noc *n, unsigned group, bool write,
++                           uint32_t bus, hwaddr *pa, uint64_t *left)
+ {
+     unsigned paired = z63_noc_groups[group].paired;
+     unsigned slots = z63_noc_groups[group].slots << paired;
+@@ -166,13 +166,48 @@ static bool z63_noc_translate(Z63Noc *n, unsigned group, bool write,
+         w = z63_noc_slot(n, group, hi, e);
+         start = z63_noc_word(w, 0) & 0xffffffc0;
+         span = -(uint32_t)(z63_noc_word(w, 1) & 0xffffffc0);
+-        if (span && bus >= start && (uint64_t)bus - start + len <= span) {
++        if (span && bus >= start && bus - start < span) {
+             *pa = (hi ? 0x800000000ULL : 0xc00000000ULL) +
+                   (z63_noc_word(w, 2) & 0xfffffffc0ULL) + (bus - start);
++            *left = span - (bus - start);
+             return true;
+         }
+     }
+     return false;
+ }
+ 
++/*
++ * The whole of [bus, bus + len) as one physical range. Each beat on the
++ * bus is translated by itself, so a buffer may run from one window into
++ * the next; it is one range wherever their targets are contiguous, as the
++ * graphics driver programs group 15's 512 MiB windows (bus 0x40000000 and
++ * 0x60000000 -> DRAM +0 and +512 MiB, so the menu's 640x4320 clear at bus
++ * 0x5f979000 crosses into the second one). Anything else is refused, as a
++ * range outside every window is.
++ */
++static bool z63_noc_translate(Z63Noc *n, unsigned group, bool write,
++                              uint32_t bus, uint64_t len, hwaddr *pa)
++{
++    uint64_t at = bus, left;
++    hwaddr first, next;
++
++    if (!z63_noc_window(n, group, write, bus, &first, &left)) {
++        return false;
++    }
++    next = first;
++    while (left < len) {
++        hwaddr p;
++
++        at += left;
++        next += left;
++        len -= left;
++        if (at > UINT32_MAX ||
++            !z63_noc_window(n, group, write, at, &p, &left) || p != next) {
++            return false;
++        }
++    }
++    *pa = first;
++    return true;
++}
++
+ #endif /* HW_ARM_NIKON_Z63_NOC_H */
+-- 
+2.55.0
+

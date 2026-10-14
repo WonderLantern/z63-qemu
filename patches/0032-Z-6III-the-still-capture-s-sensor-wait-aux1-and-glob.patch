@@ -1,0 +1,179 @@
+From 138eb41ff8f9f247138c8493f6b5d2c77d0b0902 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 14:43:47 +0000
+Subject: [PATCH 32/47] Z 6III: the still capture's sensor wait -- aux1 and
+ global0 bit 26 at the frame boundary
+
+With the release firing (72eba8f) and the readout descriptor index in
+(a3a4f82), every photo ended 3 s later in camera error 0x40: the sensor
+module's stage 0x134 (sub_4116307C) clears flags 0x405000 of
+0xA04CE0DA0 and waits 150 ms for them (sub_4116C4EC -> sub_40D32750),
+logs 0x5070 / code 0x134 on the timeout, and CAPSEQ turns that into
+0x40.
+
+The wait is an AND. sub_40D32750 passes flag mode 2 to the kernel's
+twai_flg, and sub_4017FBDC takes mode bit 0 as OR, otherwise all bits --
+so all three were needed:
+
+  0x1000    aux0 status bit 0 (ISR sub_40C29C98, event 0x41190402,
+            sub_4115CD10) -- the frame-boundary peer already delivered it;
+  0x4000    the same from aux1, the bank at 0x15085400 (ISR sub_40C29D34,
+            event 0x41190404) -- not modelled;
+  0x400000  global0 status bit 26 (the global0 callback sub_4115C8A4),
+            enabled in the firmware's mask (0xffe7feb7) from boot -- never
+            raised.
+
+The boundary peer now also sets the aux1 bits the firmware has unmasked
+(+0x50c, bits 0..1) with event1508-aux1-model, and global0 bit 26 with
+event1508-global0-bit26-model (../z9-qemu's opt-in, there an injected
+input: "original ZR subscriber notifies 400000"; the ZR shares this
+body's sensor). Both models are in the default props. DECLARED: that
+they come at the frame boundary, every frame; what the part signals with
+them is not known.
+
+The release now runs stage 0x134 to completion, then 0xd2, 0x321 and
+0xc9/0xca, frees its buffers and stays blacked out with no error; no
+image is written yet (the still frame's data path is the next step).
+Live view is unchanged: a 66 s run completes 690 frame jobs with no
+allocation failure or camera error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c    | 30 ++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63-z9lab.h    |  2 ++
+ z63-tools/z9lab_attach.c.in | 30 ++++++++++++++++++++++++++++++
+ 3 files changed, 62 insertions(+)
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index ff01121..334c09a 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -18272,6 +18272,25 @@ static void z63_z9lab_pcie_init(NikonZ9State *s, DeviceState *gic,
+  * asked for anything. That is done here by a timer instead of over QMP, with
+  * the same period and the same two inputs; "z63-boundary-ms=0" turns it off.
+  * The period is that tool's choice, not a measured sensor timing.
++ *
++ * The still capture needs two more of the block's inputs at that boundary.
++ * Its sensor stage 0x134 (sub_4116307C) clears flags 0x405000 of
++ * 0xA04CE0DA0 and waits, up to 150 ms, for all three of them
++ * (sub_4116C4EC -> sub_40D32750, flag mode 2, which the kernel's
++ * sub_4017FBDC treats as AND; mode 1 is OR): 0x1000 is aux0 status bit 0
++ * (ISR sub_40C29C98, event 0x41190402, sub_4115CD10) -- the input above;
++ * 0x4000 is aux1's, the second bank at 0x15085400 (ISR sub_40C29D34,
++ * event 0x41190404); and 0x400000 is global0 status bit 26 (the global0
++ * callback sub_4115C8A4), which the firmware enables in its mask
++ * (0xffe7feb7) from boot. Nothing produced the last two, so every release
++ * timed out there (log 0x5070, code 0x134) and ended in camera error 0x40.
++ * With event1508-aux1-model the boundary also sets the aux1 bits the
++ * firmware has unmasked (+0x50c, bits 0..1); with
++ * event1508-global0-bit26-model it also sets global0 bit 26 (../z9-qemu's
++ * opt-in, there an injected input: "original ZR subscriber notifies
++ * 400000" -- the ZR shares this body's sensor). DECLARED, both: that they
++ * come with the frame boundary, every frame, is a choice; what the part
++ * signals with them is not known.
+  */
+ typedef struct Z63Z9Boundary {
+     NikonZ9State *s;
+@@ -18431,6 +18450,7 @@ static void z63_z9lab_boundary_tick(void *opaque)
+     Z63Z9Boundary *b = opaque;
+     NikonZ9State *s = b->s;
+     unsigned mask = s->event_capture_config_1508[0][0x10c / 4] & 3;
++    unsigned mask1 = s->event_capture_config_1508[1][0x10c / 4] & 3;
+ 
+     s->event_global1_pending |= 0x80;
+     s->event_global1_inputs++;
+@@ -18441,6 +18461,16 @@ static void z63_z9lab_boundary_tick(void *opaque)
+         event_aux0_update_irq(s);
+         b->aux_deliveries++;
+     }
++    if (s->event1508_aux1_model && mask1) {
++        s->event_aux1_pending |= mask1;
++        s->event_aux1_inputs++;
++        event_aux1_update_irq(s);
++    }
++    if (s->event1508_global0_model && s->event1508_global0_bit26_model) {
++        s->event_global0_pending |= 0x04000000;
++        s->event_global0_inputs++;
++        event_global0_update_irq(s);
++    }
+     z63_z9lab_150c_frame_end(b);
+     z63_z9lab_150c_path2_end(b);
+     b->deliveries++;
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index 59d2ef4..0dfe8d4 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -99,6 +99,7 @@ static const char z63_z9lab_default_props[] =
+     "engine150c-control-model=on;"
+     "event1508-front-model=on;"
+     "event1508-aux-model=on;"
++    "event1508-aux1-model=on;"
+     "event1508-aux-config-model=on;"
+     "event1508-aux-status-input=0:0:0:0:0:0:0:0;"
+     "event1508-channel-model=on;"
+@@ -141,6 +142,7 @@ static const char z63_z9lab_default_props[] =
+     "engine150d-readback-input=0:0:0:0:0;"
+     "multi-io-counter-model=on;"
+     "event1508-global0-bit10-model=on;"
++    "event1508-global0-bit26-model=on;"
+     "z63-boundary-ms=33;"
+     "z63-150c-frame-end=on;"
+     "z63-150c-path2-end=on;"
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 5113a72..1a39b7a 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -86,6 +86,25 @@ static void z63_z9lab_pcie_init(NikonZ9State *s, DeviceState *gic,
+  * asked for anything. That is done here by a timer instead of over QMP, with
+  * the same period and the same two inputs; "z63-boundary-ms=0" turns it off.
+  * The period is that tool's choice, not a measured sensor timing.
++ *
++ * The still capture needs two more of the block's inputs at that boundary.
++ * Its sensor stage 0x134 (sub_4116307C) clears flags 0x405000 of
++ * 0xA04CE0DA0 and waits, up to 150 ms, for all three of them
++ * (sub_4116C4EC -> sub_40D32750, flag mode 2, which the kernel's
++ * sub_4017FBDC treats as AND; mode 1 is OR): 0x1000 is aux0 status bit 0
++ * (ISR sub_40C29C98, event 0x41190402, sub_4115CD10) -- the input above;
++ * 0x4000 is aux1's, the second bank at 0x15085400 (ISR sub_40C29D34,
++ * event 0x41190404); and 0x400000 is global0 status bit 26 (the global0
++ * callback sub_4115C8A4), which the firmware enables in its mask
++ * (0xffe7feb7) from boot. Nothing produced the last two, so every release
++ * timed out there (log 0x5070, code 0x134) and ended in camera error 0x40.
++ * With event1508-aux1-model the boundary also sets the aux1 bits the
++ * firmware has unmasked (+0x50c, bits 0..1); with
++ * event1508-global0-bit26-model it also sets global0 bit 26 (../z9-qemu's
++ * opt-in, there an injected input: "original ZR subscriber notifies
++ * 400000" -- the ZR shares this body's sensor). DECLARED, both: that they
++ * come with the frame boundary, every frame, is a choice; what the part
++ * signals with them is not known.
+  */
+ typedef struct Z63Z9Boundary {
+     NikonZ9State *s;
+@@ -245,6 +264,7 @@ static void z63_z9lab_boundary_tick(void *opaque)
+     Z63Z9Boundary *b = opaque;
+     NikonZ9State *s = b->s;
+     unsigned mask = s->event_capture_config_1508[0][0x10c / 4] & 3;
++    unsigned mask1 = s->event_capture_config_1508[1][0x10c / 4] & 3;
+ 
+     s->event_global1_pending |= 0x80;
+     s->event_global1_inputs++;
+@@ -255,6 +275,16 @@ static void z63_z9lab_boundary_tick(void *opaque)
+         event_aux0_update_irq(s);
+         b->aux_deliveries++;
+     }
++    if (s->event1508_aux1_model && mask1) {
++        s->event_aux1_pending |= mask1;
++        s->event_aux1_inputs++;
++        event_aux1_update_irq(s);
++    }
++    if (s->event1508_global0_model && s->event1508_global0_bit26_model) {
++        s->event_global0_pending |= 0x04000000;
++        s->event_global0_inputs++;
++        event_global0_update_irq(s);
++    }
+     z63_z9lab_150c_frame_end(b);
+     z63_z9lab_150c_path2_end(b);
+     b->deliveries++;
+-- 
+2.55.0
+

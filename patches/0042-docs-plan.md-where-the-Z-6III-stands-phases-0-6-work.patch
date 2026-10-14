@@ -1,0 +1,514 @@
+From 999e757b4a7ec5434e9c348fcfb7160ad1c33846 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Tue, 13 Oct 2026 03:17:30 +0000
+Subject: [PATCH 42/47] docs/plan.md: where the Z 6III stands -- phases 0-6
+ worked through, what does not work, what is next
+
+The plan still described the display, input, CFexpress and capture as
+future phases and the RTOS as stopping at the graphics engine. It now
+opens with what is measured as of 3ac1f42 (boot with Linux to BusyBox,
+menus, keys, live view, a still written to the card, standby, JPEG
+decode), ranks what is known not to work (playback's resize, the other
+shutter types, the late d6 change, wake from standby, settings not
+persisting), and proposes the order for next: re-enable smoke's Linux
+check (z63-tools/frontier still records 0x15540000, which no longer
+stops anything), playback's resize, wake from standby, the shutter
+types, persistence. The method and the history are kept short; the
+rules are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/plan.md | 477 ++++++++++++++++++---------------------------------
+ 1 file changed, 163 insertions(+), 314 deletions(-)
+
+diff --git a/docs/plan.md b/docs/plan.md
+index c3de9ad..704d3d0 100644
+--- a/docs/plan.md
++++ b/docs/plan.md
+@@ -3,320 +3,169 @@
+ Goal: the RTOS and Linux both running on `nikon-z63`, with a display, working
+ menus, the ISP, and the rest of the camera actually doing something.
+ 
+-Where this starts, measured rather than assumed:
+-
+-* **Linux already works** — boots on CPU3 to an interactive BusyBox shell with
+-  a serial console. `z63-tools/smoke.sh` is the regression.
+-* **The RTOS boots and then stops.** All three cores reach the TOPPERS idle
+-  task. The application layer runs only between 3.5% and 4.1% of a 60-second
+-  run and never again.
+-* **Why it stops is known exactly.** The last application code executed is
+-  `0x402B0368`, inside `sub_402B0300`, the display subsystem's init: it
+-  configures both DISP units from the `.data` descriptors at 0xA02808440 and
+-  0xA02808478, writes 0x1548F000 / 0x15491000 / 0x15492000, registers five
+-  interrupt handlers through `sub_40C00704`, then calls `sub_401854AC` and
+-  never returns. That function is a TOPPERS **blocking** service call — it
+-  does the E_CTX context check and the E_ID range check against the count at
+-  0xA02BD2318, over 40-byte control blocks at 0xA04D27D90. It is waiting for
+-  an event that nothing will ever signal.
+-
+-**So the one thing standing between here and everything else is interrupts.**
+-No device model in this board raises an IRQ. Three independent reversing
+-passes hit the same wall from three directions: the storage model traced no
+-name-to-SPI binding and wired nothing; the HDMI driver's status dispatcher
+-`0x402B6BE8` has no pointer to it anywhere in text, rodata or `.data`, so it
+-is installed from a table built at run time; and the USB assist arm at
+-`sub_40C716E4` spins `do { delay(10); } while (flag != 1)` with no bound and
+-no register in the loop, the flag set only by an ISR. Modelling more registers
+-changes nothing until something can pull a line.
+-
+-Running notes on what is known live in `docs/symbols.md` — every function
+-identified so far, with how it is known. Add to it as each phase names more.
+-
+-## Phase 0 — integrate, and build the loop that drives every later phase
+-
+-1. Wire `nikon-z63-hdmi.h` and `nikon-z63-usb.h` into the board. Resolve the
+-   overlap first: `nikon-z63-display.h` maps 0x15496000+0x3000 as refuse-only
+-   and the HDMI model owns that span.
+-2. `z63-tools/smoke.sh` stays green: RTOS to idle with no unmodelled access,
+-   Linux to BusyBox.
+-3. Write `z63-tools/where_blocked.py`. It automates by script what was done by
+-   hand to find the answer above: run with `-d exec`, find the last execution
+-   in the application regions, print the hand-off, and name the containing
+-   functions. **Every later phase is a turn of this crank**, so it has to be
+-   one command.
+-
+-Exit: both models in, smoke green, and one command that answers "where is it
+-stuck now".
+-
+-## Phase 1 — interrupts
+-
+-1. Settle how a handler reaches a line. `sub_40C00704(id, 0, handler)` is the
+-   registration the display init uses with ids 99, 100, 101, 102 and 105;
+-   establish whether that first argument is an SPI or an index into a table,
+-   and find what consumes it. The IRQ name table at rodata 0x41847000 gives
+-   SPI *n* at `0x41847000 + 0x20n` — that arithmetic already reproduces the
+-   board's `Z63_UART_IRQ_SPI 173` from `UART_0_RX`, so it is trustworthy.
+-2. Give the board the GIC lines for the devices already modelled, from that
+-   table: `DISP_0/1/1B/DWCH` 67-70, `MIPI_DSI_TX` 73, `HDMI_MASTER/CEC` 71-72,
+-   `EXS_SDIO_*` 97-99, `EXS_UHS2_1_F_SDH30/40_*` 100-104, USB 108-110.
+-3. Make the display model raise its line when the firmware arms it, and only
+-   then. The rule the whole project runs on applies here too: an interrupt the
+-   firmware did not ask for is an invented device behaviour.
+-
+-Exit: the RTOS gets past `sub_402B0300` and new application code executes.
+-
+-## Phase 2 — turn the crank
+-
+-> **Status, loader round.** `z63-tools/smoke.sh` **PASSES both checks**: the
+-> RTOS runs 45 s with nothing stopping, and Linux reaches a BusyBox prompt in
+-> the same machine (146 serial lines, 40,917 distinct blocks). The RTOS's own
+-> serial console now works, which replaces the block count as the instrument
+-> of record. Three things got it there, in order of size:
+->
+-> 1. **The image placed in DRAM where the firmware's initial page tables
+->    expect it** -- the loader's job, see `serial-nor-resources.md`.
+->    Undefined-instruction exceptions 102,715 per 30 s -> **0**.
+-> 2. The loader band itself, `-machine loader=<file>`, which removed the
+->    stop at pc 0x40168a04.
+-> 3. Six more blocks modelled, listed in `register-windows.md`.
+->
+-> **Two open questions this round opened, both worth more than another
+-> block:**
+->
+-> * **How the body really starts Linux.** The firmware now gets far enough
+->   to release CPU3 itself -- and it asks for it at **0x40160000, the RTOS
+->   image entry**. It is claiming CPU3 as a fourth RTOS core, not handing it
+->   to Linux. So `-machine cpu3-entry` is a stand-in that fires early, and
+->   the board now says so loudly every run while keeping it, because it is
+->   the only thing that boots Linux today. Finding the real trigger is the
+->   next structural piece: it is probably the IPC bridge, and
+->   `nikon-ipc-bridge` has both ends of that path already.
+-> * **The IPC hand-off was ordered wrong, and that is fixed.** LaMainApp
+->   attaches to the share_mem directory the RTOS builds -- `sub_405B08`
+->   does `memcmp(page + 8, "MASTER", 7)` and returns NULL on mismatch, at
+->   which point `CIpcPorting_Initialize` prints `...[105], error.` and the
+->   IPC layer is dead for that run. Linux reaches userspace in ~3 s; the
+->   emulated RTOS needs far longer; the stand-in started Linux at machine
+->   reset, so Linux always lost a race the body never has. Proved by
+->   killing LaMainApp and re-running it once the RTOS was up: the error
+->   disappears. `-machine li-wait-ipc` (on by default) now holds CPU3 until
+->   that header appears. **This is not the display's gate** -- see below --
+->   but it was wrong on its own terms.
+-> * **The display still has no frame.** The scanout refuses with `output
+->   size is 0x0 (mode 0, from +0x132c/+0x1328)` -- unchanged. The crank has
+->   not yet reached whatever writes it. That is Phase 3 and it is now the
+->   top of the list.
+->
+->   **Menu drawing is the RTOS's job, not LaMainApp's** (corrected by the
+->   project owner). So the display path does not run through the Linux
+->   application at all, and the IPC fix above, while real, does not open
+->   it. What is known: `sub_402B20EC` writes the output size at +0x132c /
+->   +0x1328 and **never runs**; its call chain tops out after four
+->   functions in handlers that are only reached indirectly; the display
+->   subsystem's own event loop (`sub_402BCEB8`, a three-way dispatch) *is*
+->   alive and has taken all three of its branches; and the subsystem was
+->   still entering blocks it had never entered before at 99.7% of the way
+->   through a 60 s run. So it is progressing, not deadlocked -- it has not
+->   yet been given the event that sets a mode. The open question is which
+->   RTOS task sends it and what that task is waiting for.
+-
+-> **Status, NAND round.** The "idle, not deadlocked" reading in
+-> `register-windows.md` predates the loader round and no longer holds. Measured
+-> since, in order of what each step uncovered:
+->
+-> 1. **CPU0 was never idle.** It sat at 0x40c5e530 in task STSQNAND (priority
+->    4), polling 0x17800014 for a COMP bit plain storage never sets, retrying
+->    for ever; the 87 tasks on that core -- APPCTL, SYSCTL, GUISRV, APPMENU,
+->    APPLV, TFTDIR among them -- were runnable and starved. `z63-tools/tasks.py`
+->    now names every task (exinf points at SOLID's task object; the name is at
+->    +0x1d) and shows state, priority, core and entry.
+-> 2. **EXS1780 is a Cadence NAND controller** (SPI 105, `EXS_NF`) holding the
+->    firmware's "ANAND" store. `nikon-z63-nand.h` models it with an erased
+->    1 Gbit chip, or `-machine nand=<file>` to keep what the firmware writes.
+->    The store mounts, finds nothing, formats.
+-> 3. **That let the module lifecycle reach group 4 -- component step 4**, the
+->    value the display gate `sub_4074B484` waits for. The round driver
+->    `sub_40D6FB64` runs on three tasks (PKGB1/2/3, one per core), meeting at
+->    an event-flag barrier after each of seven groups; the waits after groups
+->    0-4 time out at 2000 ticks. Group 5 waits for all four storage
+->    sequencers; group 6 parks the two other cores in WorkSRAM and suspends
+->    DRAM -- the end of a boot, not a crash.
+-> 4. **Without the per-unit SNOR_USER data, that lifecycle desynchronises.**
+->    Component `sub_407640E0`, step 3, builds a mask with
+->    `sub_40321450({n, ...})`, which loops `n - 1` times; `n` comes from
+->    configuration object 28 and reads 0, so it loops 2^32 times. PKGB3 spends
+->    ~10 s there, the other two time out of the barrier, step out of lockstep
+->    (a stale flag bit lets the next wait through), and PKGB2 parks CPU1 while
+->    PKGB1 is still in group 5 -- whose cache-maintenance cross-call to cores
+->    0-2 (`sub_40170940(7)` -> `sub_401770BC`) then waits for ever. Traced
+->    barrier by barrier over the gdbstub. **With `-machine
+->    snor-user=<extracted body>` the loop is 0.01 s, every barrier passes in
+->    step, and the crank turns again**: the next stop is an unmodelled read of
+->    0x15540018 from pc 0x4026b37c (`sub_4026B364`, a 1 MiB-window accessor
+->    with 88 callers). So `snor-user` is no longer optional for this work.
+->
+-> Instruments and hosts, measured:
+->
+-> * **Run on exapfs (M4, bare metal).** The development machine is a VM
+->   (`Apple M2 Ultra (Virtual)`) and its guest clock advances ~105 RTOS ticks
+->   per wall second; on exapfs it is ~665. A firmware that times out at 2000
+->   ticks behaves differently on the two.
+-> * **`-icount shift=0,sleep=off`** ties guest time to instructions, so a
+->   timeout means the same work everywhere and idle periods cost nothing.
+->   It did not cure the desync above -- the 2^32 loop is real work -- which is
+->   how it was told apart from a host-speed artefact.
+-> * **HVF is not worth it yet.** EL3/EL2 appear only in `start`
+->   (0x40160000-0x40160258); the runtime has no SMC/HVC and sets only
+->   VBAR_EL1, so EL3 alone is not the problem. What is: the RTOS runs Secure
+->   EL1 beside Non-secure Linux in one GICv3 with security extensions, and HVF
+->   has no secure state; QEMU's hvf asserts on a device access without ISV
+->   (`target/arm/hvf/hvf.c`, the data-abort path), so any LDP/STP to MMIO
+->   kills the process; unknown sysregs such as CPUECTLR inject UNDEF; RAM
+->   must be 16 KiB-aligned; and `-d exec`, `-d int` and `where_blocked.py`
+->   -- the method -- are TCG-only. Days of work with lasting divergence.
+->
+-> **Then the graphics engine.** With SNOR_USER the crank reached
+-> 0x15540000, which `../z9-qemu` (WonderLantern, the Z 9 on the same SoC)
+-> had already identified as the 2D graphics engine -- same base, same
+-> register file, same 0xDECAFACE trailer, even the same microcode
+-> selectors. Its readings were re-checked against this image, not copied:
+->
+-> * **NoC bus windows** (`nikon-z63-noc.h`). The RTOS only reads back the
+->   aperture of each DMA window, which the loader sets on the body; here
+->   they were zero, so every bus address the firmware derived was garbage.
+->   Provisioned at reset with z9's explicit hypothesis, a declared choice.
+-> * **XDMAC translates bus addresses** through its group (PERI 1, EXS 2,
+->   registered by `sub_40CAA5FC`) and does the DMA memset
+->   (`sub_40CAB55C`'s fixed 8-byte source). Until the windows existed, DRAM
+->   buffers only worked because the failed lookup left CPU addresses in
+->   place.
+-> * **The other DSP memories**: measured copies to 0x1c200000, 0x1d200000
+->   and 0x1f200000 put each at +0x200000 in its 16 MiB slot.
+-> * **The engine itself** (`nikon-z63-gfx.h`): both FIFOs, fences, the DRAM
+->   command ring, and the microcode instruction layer (select / parameters
+->   / run). Configuration is executed; anything that would draw stops.
+->
+-> It now stops, on purpose, at the first draw: program 0x281, an image.
+-> The firmware has set up the engine, loaded its tables, and is drawing
+-> the menu. Rendering is the next piece -- z9 has a functional image, path,
+-> glyph and clear renderer for the same microcode, to be ported and
+-> re-verified one operation at a time.
+->
+-> Still open from this round: the 0x17840000 window (EXS1784), whose handler
+-> `sub_40C5EA9C` the NAND driver's neighbour installs for SPI 91
+-> (`EXS_NETSEC_A`), is still plain storage and unexamined.
+-
+-Repeat until the GUI task runs: locate the block, identify what it waits for,
+-model or wire that, verify progress with `where_blocked.py`. Each turn should
+-move the "last application execution" marker measurably later.
+-
+-What is already known to be waiting and will surface here: the HDMI DDC path
+-(costs 1000 ms per transfer and fails until its line exists), the USB assist
+-arm, and the card HAL. The region table and the IRQ name table name every
+-block that appears; `z63-tools/region_table.py` and `block_identify.py` do the
+-naming.
+-
+-Exit: the UI/menu task is scheduled and running. **Reached.** The module
+-start round runs, 189 named tasks exist including the display and UI
+-services, and they are blocked on their request queues rather than on
+-anything missing from the address map. "What the machine looks like once
+-nothing stops it" in `register-windows.md` has the measurements, and the
+-phases below now begin from there.
+-
+-### Where the crank has got to
+-
+-The turn is now mechanical and is written up in `register-windows.md`: the
+-stop names a PC, the PC names a function, the function says in which of three
+-shapes its driver gets the device base, and `z63-tools/make_window.py` turns
+-that into a modelled block. Seven blocks have gone through it, each one
+-surfacing the next:
+-
+-```
+-0x15080044  sensor interface        -> 0x150c0018  ISP_APB device 0x1a0
+-0x150c0018  ISP_APB device 0x1a0    -> 0x0e70073c  serial bus, instance 7
+-0x0e70073c  serial bus              -> 0x0c86f014  AUX, instance 1
+-0x0c86f014  AUX                     -> 0x15200000  the 0xa02e7b0c0 block
+-0x15200000  that block              -> 0x15340014  devices 0x185 and 0x186
+-0x15340014  devices 0x185/0x186     -> 0x15440308  (next)
+-```
+-
+-Two of those replaced hand-built models that had been built from the accesses
+-that happened to have been observed rather than from the driver: the serial
+-bus knew three offsets of thirty-six, AUX three of a hundred and twenty-three.
+-Each was stopping the machine on the first register its driver reached that
+-nobody had yet watched it reach. That is the pattern to expect from any
+-remaining block modelled the old way.
+-
+-Two things found on the way are worth more than the blocks themselves:
+-
+-* The firmware ships its own **device id to MMIO base table** in `.data`
+-  around flat 0x451fe400. A stopping address is usually in it, under an id,
+-  with its siblings beside it and its driver's entry points above it.
+-* There are two EXPEED 7 IDA databases and only one of them is this image.
+-  The other agrees closely enough to be convincing and produces wrong
+-  answers. `register-windows.md` has the md5s and the test.
+-
+-## Phase 3 — pixels
+-
+-**The device side is done.** `nikon-z63-scanout.h` reads the controller's
+-register file and composes a frame from guest DRAM, validated against the
+-Z 8 reversing work by `z63-tools/scanout_check.sh`. What is left on this
+-phase is not a model: it is the firmware writing the output size. The
+-scanout names that register in its refusal message every run. See "Phase 3:
+-the display is modelled, with scanout" in `register-windows.md`.
+-
+-
+-The display controller at 0x15480000 / 0x15484000 is modelled as a register
+-file. Scanout is not. This phase makes the DISP unit's framebuffer appear on a
+-QEMU console: find where the firmware points it, what format it writes, and
+-drive a `DisplaySurface` from guest memory. The MIPI DSI host at 0x1548D000 is
+-a Synopsys DesignWare v1.3x map and already understood register for register.
+-
+-Reference, not source: `../n-research/z8-qemu` renders the Z 8's native menu
+-through a modelled GPU and LCD controller, and `../z7-qemu` has a Bayer → ISP
+-→ LCD pipeline. Neither body's addresses transfer, but both show the shape.
+-
+-Exit: the menu is on screen.
+-
+-## Phase 4 — input
+-
+-Keys, so the menu can be navigated. The Z 8 board drives them through its
+-ExMCU over SSP/GPIO; this body's path has not been traced yet.
+-
+-Exit: the menu responds.
+-
+-## Phase 5 — CFexpress, by not writing a storage controller
+-
+-The slot is PCIe + NVMe and the firmware carries EDK2's NVMe driver verbatim
+-(`NvmExpress.c`, `NvmExpressDriverBindingStart`, `== NVME IDENTIFY CONTROLLER
+-DATA ==`, `Aqa.Asqs`). The root complex is a Synopsys DesignWare — proven by
+-`DBI_RO_WR_EN` at DBI+0x8BC written 1 then 0 around the read-only config
+-writes, `GEN3_RELATED_OFF` 0x890, `GEN3_EQ_CONTROL_OFF` 0x8A8, the MSI block
+-at 0x820-0x830, and the unrolled iATU at DBI+0x300000. Four root ports at
+-0x1A000000 / 0x1A400000 / 0x1A800000 / 0x1AC00000, controller wrappers at
+-0x17B00000 and 0x17B80000.
+-
+-So QEMU's own `hw/pci-host/designware.c` plus `-device nvme` can serve this,
+-with four gaps to close:
+-
+-1. QEMU implements only the viewport-indexed iATU at 0x900; this firmware uses
+-   the unrolled window at DBI+0x300000 and never touches 0x900.
+-2. `designware_pcie_update_viewport()` handles only `ATU_TYPE_MEM`; region 0
+-   here is `CFG0`, and that region *is* the config path.
+-3. 0x8BC, 0x890, 0x8A8, 0xB40 are unimplemented.
+-4. Link state lives outside the DBI, in the wrappers, polled as LTSSM == 0x11.
+-   Letting it time out is a legitimate first step: `sub_40289B30` then gates
+-   every access and the stack reports "no device" cleanly.
+-
+-Exit: the firmware enumerates an NVMe namespace.
+-
+-## Phase 6 — ISP and capture
+-
+-Furthest out, and not planned in detail until Phase 3 has made the display
+-path real. `PERSUIT_0..31`, `RAW0/1`, `IPU`, `RSZ`, `MPO`, `YUV_COMP/DECOMP`,
+-`JPEG_0/1`, `HEVC_STL`, `PRORES`, `MVD`, `VMAP` are all named in the IRQ table
+-and all live in `ISP_APB` / `ISP_AHB_AXI` / `CODEC` per the region table.
++The original plan (phases 0-6 below) has been worked through: the camera
++boots, draws its menus, takes key presses, runs live view and writes a
++photograph to a CFexpress card. What follows is where it stands, measured,
++what is known not to work, and the order proposed for what is next. The
++history of how it got here is kept short at the end; the commit messages
++carry the detail.
++
++## Where it stands (2026-10-13, `mcu-link` at 3ac1f42)
++
++* **Boot.** The RTOS runs on three A53 cores and starts CPU3 itself
++  (`Z63: released CPU3 at pc=0x40160000`); Linux 4.14 boots there to the
++  BusyBox shell and starts LaMainApp. The body MCU runs its own firmware
++  (`-machine mcu-image=`), with the frame link to the EXPEED, its I2C
++  expanders (the buttons), the camera clock (`mcu-rtc=`), the battery's
++  ready line and the top LCD (`toplcd-live=`).
++* **Display and menus.** The 2D graphics engine renders the GUI's image,
++  path, glyph and clear programs (`nikon-z63-gfx.h`, from `../z9-qemu`'s
++  renderer, re-checked here); the scanout composes the frame
++  (`scanout-dump=`, `scanout-live=`), which z63ui shows. All seven menu
++  tabs walk top to bottom without a stop.
++* **Input.** Keys through the MCU (`mcu-keys=`, or `qom-set mcu-keys` at
++  run time); the shutter button's contacts reach the EXPEED as EXT_INT_4/5.
++* **Live view.** The sensor streams from a Bayer file (`z9-capture-raw=`)
++  through `../z9-qemu`'s capture models (`-machine z9-capture=on`, default
++  props in `nikon-z63-z9lab.h`), the vector DSPs and the display's direct
++  input; frame by frame, with DISP cycling through its screens, the
++  histogram among them (its bins read 0).
++* **Stills.** With custom setting d6 = electronic shutter, a release writes
++  DCIM/xxxNZ6_3/DSC_nnnn.JPG (6048x4032, Exif "NIKON Z6_3") to the card and
++  live view resumes, release after release.
++* **Storage.** NAND (the "ANAND" store, `nand=`), the settings journal in
++  SNOR_USER (written; not saved to the file), a CFexpress card on PCIe
++  (`cfexpress=on`, QEMU's nvme; the camera formats it), an empty SD slot.
++* **Standby.** 30 s after live view starts with no key pressed, the
++  camera's suspend-to-RAM runs to its end -- cores off, DRAM in
++  self-refresh, the power-hold line dropped -- and `-machine power-off=`
++  decides what follows (default: a clean guest shutdown).
++* **Playback.** The JPEG cores decode (`z63-jpeg-decode`): PLAY decodes the
++  newest picture's 1620x1080 preview. It stops at the next step, the
++  resizer (below).
++* **Regression.** `z63-tools/smoke.sh` passes, but checks less than it
++  should: see "Next", item 1.
++
++## Known not to work
++
++Ranked by how much of the camera each one blocks.
++
++1. **Playback stops at the resizer.** After the decode, the resizer scales
++   the picture from RAM: A1 (0x15421100) `+4 = 0x5001` at pc 0x40c27448,
++   with the coefficient banks 0x15427000/0x15428000 and output instance
++   0x15432000. `../z9-qemu` models RAM input only for the thumbnail route
++   (A2 -> F4 -> B4, `nikon-z9-thumbnail-nv16.h`).
++2. **Shutter types other than electronic stall.** At auto, mechanical and
++   EFCS the still waits for image outputs that never come (items 0x274F/
++   0x2750 = 0x2A01/0x2038, live-view readout type 2).
++3. **A d6 change after an early half-press is late.** Half-press, then set
++   d6 to electronic: a release within ~10 s of leaving the menu still takes
++   the old shutter's path and stops on the JPEG core (0x15e20400). After
++   ~70 s idle it works. Fourteen settings items differ between the two
++   states (0x1526, 0x20a2, 0x20d6, 0x20e6, 0x242f, 0x24ab/ac, 0x270a/b,
++   0x4001, 0x4800/3, 0x5701, 0x58b); what decides is not known.
++4. **No wake from standby, and no standby after a key.** An untouched boot
++   goes to standby at ~68 s and, with the default, the machine shuts down.
++   After any key press the camera never goes to standby at all, which the
++   body would after 30 s -- unexplained. The wake is understood (below) but
++   not modelled.
++5. **Settings do not persist across boots.** SNOR_USER writes are not
++   saved (an opt-in `snor-user-save=` was proposed), so d6 must be set
++   every boot.
++6. **Smaller ones, each seen once:** live-view zoom ends in camera error
++   0x40 with the scanout stopped; AF-ON with no lens leaves the camera
++   unresponsive; Setup > clean image sensor NACKs on I2C bank 2 address
++   0x34; voice-memo options and the colour-balance picture use GFX draws
++   the model skips (YUV targets, sampler mode); movie recording, the VPU
++   (0x16010000) and ProRes (0x16000000) have not been reached.
++
++Deliberately not modelled: the ARM IPCU at 0x0C851000 (a storage stand-in
++would make sends "succeed" and then hang -- never reached), the NOR
++calibration commands of sub_455CB8CC (never reached).
++
++## Next, in the order proposed
++
++1. **Make smoke check Linux again.** `z63-tools/frontier` still records
++   0x15540000, which no longer stops anything, and its note says Linux is
++   broken in the full machine -- it is not any more (BusyBox, LaMainApp).
++   Clear the line so smoke's Linux check runs, with `power-off=continue`
++   so the 68 s standby does not end the run. Cheap, and it guards the
++   whole machine instead of half of it.
++2. **Playback's resize.** Model the RAM-input route the playback job
++   programs (item 1 above): A1's input plane and geometry, the scaler
++   instance and the 0x1543 output, and the completions its job waits for.
++   PLAY should then show the picture.
++3. **Wake from standby.** Static analysis found it a warm reboot, not a jump
++   back: the MCU's power manager polls the power-hold line (MCU PG12 <-
++   EXPEED port 3 bit 11, inferred) after the power-off frame, cuts every
++   EXPEED rail but DRAM's (PE11), and on an enabled wake line restores
++   them, raises the resume flag (PD10 -> port 3 bit 6) and releases the
++   EXPEED's reset (PC4). The EXPEED's start-up takes port 3 bit 6 high as a
++   resume (the DRAM init's mode 3; sub_40D6F7F0 at 0x40d6f844 with byte
++   0xa1bff7880). Needed: the two wires, an EXPEED-only reset that keeps
++   DRAM and the MCU, the CPU3 hand-off re-armed. Together with finding why
++   a key press disables standby, this is the "keep it awake" the z63ui
++   user asked for.
++4. **The other shutter types** (item 2), then **the late d6** (item 3):
++   both are in the capture planning, and the electronic-shutter path that
++   works is the reference.
++5. **Persist settings** behind an opt-in property (item 5).
++6. The histogram's bins (computed from the RAW pipeline's frame), and the
++   smaller items as the UI sweep reaches them.
++
++## How the work is done
++
++The method has not changed and is written up in `register-windows.md`: a
++stop names a PC, the PC names a function, the function says how its driver
++gets the device base, and the block is modelled from the driver, not from
++the accesses that happened to be seen. The instruments, all one command:
++
++* `z63-tools/where_blocked.py`, `tasks.py` (every RTOS task by name and
++  state), `gdb_probe.py`, and the TCG plugins `z63log` (camera errors,
++  function calls and callers), `z63watch`, `z63ftrace`;
++* the idasql databases of the EXPEED image, the loader and the MCU
++  firmware, and `make_window.py` / `handle_offsets.py` /
++  `window_pointers.py` for register sets;
++* sweeps: a static one of every fixed device address the image
++  materialises against the board's windows, and a scripted UI walk that
++  attributes each stop to the key that caused it (`shots.sh` steps).
++
++`../z9-qemu`'s capture models come in through `z63-tools/import_z9lab.py`,
++which writes `hw/arm/nikon-z63-z9lab.c` and reproduces it exactly: change
++the script (each Z 6III edit sits behind a `z63-*` switch documented in
++`z63-tools/z9lab_attach.c.in`), never the generated file.
++
++Run on exapfs (M4, bare metal): the development VM's guest clock runs ~6x
++slower, and firmware timeouts behave differently on the two.
++
++## How it got here
++
++* **Phase 0-1, integration and interrupts.** HDMI and USB wired; the board
++  learned to raise interrupts only when the firmware arms them; the IRQ
++  name table (rodata 0x41847000, SPI *n* at +0x20n) names every line.
++* **Phase 2, the crank.** The loader band and the image placed in DRAM
++  where the firmware's page tables expect it (undefined instructions
++  102,715 per 30 s -> 0); the NAND controller (EXS1780); the per-unit
++  SNOR_USER body (without it a 2^32 loop desynchronises the module
++  lifecycle); dozens of blocks modelled from their drivers, the history in
++  `z63-tools/frontier`. Exit reached: 189 named tasks, the GUI among them.
++* **Phase 3, pixels.** The scanout composes frames; the NoC bus windows,
++  XDMAC's bus translation and the DSP memories made the GUI's buffers real;
++  the graphics engine's draw programs were ported and re-verified one at a
++  time.
++* **Phase 4, input.** The body MCU's own firmware, run as a second machine
++  (an STM32 model), linked to the EXPEED by its SPI frames and handshake
++  wires; buttons through its I2C expanders; MENU opens.
++* **Phase 5, CFexpress.** QEMU's DesignWare host with the unrolled iATU,
++  the CFG0 region, the link wrappers, and `-device nvme`.
++* **Phase 6, ISP and capture.** `../z9-qemu`'s capture models (revision
++  deb3a75) in front of the board's windows; the DSPs' bus windows widened
++  to all of DRAM (the live-view stall); the shutter mechanism answered by
++  the MCU; the still through engine 0x150c, its frame end and the JPEG
++  cores (`z63-still-capture`).
++* **This round.** Standby to its end (`power-off=`); a static sweep closed
++  the register gaps it found (sensor interface banks, devices 0x184 and
++  0x1cc-0x1ce, EXS1784); the histogram; JPEG decode.
+ 
+ ## Rules that do not bend
+ 
+-- 
+2.55.0
+

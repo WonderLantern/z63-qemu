@@ -1,0 +1,324 @@
+From 62a27ed9d174b9b959ea5c192e50ba2c764ca533 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 03:49:15 +0000
+Subject: [PATCH 11/47] Z 6III: the audio codec answers; movie live view's
+ set-up stops timing out
+
+Module 0x421's start-up handler (sub_40E3FE2C, on a worker task) runs the
+audio service's codec init: sub_40C7F010 -> the register-script
+interpreter sub_40C7CAC0. The codec sits on serial instance 10 (logical
+channel 5, sub_40C7C894: sub_40C0040C(5)) with a GPIO chip select
+(resource 76, pin descriptor 0xa028097d8 = port 5 bit 13). Unclocked, its
+first transfer waited for ever ("instance 10 has TX words and no peer"),
+so module 0x421 never reached "started" (0xa03ab54c0 = 1), its subscriber
+sub_40F9792C never got event 0x4210000 and never set bit 2 of
+0xa03d81810, and the movie live-view set-up in sub_40F99E7C timed out on
+that flag after 3 s, every run. That 3 s wait is what the last round's
+0x40f99xxx traces were circling; the blocked task's stack, read from
+guest memory, put it in sub_40C7F010.
+
+hw/arm/nikon-z63-audio.h answers the codec as a register file. Every
+access is one of two shapes inside one chip-select low -- write
+[address, data]; read [address | 0x8000], then a one-word receive -- and
+the reads only feed the script's set-bits/clear-bits operations
+(sub_40C7E45C, sub_40C7E4AC) and a debug dump: nothing compares a value
+or polls. The peer frames on the chip select (GPIO_TOP port 5's data
+word, hooked in z63_gpio_write), keeps what is written and returns it.
+DECLARED: the file starts at zero, and words take the sinks' 2 us.
+-machine audio-codec (default on) attaches it.
+
+Verified: the codec script runs (first write 0x000f = 0x6243; a set-bits
+on 0x45 reads 0, writes 0x44, reads 0x44 back), module 0x421 finishes
+starting at t = 0.27 s, the subscriber gets 0x4210000 and the wait in
+sub_40F99E7C returns success at t = 1.7 s instead of timing out. With
+the codec answered (first tried with a zero sink on instance 10) the GUI
+draws the whole movie shooting screen over the live-view plane -- REC,
+00m00s, 2160p30, the audio meters with the external mic -- and then an
+"Error. Turn the camera off and on again" dialog: error 0x40, the next
+commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-audio.h | 183 +++++++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63.c       |  26 ++++++
+ 2 files changed, 209 insertions(+)
+ create mode 100644 hw/arm/nikon-z63-audio.h
+
+diff --git a/hw/arm/nikon-z63-audio.h b/hw/arm/nikon-z63-audio.h
+new file mode 100644
+index 0000000..c1a4035
+--- /dev/null
++++ b/hw/arm/nikon-z63-audio.h
+@@ -0,0 +1,183 @@
++/*
++ * Nikon Z 6III -- the audio codec on serial-bus instance 10.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * What is on the wire
++ * -------------------
++ * The audio service ("AudSvSe0"/"AudSvMx0", tag "DEC" at 0xa02e7b700)
++ * talks to a codec over logical serial channel 5 (sub_40C7C894:
++ * sub_40C0040C(5), stored at 0xa02e7b768), which is serial instance 10,
++ * with a GPIO chip select: resource 76, pin descriptor 0xa028097d8 =
++ * {0x4c, port 5, bit 13}, driven through GPIO_TOP port 5's data word
++ * (0x0d151014, upper half the write mask) by sub_40C15BB8. Every access
++ * is one of two shapes, each inside one chip-select low:
++ *
++ *   write  sub_40C7DDFC   one transfer: [address, data]
++ *   read   sub_40C7E2F0   one transfer: [address | 0x8000], then a second,
++ *                         receive-only one of a single word (sent as 0 by
++ *                         the serial driver's fill, sub_40C1538C), whose
++ *                         received word is the register
++ *
++ * 16-bit words, addresses up to 0x5ffe (both functions refuse higher).
++ * Those two and the debug dump are the only callers of the codec's
++ * transfer routine sub_40C7EF2C.
++ *
++ * Why it matters
++ * --------------
++ * The codec's init runs inside module 0x421's start-up handler
++ * (sub_40E3FE2C -> sub_40C7F010 -> the register script interpreter
++ * sub_40C7CAC0), on a worker task. Unclocked, its first transfer waited for
++ * ever (Z63_SIO: "instance 10 has TX words and no peer"), module 0x421 never
++ * finished starting, its subscriber sub_40F9792C never got event 0x4210000,
++ * the movie live-view set-up's 3 s wait in sub_40F99E7C timed out, and the
++ * GUI never drew the shooting screen.
++ *
++ * What the reads feed
++ * -------------------
++ * Reads exist only for the script's set-bits and clear-bits operations
++ * (sub_40C7E45C, sub_40C7E4AC: read, OR or AND-NOT, write back) and for
++ * the debug register dump sub_40C7E064. No read is compared with anything
++ * -- there is no identity check and no poll -- so a register file answers
++ * the driver the way it uses the device.
++ *
++ * DECLARED CHOICES. The register file starts at zero, which is not the
++ * codec's measured reset state (the codec is not identified); reads return
++ * what was last written. The time per word is the write-only sinks'
++ * (Z63_SIO_SINK_NS). Nothing here produces or consumes audio.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_AUDIO_H
++#define HW_ARM_NIKON_Z63_AUDIO_H
++
++#define Z63_AUDIO_SIO_INST   10      /* logical channel 5 */
++#define Z63_AUDIO_CS_PORT    5       /* GPIO_TOP port 5, 0x0d151014 */
++#define Z63_AUDIO_CS_BIT     13
++#define Z63_AUDIO_REGS       0x6000
++#define Z63_AUDIO_LOG        16      /* first accesses named on stderr */
++
++typedef enum {
++    Z63_AUDIO_ADDR,                  /* the next word is an address */
++    Z63_AUDIO_WRITE,                 /* the next word is data to store */
++    Z63_AUDIO_READ,                  /* the next word clocks the register out */
++    Z63_AUDIO_DONE,                  /* frame complete; more words are stray */
++} Z63AudioState;
++
++typedef struct Z63Audio {
++    Z63Sio *sio;
++    QEMUTimer *timer;
++    bool attached;
++    bool selected;                   /* chip select low */
++    Z63AudioState state;
++    uint16_t reg;
++    uint16_t regs[Z63_AUDIO_REGS];
++    uint64_t writes, reads, stray;
++} Z63Audio;
++
++static void z63_audio_log(Z63Audio *a, const char *what, uint16_t reg,
++                          uint16_t value)
++{
++    uint64_t n = a->writes + a->reads;
++
++    if (n <= Z63_AUDIO_LOG) {
++        error_report("Z63_AUDIO: %s reg 0x%04x = 0x%04x%s", what, reg, value,
++                     n == Z63_AUDIO_LOG ? " (further accesses not logged)"
++                                        : "");
++    }
++}
++
++static uint16_t z63_audio_word(void *opaque, unsigned inst, uint16_t out)
++{
++    Z63Audio *a = opaque;
++    uint16_t in = 0;
++
++    switch (a->state) {
++    case Z63_AUDIO_ADDR:
++        a->reg = out & 0x7fff;
++        if (a->reg >= Z63_AUDIO_REGS) {
++            a->state = Z63_AUDIO_DONE;
++            goto stray;
++        }
++        a->state = (out & 0x8000) ? Z63_AUDIO_READ : Z63_AUDIO_WRITE;
++        break;
++    case Z63_AUDIO_WRITE:
++        a->regs[a->reg] = out;
++        a->writes++;
++        z63_audio_log(a, "write", a->reg, out);
++        a->state = Z63_AUDIO_DONE;
++        break;
++    case Z63_AUDIO_READ:
++        in = a->regs[a->reg];
++        a->reads++;
++        z63_audio_log(a, "read", a->reg, in);
++        a->state = Z63_AUDIO_DONE;
++        break;
++    case Z63_AUDIO_DONE:
++    stray:
++        if (a->stray++ == 0) {
++            error_report("Z63_AUDIO: word 0x%04x outside the two transfer "
++                         "shapes (pc=0x%" PRIx64 "); answered 0 -- see "
++                         "nikon-z63-audio.h", out, z63_current_pc());
++        }
++        break;
++    }
++    return in;
++}
++
++static void z63_audio_clock(void *opaque)
++{
++    Z63Audio *a = opaque;
++
++    z63_sio_clock(a->sio, Z63_AUDIO_SIO_INST, Z63_SIO_FIFO, z63_audio_word,
++                  a);
++}
++
++static void z63_audio_kick(void *opaque, unsigned inst)
++{
++    Z63Audio *a = opaque;
++    unsigned words = a->sio->pio[inst].tx_queued;
++
++    if (!timer_pending(a->timer)) {
++        timer_mod(a->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  (int64_t)words * Z63_SIO_SINK_NS);
++    }
++}
++
++/* GPIO_TOP port Z63_AUDIO_CS_PORT changed: a falling chip select starts a
++ * frame. */
++static void z63_audio_cs(Z63Audio *a, uint16_t port_word)
++{
++    bool selected = !(port_word & (1u << Z63_AUDIO_CS_BIT));
++
++    if (!a->attached || selected == a->selected) {
++        return;
++    }
++    a->selected = selected;
++    if (selected) {
++        a->state = Z63_AUDIO_ADDR;
++    }
++}
++
++static void z63_audio_init(Z63Audio *a, Z63Sio *sio, bool attach)
++{
++    a->sio = sio;
++    if (!attach) {
++        return;
++    }
++    if (sio->kick[Z63_AUDIO_SIO_INST]) {
++        error_report("Z63_AUDIO: serial instance %u already has a peer",
++                     Z63_AUDIO_SIO_INST);
++        exit(1);
++    }
++    a->attached = true;
++    a->state = Z63_AUDIO_DONE;          /* until the first chip select */
++    a->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_audio_clock, a);
++    sio->kick[Z63_AUDIO_SIO_INST] = z63_audio_kick;
++    sio->kick_opaque[Z63_AUDIO_SIO_INST] = a;
++    error_report("Z63_AUDIO: codec register file on serial instance %u, "
++                 "chip select GPIO port %u bit %u (declared: starts at zero; "
++                 "see nikon-z63-audio.h, -machine audio-codec=)",
++                 Z63_AUDIO_SIO_INST, Z63_AUDIO_CS_PORT, Z63_AUDIO_CS_BIT);
++}
++
++#endif /* HW_ARM_NIKON_Z63_AUDIO_H */
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index b617eed..174c562 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -601,6 +601,7 @@ static uint64_t z63_current_pc(void);
+ #include "hw/arm/nikon-z63-i2c.h"
+ #include "hw/arm/nikon-z63-imu.h"
+ #include "hw/arm/nikon-z63-sio.h"
++#include "hw/arm/nikon-z63-audio.h"
+ #include "hw/arm/nikon-z63-mcu.h"
+ #include "hw/arm/nikon-z63-stm32.h"    /* the MCU itself, as the board's peer */
+ #include "hw/arm/nikon-z63-wlsd.h"
+@@ -726,6 +727,7 @@ typedef struct NikonZ63State {
+     uint32_t cfg7_words[Z63_CFG7_SIZE / 4];
+ 
+     Z63Sio sio;                /* serial-bus controllers, nikon-z63-sio.h */
++    Z63Audio audio;            /* codec on serial instance 10, -audio.h */
+     Z63ExtInt extint;          /* EXT_INT edge detector, nikon-z63-extint.h */
+     Z63Mcu mcu;                /* synthetic MCU peer, nikon-z63-mcu.h */
+     Z63RegWindow wlsd_vendor;  /* Linux's SDIO host, nikon-z63-wlsd.h */
+@@ -803,6 +805,7 @@ typedef struct NikonZ63State {
+     bool gfx_skip_unmodelled;    /* nikon-z63-gfx.h, skip_unmodelled */
+     char *scanout_dump;          /* host-side PPM of the scanout */
+     char *sio_sink;              /* write-only serial sinks, nikon-z63-sio.h */
++    bool audio_codec;            /* nikon-z63-audio.h */
+     bool z9_capture;             /* nikon-z63-z9lab.h */
+     char *z9_capture_props;
+     char *z9_capture_raw;
+@@ -2049,6 +2052,9 @@ static void z63_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+     if (addr < 0x100 && !(addr % 4)) {
+         z63_wires_drive_mcu(s, addr / 4, *config);
+     }
++    if (addr == Z63_AUDIO_CS_PORT * 4) {
++        z63_audio_cs(&s->audio, *config);
++    }
+ }
+ 
+ static const MemoryRegionOps z63_gpio_ops = {
+@@ -4259,6 +4265,7 @@ static void z63_init(MachineState *machine)
+         qemu_input_handler_activate(
+             qemu_input_handler_register(NULL, &z63_kbd_handler));
+     }
++    z63_audio_init(&s->audio, &s->sio, s->audio_codec);
+     z63_sio_sinks(&s->sio, s->sio_sink);
+ 
+     /* The block named by the single runtime pointer at 0xa02e7b0c0. See
+@@ -4600,6 +4607,7 @@ static void z63_machine_instance_init(Object *obj)
+      * it with zeros, which is the declared limit of this choice. */
+     s->sio_sink = g_strdup("9:8");
+     s->storage_caps_stub = true; /* nikon-z63-storage.h, declared values */
++    s->audio_codec = true;       /* nikon-z63-audio.h, declared register file */
+     s->soc_chip_id = Z63_SOC_CHIP_ID_DEFAULT;
+ }
+ 
+@@ -4863,6 +4871,16 @@ static void z63_prop_set_sio_sink(Object *obj, const char *value,
+     s->sio_sink = g_strdup(value);
+ }
+ 
++static bool z63_prop_get_audio_codec(Object *obj, Error **errp)
++{
++    return NIKON_Z63(obj)->audio_codec;
++}
++
++static void z63_prop_set_audio_codec(Object *obj, bool value, Error **errp)
++{
++    NIKON_Z63(obj)->audio_codec = value;
++}
++
+ static bool z63_prop_get_storage_caps_stub(Object *obj, Error **errp)
+ {
+     return NIKON_Z63(obj)->storage_caps_stub;
+@@ -5194,6 +5212,14 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "colons: each word sent is logged and a zero word comes back. "
+         "Default \"9:8\", the rear panel's and the image sensor's control "
+         "port; empty attaches none. See nikon-z63-sio.h.");
++    object_class_property_add_bool(oc, "audio-codec",
++                                   z63_prop_get_audio_codec,
++                                   z63_prop_set_audio_codec);
++    object_class_property_set_description(oc, "audio-codec",
++        "Answer the audio codec on serial instance 10 (chip select GPIO "
++        "port 5 bit 13) as a register file that starts at zero: writes are "
++        "kept, reads return them. Default on; off leaves the instance "
++        "unclocked. See nikon-z63-audio.h.");
+     object_class_property_add_bool(oc, "storage-caps-stub",
+                                    z63_prop_get_storage_caps_stub,
+                                    z63_prop_set_storage_caps_stub);
+-- 
+2.55.0
+

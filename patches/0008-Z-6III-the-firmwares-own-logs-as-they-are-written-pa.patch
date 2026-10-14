@@ -1,0 +1,561 @@
+From 991ad39f57d27606bc8bc744e5c35923f9646f39 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Sun, 11 Oct 2026 18:14:16 +0000
+Subject: [PATCH 08/47] Z 6III: the firmwares' own logs as they are written;
+ past the GUI draws
+
+Logs. Neither processor prints a boot log, but both keep binary ones:
+the RTOS's application layer writes 32-byte records to per-module rings
+in heap memory through one function, sub_40C06924(object, level, a,
+code, b) -- 84 modules' wrappers end there, the camera controller's
+among them -- the kernel has TOPPERS syslog (syslog_wri_log at
+0x401842f8; fully enabled, never called on a healthy boot), and the body
+MCU keeps an error ring through sub_80214C0(code, value). The rings sit
+in runtime heap, scattered over 84 objects, so instead of mapping them
+the new TCG plugin z63-tools/plugins/z63log.c hooks those three entry
+points and writes one line per call: module (the object's first u16),
+level, code, arguments and the calling address, in host-time order.
+Build with z63-tools/plugins/build.sh; load with
+-plugin z63-tools/plugins/libz63log.dylib,out=<file>, or Z63_LOG=<file>
+with gui.sh. The build has to be configured with -Dplugins=true (this
+tree's is now); without the plugin loaded nothing changes. A boot gives
+some 9000 records in two minutes, the sensor-ready timeout 0x1EA7 among
+them.
+
+Graphics. The GUI's movie shooting screen uses two image states the
+Z 9 never did:
+- 0x48 reg 0x640 = 1 with eight words at 0x641..0x648 (float32 >> 13,
+  from sub_40243FF0 through sub_402226B0). The first sets the GUI sends
+  are four (1.0, 0.0) pairs -- read as a per-channel scale/offset, the
+  identity -- and those are drawn as if 0x640 were 0; anything else
+  still stops, and the state is reported in full. The packet itself is
+  stored now instead of stopping at once.
+- an RGBA source with the sampler words the model only knows for A8
+  stencils (0x610 = 0x39, 0x611 = 2, 0x630 = 3). Not decoded.
+For runs that need to get past such draws, -machine
+gfx-skip-unmodelled=on drops a draw the model refuses at its commit --
+no pixels written, fences complete, each reason named once -- instead
+of stopping. Off by default.
+
+Where live view stands: CSEQ powers the sensor up, FrontEnd starts the
+0x150C front-end engine (PPC_0) and waits 400 ms for its first-frame
+completion (resource events 0x422D0002/3 -> sub_410B05A8 -> FrontEnd's
+callbacks -> 0xA04072F10 bit 4). That needs the sensor to be streaming,
+which nothing models yet, so FrontEnd logs 7624 and CSEQ times out with
+0x1EA7.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-gfx.h       |  92 +++++++++++++-
+ hw/arm/nikon-z63.c           |  21 ++++
+ z63-tools/gui.sh             |  13 +-
+ z63-tools/plugins/.gitignore |   2 +
+ z63-tools/plugins/build.sh   |  17 +++
+ z63-tools/plugins/z63log.c   | 238 +++++++++++++++++++++++++++++++++++
+ 6 files changed, 376 insertions(+), 7 deletions(-)
+ create mode 100644 z63-tools/plugins/.gitignore
+ create mode 100755 z63-tools/plugins/build.sh
+ create mode 100644 z63-tools/plugins/z63log.c
+
+diff --git a/hw/arm/nikon-z63-gfx.h b/hw/arm/nikon-z63-gfx.h
+index 8ccd535..b09afe3 100644
+--- a/hw/arm/nikon-z63-gfx.h
++++ b/hw/arm/nikon-z63-gfx.h
+@@ -192,6 +192,13 @@ typedef struct Z63Gfx {
+     uint32_t ring_head;
+     uint64_t descriptors;
+     uint32_t reported;                 /* first use of each kind */
++    /* -machine gfx-skip-unmodelled=on: a draw this model refuses at its
++     * commit is dropped instead of stopping the machine -- no pixels are
++     * written, the fences still complete -- and each distinct reason is
++     * named once. A DECLARED CHOICE for runs that need to get past the GUI
++     * to something else; the picture is then knowingly incomplete. */
++    bool skip_unmodelled;
++    GHashTable *skipped;               /* reason -> count */
+ } Z63Gfx;
+ 
+ static void z63_gfx_first(Z63Gfx *g, unsigned bit, const char *fmt, ...)
+@@ -672,6 +679,59 @@ static const char *z63_gfx_render_yuva(Z63Gfx *g, const Z63GfxImage *in,
+     return NULL;
+ }
+ 
++/*
++ * 0x48 reg 0x640 = 1 with eight words at 0x641..0x648: an image state the
++ * Z 9 never used (it only ever wrote 0x640 = 0). The GUI's image-state
++ * builder sub_40243FF0 sends it, through sub_402226B0, when its flag
++ * 0xA02E5CD84 or 0xA02E5CD8C is set: eight float32 words of its state at
++ * +0x4ac..+0x4c8, each >> 13 -- float32 cut to 19 bits, 1.0 becoming
++ * 0x1fc00 -- then 0x640 = 1. The first ones the GUI sends are four pairs
++ * of (1.0, 0.0), which reads as a per-channel scale and offset: a colour
++ * transform, and that one the identity. The identity changes no pixel, so
++ * it is drawn as if 0x640 were 0; any other set of words still stops the
++ * draw, naming them (z63_gfx_quad_report). That the pairs are scale/offset
++ * is a reading of the values, not established; only the identity case
++ * depends on it.
++ */
++static bool z63_gfx_identity_transform(const uint32_t *c48)
++{
++    for (unsigned i = 0; i < 8; i++) {
++        if (c48[0x641 + i] != (i & 1 ? 0 : 0x1fc00)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static void z63_gfx_quad_report(Z63Gfx *g)
++{
++    uint32_t *c48 = g->bank[6];
++    double m[9];
++
++    for (unsigned i = 0; i < 9; i++) {
++        m[i] = z63_gfx_float(g->image_matrix[i]);
++    }
++    error_report("Z63_GFX: image with 0x640 = %u: quad 0x641..0x648 = "
++                 "%d,%d %d,%d %d,%d %d,%d (as words: %08x %08x %08x %08x "
++                 "%08x %08x %08x %08x); 0x610 = 0x%x 0x611 = 0x%x "
++                 "0x630 = 0x%x 0x650 = 0x%x 0x4b4 = 0x%x 0x21 = 0x%x "
++                 "0x4f8 = 0x%x 0x620 = 0x%x; image %gx%g; matrix "
++                 "[%g %g %g; %g %g %g; %g %g %g]; clip %u,%u..%u,%u",
++                 c48[0x640], (int32_t)c48[0x641], (int32_t)c48[0x642],
++                 (int32_t)c48[0x643], (int32_t)c48[0x644],
++                 (int32_t)c48[0x645], (int32_t)c48[0x646],
++                 (int32_t)c48[0x647], (int32_t)c48[0x648],
++                 c48[0x641], c48[0x642], c48[0x643], c48[0x644],
++                 c48[0x645], c48[0x646], c48[0x647], c48[0x648],
++                 c48[0x610], c48[0x611], c48[0x630], c48[0x650],
++                 c48[0x4b4], c48[0x21], c48[0x4f8], c48[0x620],
++                 z63_gfx_float(g->image_geometry[0]),
++                 z63_gfx_float(g->image_geometry[1]),
++                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8],
++                 g->bank[5][0xe0] >> 16, g->bank[5][0xe0] & 0xffff,
++                 g->bank[5][0xe1] >> 16, g->bank[5][0xe1] & 0xffff);
++}
++
+ /* Draw the pending image. NULL on success, else the check that failed. */
+ static const char *z63_gfx_render_image(Z63Gfx *g)
+ {
+@@ -708,6 +768,9 @@ static const char *z63_gfx_render_image(Z63Gfx *g)
+     Z63GfxImage in;
+     const char *why;
+ 
++    if (c48[0x640] && !z63_gfx_identity_transform(c48)) {
++        z63_gfx_quad_report(g);
++    }
+ #define NEED(cond, what) do { if (!(cond)) { return what; } } while (0)
+     NEED(z63_gfx_surface_height(g, g->image_control[0], y0, y1, &sheight),
+          "the target height (0x43 slot 0x12c), image control or clip");
+@@ -727,7 +790,10 @@ static const char *z63_gfx_render_image(Z63Gfx *g)
+     NEED(stencil || c47[0xc1] == 255, "0x47 0xc1 not 255 for a normal draw");
+     NEED(c48[0x4b1] == 1, "0x48 0x4b1 not 1");
+     NEED(stencil || normal, "a sampler mode (0x48 0x610/0x611/0x630/0x650)");
+-    NEED(c48[0x620] == 0 && c48[0x640] == 0, "0x48 0x620 / 0x640 not 0");
++    NEED(c48[0x620] == 0, "0x48 0x620 not 0");
++    NEED(c48[0x640] == 0 ||
++         (c48[0x640] == 1 && z63_gfx_identity_transform(c48)),
++         "a colour transform (0x48 0x640..0x648) other than the identity");
+     NEED(m[6] == 0 && m[7] == 0 && m[8] == 1 && fabs(det) >= 1e-8,
+          "a projective or singular image matrix");
+     NEED(over || !memcmp(&c48[0x780], src_coeff, sizeof(src_coeff)),
+@@ -2000,10 +2066,9 @@ static bool z63_gfx_commit(Z63Gfx *g, hwaddr off)
+         }
+         if (op == 0x48) {
+             for (unsigned i = 0; i < g->need; i++) {
+-                if ((reg + i == 0xb00 || reg + i == 0x640) && g->payload[i]) {
+-                    why = reg + i == 0xb00 ? "a clear start (0x48 reg 0xb00) "
+-                                             "inside a longer packet"
+-                                           : "a draw start (0x48 reg 0x640)";
++                if (reg + i == 0xb00 && g->payload[i]) {
++                    why = "a clear start (0x48 reg 0xb00) inside a longer "
++                          "packet";
+                 }
+             }
+             if (why) {
+@@ -2028,7 +2093,22 @@ static bool z63_gfx_commit(Z63Gfx *g, hwaddr off)
+                               : g->image_pending ? z63_gfx_render_image(g)
+                                                  : z63_gfx_render_path(g);
+ 
+-            if (bad) {
++            if (bad && g->skip_unmodelled) {
++                uintptr_t n;
++
++                if (!g->skipped) {
++                    g->skipped = g_hash_table_new(g_str_hash, g_str_equal);
++                }
++                n = GPOINTER_TO_UINT(g_hash_table_lookup(g->skipped, bad)) + 1;
++                g_hash_table_insert(g->skipped, (gpointer)bad,
++                                    GUINT_TO_POINTER(n));
++                if (n == 1 || !(n & (n - 1))) {
++                    error_report("Z63_GFX: skipped a draw this model cannot "
++                                 "do (%" PRIuPTR "x): %s -- no pixels "
++                                 "written (gfx-skip-unmodelled=on)", n, bad);
++                }
++                g->image_pending = g->path_pending = false;
++            } else if (bad) {
+                 g_autofree char *msg = g_strdup_printf("a draw this model "
+                                                        "cannot do: %s", bad);
+                 z63_gfx_refuse(off, g->header, msg);
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 8f2b44d..486c73f 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -800,6 +800,7 @@ typedef struct NikonZ63State {
+     Z63Stm32 real_mcu;           /* the MCU itself, when mcu_image is set */
+     bool real_mcu_built;
+     bool storage_caps_stub;      /* SD capability words, declared values */
++    bool gfx_skip_unmodelled;    /* nikon-z63-gfx.h, skip_unmodelled */
+     char *scanout_dump;          /* host-side PPM of the scanout */
+     char *sio_sink;              /* write-only serial sinks, nikon-z63-sio.h */
+     bool z9_capture;             /* nikon-z63-z9lab.h */
+@@ -4390,6 +4391,7 @@ static void z63_init(MachineState *machine)
+                      "disables it");
+     }
+     z63_gfx_init(OBJECT(machine), sysmem, &s->gfx, &s->noc);
++    s->gfx.skip_unmodelled = s->gfx_skip_unmodelled;
+ 
+     /* Five sibling blocks, one subregion per instance (see z63_sib_read).
+      * The region spans the whole family so an access between instances
+@@ -4874,6 +4876,16 @@ static void z63_prop_set_li_wait_ipc(Object *obj, bool value, Error **errp)
+     s->li_wait_ipc = value;
+ }
+ 
++static bool z63_prop_get_gfx_skip(Object *obj, Error **errp)
++{
++    return NIKON_Z63(obj)->gfx_skip_unmodelled;
++}
++
++static void z63_prop_set_gfx_skip(Object *obj, bool value, Error **errp)
++{
++    NIKON_Z63(obj)->gfx_skip_unmodelled = value;
++}
++
+ static bool z63_prop_get_image_in_dram(Object *obj, Error **errp)
+ {
+     NikonZ63State *s = NIKON_Z63(obj);
+@@ -5207,6 +5219,15 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "wire is logged; empty (the default) leaves the pins as they were, "
+         "which is what the two chips' own firmware reads. See nikon-z63.c's "
+         "Z63McuWire.");
++    object_class_property_add_bool(oc, "gfx-skip-unmodelled",
++                                   z63_prop_get_gfx_skip,
++                                   z63_prop_set_gfx_skip);
++    object_class_property_set_description(oc, "gfx-skip-unmodelled",
++        "Drop a graphics draw the model cannot do, at its commit, instead of "
++        "stopping the machine: no pixels are written, fences complete, and "
++        "each distinct reason is named once on stderr. For runs that have to "
++        "get past the GUI; the picture is then knowingly incomplete. Off by "
++        "default. See nikon-z63-gfx.h.");
+     object_class_property_add_bool(oc, "li-wait-ipc",
+                                    z63_prop_get_li_wait_ipc,
+                                    z63_prop_set_li_wait_ipc);
+diff --git a/z63-tools/gui.sh b/z63-tools/gui.sh
+index 522411d..52949bf 100755
+--- a/z63-tools/gui.sh
++++ b/z63-tools/gui.sh
+@@ -25,6 +25,11 @@
+ # drive. Declared, and each wire is logged as Z63_MCU_WIRE.
+ #
+ #
++# Z63_LOG=<file> loads z63-tools/plugins/libz63log (build it with
++# z63-tools/plugins/build.sh) and writes the firmwares' own log calls there,
++# one line each: the RTOS's binary module logs, its kernel syslog and the
++# body MCU's error log. The build must be configured with -Dplugins=true.
++#
+ # NAND is copied before every run (to $NAND.run) because the firmware
+ # writes to it; the original is never touched. Without NAND the RTOS does
+ # not get as far as the display.
+@@ -62,9 +67,15 @@ if [ -n "${MCU:-}" ]; then
+     [ -n "${MCU_SPI_PEER:-}" ] && OPT="$OPT,mcu-spi-peer=$MCU_SPI_PEER"
+     SMP=4,maxcpus=5
+ fi
++PLUGIN=""
++if [ -n "${Z63_LOG:-}" ]; then
++    lib=$(cd "$(dirname "$0")" && pwd)/plugins/libz63log
++    [ -f "$lib.dylib" ] && lib=$lib.dylib || lib=$lib.so
++    PLUGIN="-plugin $lib,out=$Z63_LOG"
++fi
+ rm -f /tmp/z63-gui.sock
+ exec "$QEMU" -name z63-gui -machine "nikon-z63$OPT" \
+     -cpu cortex-a53 -smp "$SMP" -bios "$DIR/eg2010_0200i1.bi" \
+     -serial file:/tmp/z63-gui-serial.log -monitor none \
+     -qmp unix:/tmp/z63-gui.sock,server=on,wait=off \
+-    -display cocoa -action shutdown=pause "$@"
++    -display cocoa -action shutdown=pause $PLUGIN "$@"
+diff --git a/z63-tools/plugins/.gitignore b/z63-tools/plugins/.gitignore
+new file mode 100644
+index 0000000..b013b0f
+--- /dev/null
++++ b/z63-tools/plugins/.gitignore
+@@ -0,0 +1,2 @@
++*.dylib
++*.so
+diff --git a/z63-tools/plugins/build.sh b/z63-tools/plugins/build.sh
+new file mode 100755
+index 0000000..bbdc235
+--- /dev/null
++++ b/z63-tools/plugins/build.sh
+@@ -0,0 +1,17 @@
++#!/bin/sh
++# Build the z63 TCG plugins against this tree's plugin header. The QEMU
++# that loads them must be configured with -Dplugins=true.
++set -e
++here=$(cd "$(dirname "$0")" && pwd)
++top=$(cd "$here/../.." && pwd)
++case "$(uname)" in
++Darwin) ext=dylib; ld="-dynamiclib -undefined dynamic_lookup" ;;
++*)      ext=so;    ld="-shared" ;;
++esac
++for src in "$here"/*.c; do
++    name=$(basename "$src" .c)
++    cc -O2 -fPIC -Wall $ld -I"$top/include/qemu" \
++        $(pkg-config --cflags glib-2.0) \
++        -o "$here/lib$name.$ext" "$src"
++    echo "built $here/lib$name.$ext"
++done
+diff --git a/z63-tools/plugins/z63log.c b/z63-tools/plugins/z63log.c
+new file mode 100644
+index 0000000..1ba64ed
+--- /dev/null
++++ b/z63-tools/plugins/z63log.c
+@@ -0,0 +1,238 @@
++/*
++ * z63log -- the Z 6III firmwares' own logs, line by line, as they are written.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Neither processor prints a boot log. The RTOS's application layer logs to
++ * binary rings in heap memory through one writer, sub_40C06924(object,
++ * level, a, code, b) -- 84 modules' wrappers end there, among them the
++ * camera controller's (sub_40F561E0) and the capture modules' trace -- and
++ * the object's first u16 names the module. The kernel layer has TOPPERS
++ * syslog, syslog_wri_log(prio, record) at 0x401842f8, which is fully
++ * enabled and never called on a healthy boot. The body MCU keeps an error
++ * ring through sub_80214C0(code, value). This plugin hooks the entry of
++ * those three and writes one line per call:
++ *
++ *   <seq> <us> cpu<n> log  mod=0x42 lvl=1 a=0x1 code=0x1ea7 b=0x0 from=0x40f3b2ec
++ *   <seq> <us> cpu<n> syslog prio=3 fmt="..." args=0x.. 0x.. ...
++ *   <seq> <us> cpu4  mcu  code=10002 value=0x0 from=0x8041f8d
++ *
++ * <us> is host time in microseconds since the plugin loaded: good for order
++ * and gaps, not guest time (QEMU's register list does not expose
++ * CNTVCT_EL0, and plugins get no virtual clock). Codes are the firmware's
++ * own numbers; what they mean is not decoded here. listregs=on names the
++ * registers vCPU 0 offers, for extending the hooks.
++ *
++ *   build: z63-tools/plugins/build.sh   (needs a QEMU configured with
++ *          -Dplugins=true; this tree's build has it)
++ *   use:   -plugin z63-tools/plugins/libz63log.dylib,out=/tmp/z63log.txt
++ */
++#include <glib.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++#include <qemu-plugin.h>
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
++
++enum { ARCH_UNKNOWN, ARCH_A53, ARCH_M4 };
++
++typedef struct Hook {
++    uint64_t pc;
++    int arch;
++    const char *what;
++} Hook;
++
++static const Hook hooks[] = {
++    { 0x40c06924, ARCH_A53, "log" },     /* sub_40C06924 */
++    { 0x401842f8, ARCH_A53, "syslog" },  /* syslog_wri_log */
++    { 0x080214c0, ARCH_M4,  "mcu" },     /* sub_80214C0 */
++};
++
++#define MAX_VCPUS 16
++
++typedef struct Vcpu {
++    int arch;
++    struct qemu_plugin_register *arg[5], *link;
++} Vcpu;
++
++static Vcpu vcpus[MAX_VCPUS];
++static FILE *out;
++static GMutex lock;
++static uint64_t seq;
++static int64_t t0;
++static bool list_regs;                  /* listregs=on: name vCPU 0's */
++
++static uint64_t reg_u64(struct qemu_plugin_register *r)
++{
++    g_autoptr(GByteArray) buf = g_byte_array_new();
++    uint64_t v = 0;
++    int n;
++
++    if (!r) {
++        return 0;
++    }
++    n = qemu_plugin_read_register(r, buf);
++    if (n > 0) {
++        memcpy(&v, buf->data, MIN((size_t)n, sizeof(v)));   /* LE host */
++    }
++    return v;
++}
++
++static bool mem_read(uint64_t addr, void *dst, size_t len)
++{
++    g_autoptr(GByteArray) buf = g_byte_array_new();
++
++    if (!qemu_plugin_read_memory_vaddr(addr, buf, len) || buf->len < len) {
++        return false;
++    }
++    memcpy(dst, buf->data, len);
++    return true;
++}
++
++static void vcpu_init(qemu_plugin_id_t id, unsigned int idx)
++{
++    g_autoptr(GArray) regs = qemu_plugin_get_registers();
++    Vcpu *v;
++
++    if (idx >= MAX_VCPUS) {
++        return;
++    }
++    v = &vcpus[idx];
++    for (guint i = 0; i < regs->len; i++) {
++        qemu_plugin_reg_descriptor *d =
++            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
++
++        if (list_regs && idx == 0) {
++            fprintf(out, "# reg %s (%s)\n", d->name,
++                    d->feature ? d->feature : "-");
++        }
++
++        for (int a = 0; a < 5; a++) {
++            char x[4], r[4];
++
++            snprintf(x, sizeof(x), "x%d", a);
++            snprintf(r, sizeof(r), "r%d", a);
++            if (!strcmp(d->name, x)) {
++                v->arg[a] = d->handle;
++                v->arch = ARCH_A53;
++            } else if (!strcmp(d->name, r)) {
++                v->arg[a] = d->handle;
++                if (v->arch == ARCH_UNKNOWN) {
++                    v->arch = ARCH_M4;
++                }
++            }
++        }
++        if (!strcmp(d->name, "x30") || !strcmp(d->name, "lr")) {
++            v->link = d->handle;
++        }
++    }
++}
++
++static void hit(unsigned int idx, void *udata)
++{
++    const Hook *h = udata;
++    Vcpu *v = idx < MAX_VCPUS ? &vcpus[idx] : NULL;
++    uint64_t a[5], from;
++    char ts[24];
++
++    if (!v || v->arch != h->arch) {
++        return;
++    }
++    for (int i = 0; i < 5; i++) {
++        a[i] = reg_u64(v->arg[i]);
++    }
++    from = reg_u64(v->link);
++    snprintf(ts, sizeof(ts), "%" PRId64, g_get_monotonic_time() - t0);
++
++    g_mutex_lock(&lock);
++    if (!strcmp(h->what, "log")) {
++        uint16_t mod = 0;
++
++        mem_read(a[0], &mod, sizeof(mod));
++        fprintf(out, "%" PRIu64 " %s cpu%u log mod=0x%x lvl=%" PRIu64
++                " a=0x%" PRIx64 " code=0x%" PRIx64 " b=0x%" PRIx64
++                " from=0x%" PRIx64 "\n", seq++, ts, idx, mod, a[1],
++                a[2] & 0xffffffff, a[3] & 0xffffffff, a[4] & 0xffffffff,
++                from);
++    } else if (!strcmp(h->what, "syslog")) {
++        /* TOPPERS SYSLOG: logtype, logtim, prcid, then loginfo[], whose
++         * first word is the format string for the printf-style types. */
++        uint64_t rec[9] = { 0 };
++        char fmt[128] = "";
++
++        mem_read(a[1], rec, sizeof(rec));
++        if (rec[3] >= 0x40000000 && rec[3] < 0x50000000) {
++            mem_read(rec[3], fmt, sizeof(fmt) - 1);
++            fmt[sizeof(fmt) - 1] = 0;
++            for (char *c = fmt; *c; c++) {
++                if (*c == '\n' || *c == '\r') {
++                    *c = ' ';
++                }
++            }
++        }
++        fprintf(out, "%" PRIu64 " %s cpu%u syslog prio=%" PRIu64
++                " type=0x%" PRIx64 " fmt=\"%s\" args=0x%" PRIx64 " 0x%" PRIx64
++                " 0x%" PRIx64 " 0x%" PRIx64 " from=0x%" PRIx64 "\n",
++                seq++, ts, idx, a[0], rec[0], fmt, rec[4], rec[5], rec[6],
++                rec[7], from);
++    } else {
++        fprintf(out, "%" PRIu64 " %s cpu%u mcu code=%" PRIu64
++                " value=0x%" PRIx64 " from=0x%" PRIx64 "\n", seq++, ts, idx,
++                a[0] & 0xffffffff, a[1] & 0xffffffff, from & 0xffffffff);
++    }
++    g_mutex_unlock(&lock);
++}
++
++static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
++{
++    size_t n = qemu_plugin_tb_n_insns(tb);
++
++    for (size_t i = 0; i < n; i++) {
++        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
++        uint64_t pc = qemu_plugin_insn_vaddr(insn);
++
++        for (size_t k = 0; k < G_N_ELEMENTS(hooks); k++) {
++            if (hooks[k].pc == pc) {
++                qemu_plugin_register_vcpu_insn_exec_cb(
++                    insn, hit, QEMU_PLUGIN_CB_R_REGS, (void *)&hooks[k]);
++            }
++        }
++    }
++}
++
++static void at_exit(qemu_plugin_id_t id, void *p)
++{
++    if (out && out != stderr) {
++        fclose(out);
++    }
++}
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
++                                           const qemu_info_t *info,
++                                           int argc, char **argv)
++{
++    const char *path = NULL;
++
++    for (int i = 0; i < argc; i++) {
++        if (g_str_has_prefix(argv[i], "out=")) {
++            path = argv[i] + 4;
++        } else if (!strcmp(argv[i], "listregs=on")) {
++            list_regs = true;
++        }
++    }
++    out = path ? fopen(path, "w") : stderr;
++    if (!out) {
++        return -1;
++    }
++    setvbuf(out, NULL, _IOLBF, 0);
++    t0 = g_get_monotonic_time();
++    for (size_t k = 0; k < G_N_ELEMENTS(hooks); k++) {
++        fprintf(out, "# hook %s at 0x%" PRIx64 " (%s)\n", hooks[k].what,
++                hooks[k].pc, hooks[k].arch == ARCH_A53 ? "A53" : "M4");
++    }
++    qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
++    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
++    qemu_plugin_register_atexit_cb(id, at_exit, NULL);
++    return 0;
++}
+-- 
+2.55.0
+

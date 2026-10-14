@@ -1,0 +1,3225 @@
+From 5be88d557ffe9c07ad8cabaadf54062837f40efe Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Fri, 9 Oct 2026 22:12:42 +0800
+Subject: [PATCH 01/47] Nikon Z 6III (EXPEED 7) RTOS research machine
+
+Add one new TCG-only machine, `nikon-z63`, which boots the factory RTOS
+image ("eg") of a Nikon Z 6III, on top of QEMU 10.2.4:
+
+  hw/arm/nikon-z63.c                           new, ~3100 lines
+  run-z63.sh                                   new, launcher script
+  hw/arm/Kconfig                               config NIKON_Z63
+  hw/arm/meson.build                           build the new file
+  configs/devices/aarch64-softmmu/default.mak  enable it in aarch64-softmmu
+
+The machine models the DRAM map, a GICv3 distributor plus four redistributor
+frames, the nkj UART console, the boot mailbox and CPU release register, and
+the main DMA banks. Everything outside an explicitly modeled region is left
+unmodeled on purpose: an access there is logged with its PC and stops the VM
+instead of returning an invented device response, which is the intended
+modelling workflow. The image starts at EL3 and drops to EL1 by itself.
+
+The RTOS image is not included; point $EG at your own copy before running
+run-z63.sh.
+
+Co-Authored-By: Claude Code <redacted-063e40a441cf@private.invalid>
+---
+ configs/devices/aarch64-softmmu/default.mak |    3 +
+ hw/arm/Kconfig                              |    6 +
+ hw/arm/meson.build                          |    1 +
+ hw/arm/nikon-z63.c                          | 3105 +++++++++++++++++++
+ run-z63.sh                                  |   30 +
+ 5 files changed, 3145 insertions(+)
+ create mode 100644 hw/arm/nikon-z63.c
+ create mode 100755 run-z63.sh
+
+diff --git a/configs/devices/aarch64-softmmu/default.mak b/configs/devices/aarch64-softmmu/default.mak
+index ad8028c..e1b1b9b 100644
+--- a/configs/devices/aarch64-softmmu/default.mak
++++ b/configs/devices/aarch64-softmmu/default.mak
+@@ -10,3 +10,6 @@ include ../arm-softmmu/default.mak
+ # CONFIG_SBSA_REF=n
+ # CONFIG_NPCM8XX=n
+ CONFIG_VMAPPLE=n
++
++# Nikon Z 6III RTOS research machine
++CONFIG_NIKON_Z63=y
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 7877506..0dbac0c 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -186,6 +186,12 @@ config REALVIEW
+     select DS1338 # I2C RTC+NVRAM
+     select USB_OHCI_SYSBUS
+ 
++config NIKON_Z63
++    bool
++    default y
++    depends on TCG && AARCH64
++    select ARM_GIC
++
+ config SBSA_REF
+     bool
+     default y
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index aeaf654..8fa47e7 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -37,6 +37,7 @@ arm_common_ss.add(when: 'CONFIG_B_L475E_IOT01A', if_true: files('b-l475e-iot01a.
+ arm_common_ss.add(when: 'CONFIG_STM32L4X5_SOC', if_true: files('stm32l4x5_soc.c'))
+ arm_common_ss.add(when: 'CONFIG_XLNX_ZYNQMP_ARM', if_true: files('xlnx-zynqmp.c', 'xlnx-zcu102.c'))
+ arm_common_ss.add(when: 'CONFIG_XLNX_VERSAL', if_true: files('xlnx-versal.c', 'xlnx-versal-virt.c'))
++arm_common_ss.add(when: 'CONFIG_NIKON_Z63', if_true: files('nikon-z63.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX25', if_true: files('fsl-imx25.c', 'imx25_pdk.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX31', if_true: files('fsl-imx31.c', 'kzm.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6', if_true: files('fsl-imx6.c'))
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+new file mode 100644
+index 0000000..cee1316
+--- /dev/null
++++ b/hw/arm/nikon-z63.c
+@@ -0,0 +1,3105 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Nikon Z 6III (EXPEED 7) research machine — RTOS side bring-up.
++ *
++ * TCG-only. Boots the decrypted factory RTOS image ("eg"), which starts at
++ * EL3 and drops to EL1 by itself, so rvbar is pointed straight at its entry.
++ *
++ * The address plan below is not inferred from other bodies: it comes from
++ * this project's own analysis (docs/knowledge/z63-memory-map.md,
++ * analysis/rtos/00-topology.md) and the Z 6III Linux device trees
++ * (analysis/linux/10-devicetree.md):
++ *
++ *   0x0A00000000  DRAM base (PHYS_OFFSET on the Linux side)
++ *   0x0A00000000  RTOS private area (120 MiB)
++ *   0x0A07800000  Linux RAM start (not used by this machine yet)
++ *   0x40000000    RTOS image window (boot header; module lands at 0x40160000)
++ *   0x0821F000    boot mailbox (secondary-core entry points)
++ *   0x0D000000    GICv3 distributor
++ *   0x0D080000    GICv3 redistributor (four 0x20000 frames, CPU3 at 0x0D0E0000)
++ *   0x0D154000    CPU release controller
++ *   0x0F000000    nkj-uart console (register map from Nikon's own driver)
++ *   0x155C0000    main DMA, bank 0 (banks at 0x15600000, 0x15680000)
++ *
++ * Everything outside an explicitly modeled region is an "unmodeled" trap:
++ * the access is logged with its PC and the VM stops instead of inventing a
++ * device response. Iterating on those stops is the modeling workflow.
++ */
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "qemu/error-report.h"
++#include "system/reset.h"
++#include "system/runstate.h"
++#include "hw/boards.h"
++#include "hw/arm/machines-qom.h"
++#include "hw/arm/boot.h"
++#include "hw/loader.h"
++#include "hw/intc/arm_gicv3.h"
++#include "hw/qdev-properties.h"
++#include "hw/irq.h"
++#include "qobject/qlist.h"
++#include "chardev/char-fe.h"
++#include "system/system.h"
++#include "target/arm/cpu.h"
++#include "target/arm/gtimer.h"
++/* Only for the LI payload's device tree, which ships as an FDT inside the
++ * container and has to be patched before it is handed to Linux. QEMU's own
++ * system/device_tree.c includes it the same way, and CONFIG_FDT is set in
++ * this build (verified in build/config-host.h). */
++#include <libfdt.h>
++
++#define TYPE_NIKON_Z63 MACHINE_TYPE_NAME("nikon-z63")
++#define NIKON_Z63(obj) OBJECT_CHECK(NikonZ63State, (obj), TYPE_NIKON_Z63)
++
++/* Virtual SoC identity defaults. These are declared board choices, not
++ * values measured from this body -- see the note above z63_top_read. The
++ * revision nibble is 1 so the BSP variant path ((id >> 28) - 1) stores a
++ * plausible variant and the identity getter takes its revision < 3
++ * selector branch; neither is asserted to be what real silicon reports. */
++#define Z63_SOC_REVISION_DEFAULT 1
++#define Z63_SOC_CHIP_ID_DEFAULT  0
++
++/* Physical layout (real values, see header comment) */
++#define Z63_GIC_DIST_BASE   0x0D000000ULL
++/* Redistributor base from the runtime dump's per-CPU pointer table at
++ * 0x40164000: four 0x20000 frames starting at 0xd080000, so CPU3's frame
++ * lands at 0xd0e0000 -- which is the base the Linux DTB reports (Linux runs
++ * on CPU3). The EL3 boot code wakes CPU3's SGI frame at 0xd140000. */
++#define Z63_GIC_REDIST_BASE 0x0D080000ULL
++#define Z63_NUM_CPU         4
++/* num-irq = internal(32) + SPI lines. DTB-observed max SPI is 216. */
++#define Z63_GIC_NUM_IRQ     256
++
++/* GIC GPIO line arithmetic. QEMU's gicv3_set_irq (hw/intc/arm_gicv3.c)
++ * gives the layout itself:
++ *
++ *     [0..N-1]        SPI, delivered as INTID line + 32
++ *     [N..N+31]       PPI/SGI for CPU 0
++ *     [N+32..N+63]    PPI/SGI for CPU 1   ...
++ *
++ * with N = num-irq - GIC_INTERNAL, i.e. 256 - 32 = 224 here. So an SPI n
++ * is line n (not n + 32), and a PPI p of CPU i is line N + i * 32 + p.
++ *
++ * Both of those were wrong until a WFI deadlock exposed them: the boot
++ * armed the virtual timer at 40179df0 and then every CPU sat in the idle
++ * loop forever, because PPI 27 was being delivered on line 59 -- SPI 27,
++ * a line nothing raises -- instead of line 224 + i * 32 + 27. The UART
++ * SPI was wrong the same way, off by 32. */
++#define Z63_GIC_INTERNAL    32
++#define Z63_GIC_SPI(irq)    (irq)
++#define Z63_GIC_PPI(cpu, ppi) \
++    ((Z63_GIC_NUM_IRQ - Z63_GIC_INTERNAL) + (cpu) * Z63_GIC_INTERNAL + (ppi))
++
++#define Z63_UART_BASE       0x0F000000ULL
++#define Z63_UART_SIZE       0x1000
++/* The device tree gives serial@f000000 two interrupts, <0 0xAD 4> and
++ * <0 0xB0 4>, which is SPI 173 and SPI 176. Nikon's driver requests them
++ * as the port's rx irq and tx irq in that order, and the Z8 project's
++ * verified Linux /proc/interrupts shows the same pair as INTID 205
++ * nkj-uart-rx and INTID 208 nkj-uart-tx (INTID = SPI + 32). */
++#define Z63_UART_IRQ_SPI    173  /* RX */
++#define Z63_UART_TX_IRQ_SPI 176  /* TX */
++#define Z63_UART_PORT_SIZE  0x10 /* UART_PORT_SIZE in the official driver */
++#define Z63_UART_RX_FIFO    128  /* the driver's declared fifosize */
++
++/* Boot mailbox: the RTOS writes a 0x0400a151 block here describing each
++ * secondary core's entry point, then rings the release controller. The
++ * guest itself revealed the layout during boot (magic at +0xfc0, entries at
++ * +0xfd8 + (cpu-1)*8) and the Z8 sibling machine models the same 4 KiB page. */
++#define Z63_MAILBOX_BASE    0x0821F000ULL
++#define Z63_MAILBOX_SIZE    0x1000
++#define Z63_BOOT_MAGIC      0x0400A151
++#define Z63_MAILBOX_MAGIC   (Z63_MAILBOX_BASE + 0xFC0)
++#define Z63_MAILBOX_ENTRY   (Z63_MAILBOX_BASE + 0xFD8)
++
++/* The 0x0820_0000 region: a service page the image does not contain.
++ *
++ * Once the GIC wiring below was fixed the boot ran far enough to call into
++ * 0x08201000, which this machine does not map, and stopped on the fetch.
++ * Six veneers in the whole 88 MB module build an address in that region, and
++ * all six land in the one page 0x08201000..0x08201fff:
++ *
++ *   41668468  -> 082012f4      416684d0  -> 08201000
++ *   416684a8  -> 08201350      416684e0  -> 082013e0
++ *   416684f0  -> 0820102c      41668560  -> 082013f8
++ *
++ * each of them `adrp x16, #0x8201000 ; add x16, x16, #imm ; br x16`. That is
++ * the shape of a call into a fixed service block, not of a relocation.
++ *
++ * The block is real: the image's own SOLID memory-region table at
++ * 0x455c3810 declares [0x08201000, 0x08202000), and 0x455c3830 declares
++ * [0x0821e000, 0x0821f000) -- the page below the boot mailbox above. The
++ * region-name table next to it (image 0x455c39a8) is the SOLID list
++ * OCROM / WorkSRAM / PCIe_mem / CoreSight / SNAP / PERI / UART / DDR / NoC /
++ * ISP_APB / ... / EXS / DSP / LOADER / SOLID / SNOR_USER / CSRAM / ... /
++ * SUB_PROC / ...
++ *
++ * But nothing in the image ever populates it. A store there would trap --
++ * the region is unmapped -- and no such trap occurred; a read there would
++ * trap too, and none occurred before the branch; and the main DMA engine,
++ * the one silent writer, performed zero transfers for the whole boot. So
++ * the contents come from a stage that runs before `eg`, which is the same
++ * boot ROM already documented at Z63_CPU_TABLE_ADDR below.
++ *
++ * Unmapped is therefore the honest model: the page stays as it is and the
++ * boot stops there. Mapping it as RAM would only move the stop to the first
++ * instruction of whatever zeros happened to be there.
++ *
++ * What the boot is doing when it gets there, traced afterwards from three
++ * QEMU runs. `-d exec` over the whole boot shows 41668468 executed exactly
++ * once, as the last branch before the stop, and its caller is the method at
++ * 0x40d70a54 reached through a `blr` from 0x40d6fbd8. That method is short:
++ *
++ *   add x0, sp, #0xc ; bl 0x40188e90      read a per-CPU/per-die value
++ *   w0 = 0x0003000f  ; bl 0x40c012f8      config lookup: 0x40c012f8 indexes
++ *                                         a table pointed at by 0xa02c2f350
++ *                                         with (id - 0x30000), so 0x3000f is
++ *                                         entry 15 of a config table
++ *   bl 0x4018c198                         consume both values
++ *   loop 313 times calling 0x40c0a0c4     a delay
++ *   cmp w19, #1 ; msr daifset, #3         mask IRQ/FIQ
++ *   bl 0x41668468 if w19 == 1, else 0x416684a8
++ *
++ * So this is the reset/shutdown half of the pair: a delay, interrupts off, and
++ * a call into the ROM page. It is not an init path that wandered off.
++ *
++ * Where the argument comes from. 0x40d6fbd8 sits inside a small dispatcher at
++ * 0x40d6fb64, which walks a table of 0x308-byte records:
++ *
++ *   x25 = 0x4408d798 + phase * 0x100
++ *   for (x24 = 0; x24 != 7; x24++) {
++ *       for (x23 = 0; x23 != 0x100; x23 += 8)      // 32 callbacks per record
++ *           if (x25[x23]) x25[x23](phase);         // w0 = phase
++ *       x25 += 0x308;
++ *   }
++ *
++ * Each record is 0x100 bytes of callback slots, 0x200 of other data, and a
++ * name pointer at +0x300. The seven names are PreparePhase, DataReadPhase,
++ * FastbootPhase, ReleasePhase, NonReleasePhase and WaitShutdownPhase twice
++ * (the last two share the string "NonReleasePhase" at 0x4408edbb; ReleasePhase
++ * is the same address + 3, which is GCC suffix merging, not a second string).
++ * The reset method is slot 0 of channel 6, the WaitShutdownPhase channel, for
++ * phase 1 and phase 2; phase 0's channel 6 holds 0x40d709fc instead, which is
++ * a near-copy of 0x40d70a54 ending in a different veneer. Channel 5 is the
++ * other WaitShutdownPhase and reaches 0x416684d0. Every veneer in the page is
++ * therefore a different ROM shutdown service, and the page is the reset
++ * service block, not a register bank.
++ *
++ * All three running CPUs reach it, each with its own phase:
++ *
++ *   -d cpu -dfilter 0x40d6fb64+0x10 gives, at 0x40d6fb64's entry,
++ *   CPU1 X00=1, CPU2 X00=2, CPU0 X00=0, and X01 = the target address in all
++ *   three, which is the signature of `br x1` rather than a `bl`. So the three
++ *   CPUs independently enter the same dispatcher with phases 0, 1 and 2, and
++ *   CPU1 finishes its walk first: it reaches channel 6 with w19 == 1, takes the
++ *   313-iteration delay, masks interrupts, calls 0x41668468, and the machine
++ *   stops on the fetch at 0x082012f4. The other two CPUs are still part-way
++ *   through their walks when the machine stops.
++ *
++ * That last point is the one worth carrying forward: the stop is not a device
++ * that failed to answer during init. The image reached a deliberate, orderly,
++ * system-wide shutdown -- delay, `daifset #3`, ROM reset call -- executed by
++ * every CPU at once, gated on a config value read through 0x40c012f8. Whether
++ * that shutdown is this stage's designed terminus (hand back to the ROM to
++ * boot the next stage, which this machine does not supply) or the result of a
++ * condition still mis-modelled is the open question; the config id 0x0003000f
++ * and the value 0x40d70a54 passes to 0x4018c198 are where to look next. */
++
++/* CPU release controller (Z8 sibling: "cpu-release" at 0x0d154000).
++ *   +0x044 status: bit N set once CPU N has been released
++ *   +0x244 write 1<<N to release CPU N, reading the mailbox above
++ *   +0x248 clock control: plain storage (the GPU helper read-modify-writes it) */
++#define Z63_RELEASE_BASE    0x0D154000ULL
++#define Z63_RELEASE_SIZE    0x400
++
++#define Z63_IMAGE_WINDOW_BASE 0x40000000ULL /* RTOS image window (boot header) */
++#define Z63_IMAGE_WINDOW_SIZE (128 * MiB)   /* header declares 0x08200000 */
++/* The eg module itself is loaded at 0x40160000, not at the window base: the
++ * runtime dump has the boot header at 0x40000000 and is byte-identical to the
++ * factory module from 0x40160000 onward (verified: 65536/65536 bytes of the
++ * first 64 KiB match). The header names 0x40160000 as its load/entry address
++ * (three times), so the module is linked for that base and self-references
++ * depend on it. */
++#define Z63_IMAGE_LOAD_BASE  0x40160000ULL
++#define Z63_IMAGE_ENTRY      Z63_IMAGE_LOAD_BASE
++#define Z63_BOOT_HEADER      Z63_IMAGE_WINDOW_BASE
++
++/* DRAM. The size is not guessed: the RTOS builds its memory-region
++ * descriptors at 40caa5fc, and that list gives this window twice, in two
++ * groups of four, each group naming 0xa00000000 and 0xa20000000 with a
++ * size of 0x20000000:
++ *
++ *   id 12: base a00000000 size 20000000     id 18: same base and size
++ *   id 13: base a20000000 size 20000000     id 19: same base and size
++ *   id 14: base 800000000 size 20000000     id 1a: same base and size
++ *   id 15: base 860000000 size 20000000     id 1b: same base and size
++ *
++ * The two 0xa00000000 entries are why this is 1 GiB and not 512 MiB. The
++ * 0x800000000 pair is a second, 8 GiB-spaced view of the same memory; no
++ * access through it has been observed, so it is deliberately NOT mapped --
++ * reaching it should stop and say so rather than quietly alias. */
++#define Z63_DRAM_BASE       0xA00000000ULL
++#define Z63_DRAM_SIZE       (1024 * MiB)
++
++/* ------------------------------------------------------------------ */
++/* Where the LI (Linux) payload goes                                  */
++/*                                                                    */
++/* Not a guess: the running image's own SOLID region table at         */
++/* 0x455C3810 declares its Linux window, and the container's device   */
++/* tree declares the same window. See z63_load_li for the full        */
++/* derivation, including why the kernel, the initramfs and the device */
++/* tree are placed in this order and why nothing here overlaps         */
++/* share_mem.                                                          */
++/* ------------------------------------------------------------------ */
++#define Z63_LI_KERNEL_ADDR  0x0A07800000ULL  /* base of the Linux window */
++#define Z63_LI_DTB_ADDR     0x0A08000000ULL  /* 32 MiB up, 2 MiB aligned */
++#define Z63_LI_DTB_RESERVE  0x40000          /* room for the patched tree */
++#define Z63_LI_INITRD_ADDR  0x0A09000000ULL  /* above the device tree */
++#define Z63_LI_BLOCK_SHIFT  11               /* container blocks are 0x800 */
++
++/* The EL3 boot code dereferences a per-CPU pointer table at this address
++ * (ldr x9, [0x40164000 + cpu*8]) to find each redistributor's TYPER, then
++ * zeroes word 0 there to clear ProcessorSleep. The boot ROM patches the table
++ * in after copying the image; the module's own bytes at that offset are
++ * unrelated. */
++#define Z63_CPU_TABLE_ADDR  0x40164000ULL
++
++/* ------------------------------------------------------------------ */
++/* Main DMA ("resources 17a..17f" on the Z8 sibling)                   */
++/*                                                                    */
++/* Three banks of two channels, channel stride 0x80. Found by trapping */
++/* the first unmodeled access during boot: the EL3 code at 0x40160c38 */
++/* (fill) and 0x40160b94 (copy) program it before the RTOS main entry. */
++/* Register semantics were recovered from our own disassembly and then */
++/* matched against the independent Z8 work (n-research,              */
++/* z8-qemu/docs/native-main-dma.md), which documents the same protocol */
++/* register for register -- including the completion status at +0x08.  */
++/*                                                                    */
++/*   +00 channel control (write 0 = reset, +10 <- 2 when idle)        */
++/*   +04 IRQ mask, +08 IRQ/completion status (bit0 set when finished) */
++/*   +14 transfer mode: 0x20 = copy, 0x21 = fill                       */
++/*   +18 fill byte (copy requires 0)                                  */
++/*   +1c source pitch, +20 destination pitch (bytes per row)          */
++/*   +24 row bytes (0 encodes 0x8000), +28 row count (0 encodes 0x4000)*/
++/*   +30/+34 source address low 32 / high 4 bits (copy only)          */
++/*   +38/+3c destination address low 32 / high 4 bits                 */
++/*   +10 write 1 = start                                              */
++/* ------------------------------------------------------------------ */
++
++#define Z63_DMA_BANKS       3
++#define Z63_DMA_CHANNELS    (Z63_DMA_BANKS * 2)
++#define Z63_DMA_BANK_SIZE   0x100 /* two channels of 0x80 */
++#define Z63_DMA_CH_STRIDE   0x80
++#define Z63_DMA_MAX_SPAN    (64 * MiB)
++
++/* Pin configuration block ("gpio-top"): five banks of 16-bit registers. */
++#define Z63_GPIO_TOP_BASE   0x0D151000ULL
++#define Z63_GPIO_BANKS      5
++#define Z63_GPIO_WORDS      25 /* registers 0x00..0x60 in each bank */
++
++/* TOP block: identity word at offset 0, configuration words above it. */
++#define Z63_TOP_BASE        0x0D150000ULL
++#define Z63_TOP_SIZE        0x250
++
++/* Clock/power configuration bank (CGN in the Linux DTB). */
++#define Z63_CGN_BASE        0x0D152000ULL
++#define Z63_CGN_SIZE        0x100
++
++/* Peripheral control words, 0x00..0x24. */
++#define Z63_PCTL_BASE       0x0D150300ULL
++#define Z63_PCTL_WORDS      10
++
++/* Configuration sequencer at 0x0d158000. */
++#define Z63_SEQ_BASE        0x0D158000ULL
++#define Z63_SEQ_SIZE        0x0A0
++
++/* Identification/diagnostic block at 0x0d153000. */
++#define Z63_ID_BASE         0x0D153000ULL
++#define Z63_ID_SIZE         0x44
++
++/* Configuration bank at 0x0d157000. */
++#define Z63_CFG7_BASE       0x0D157000ULL
++#define Z63_CFG7_SIZE       0x800
++
++/* SPI controller at 0x0e700000, one 0x100 window per chip select. */
++#define Z63_SPI_BASE        0x0E700000ULL
++#define Z63_SPI_STRIDE      0x100
++#define Z63_SPI_INST        12
++
++/* Unnamed auxiliary pair at 0x0c86e000 / 0x0c86f000. */
++#define Z63_AUX_BASE        0x0C86E000ULL
++#define Z63_AUX_STRIDE      0x1000
++#define Z63_AUX_INST        2
++#define Z63_AUX_WORDS       3 /* +0x00, +0x04, +0x10 */
++
++/* Three flat register windows in 0x0e000000..0x0e210000. Each is sized to
++ * the span the firmware's own bases bound: E0 by the six bases 0x0e000000 +
++ * n*0x1000, E1 by the three bases 0x0e100000 + n*0x10000, E2 by the six
++ * bases 0x0e200000 + n*0x100. */
++#define Z63_EMIO_E0_BASE    0x0E000000ULL
++#define Z63_EMIO_E0_SIZE    0x6000
++#define Z63_EMIO_E1_BASE    0x0E100000ULL
++#define Z63_EMIO_E1_SIZE    0x30000
++#define Z63_EMIO_E2_BASE    0x0E200000ULL
++#define Z63_EMIO_E2_SIZE    0x600
++
++/* Two-instance register bank pair at 0x0c850000 and 0x16808000.
++ *
++ * 40c1b454 is the ninth call of the driver-init chain at 40c13f98. It sets
++ * bit 28 of both banks and then walks eight DRAM descriptors at
++ * 0x0a0280d388 (0x40 bytes each):
++ *
++ *   x8  = 0x0c850000  ldr w9, [x8]  ; orr w9, w9, #0x10000000 ; str w9, [x8]
++ *   x10 = 0x16808000  ldr w8, [x10] ; orr w8, w8, #0x10000000 ; str w8, [x10]
++ *
++ * 40c1b598(w0, w1) and 40c1b5d0(w0, w1) reach the same pair through a csel
++ * and set a single bit of the same word:
++ *
++ *   base = (w0 == 0) ? 0x0c850000 : 0x16808000
++ *   *(u32 *)base = bfi(*(u32 *)base, w1, 24, 1)     -- bit 24
++ *   *(u32 *)base = bfi(*(u32 *)base, w1, 20, 1)     -- bit 20
++ *
++ * So the two addresses are two instances of one bank, chosen by an index,
++ * and the bank's first word carries bit 28 plus at least two bits written
++ * by dedicated setters. No meaning is claimed for any of those bits.
++ *
++ * The per-channel registers sit at 0x0c850010 + n * 0x30, n = 0..7, and
++ * 40c1b398 shows that they too are per-instance: it enters with
++ * x21 = 0x0c850010, advances x21 by 0x30 and its descriptor cursor by 0x40
++ * for eight iterations, and stores the resulting address into descriptor
++ * +8. The same function reaches 0x16808000 + n * 0x30 through the madd at
++ * 40c1b3f0, which is why 0x16808000 is treated as the second instance
++ * rather than as a separate block.
++ *
++ * What the block is has NOT been established. It is not the IPCU: both
++ * device trees put the ipcu node at 0x0c851000 with a size of 0x1000, the
++ * page above, and neither device tree of any of the five revisions lists
++ * 0x0c850000 or 0x16808000 at all. 0x16807f00, one page below the second
++ * instance, is built by 40cab650 and 40cab89c -- outside the init chain --
++ * and is included because it falls in the same two pages; it is reached as
++ * a base with a scaled index (add x21, x8, w0, uxtw #3), so the entries
++ * below it cannot be enumerated either. Modelling therefore follows the
++ * auxiliary pair: exactly what the code addresses, plain storage, and no
++ * claimed semantics. */
++#define Z63_PAIR_A_BASE     0x0C850000ULL
++#define Z63_PAIR_A_SIZE     0x1000
++#define Z63_PAIR_B_BASE     0x16807000ULL
++#define Z63_PAIR_B_SIZE     0x2000
++#define Z63_PAIR_INST       2
++
++/* A flat MMIO window: accepted whole, stored word by word, and named in the
++ * stop message. Used by the banks whose register offsets cannot be listed. */
++typedef struct Z63Win {
++    const char *name;
++    uint64_t base;
++    uint32_t size;
++    uint32_t *words;
++    MemoryRegion region;
++} Z63Win;
++
++/* Video pipeline register array at 0x14000000. */
++#define Z63_VPIPE_BASE      0x14000000ULL
++#define Z63_VPIPE_STRIDE    0x4000
++#define Z63_VPIPE_INST      112
++#define Z63_VPIPE_SIZE      ((uint64_t)Z63_VPIPE_INST * Z63_VPIPE_STRIDE)
++
++/* Five sibling blocks at 0x11800000 + n * 0x800000. */
++#define Z63_BLK_BASE        0x11800000ULL
++#define Z63_BLK_STRIDE      0x800000
++#define Z63_BLK_INST        5
++#define Z63_BLK_WINDOW      0x10000 /* highest register seen is +0xf018 */
++#define Z63_BLK_CAP         0x02c   /* capability word: tested only for zero */
++
++/* Driver upload window at 0x14c00000. */
++#define Z63_UPK_BASE        0x14C00000ULL
++#define Z63_UPK_SIZE        0x2000 /* two 0x1ac-byte tables at +0x0000/+0x1000 */
++
++#define Z63_DMA_IRQ_MASK    0x0b
++
++static const hwaddr z63_dma_bases[Z63_DMA_BANKS] = {
++    0x155C0000, 0x15600000, 0x15680000,
++};
++
++#define Z63_ROM_SIZE        Z63_IMAGE_WINDOW_SIZE
++
++typedef struct NikonZ63State NikonZ63State;
++
++typedef struct Z63DmaBank {
++    NikonZ63State *s;
++    unsigned bank;
++} Z63DmaBank;
++
++typedef struct NikonZ63State {
++    MachineState parent;
++
++    MemoryRegion dram;
++    MemoryRegion rom;
++    MemoryRegion mailbox;
++    MemoryRegion boot_header_ram;
++    MemoryRegion unmapped;
++    /* The boot ROM's service page. Mapped only when rom_page_stub is set;
++     * see the long comment above z63_rompage_read. */
++    MemoryRegion rom_page;
++    bool rom_page_stub;
++
++    DeviceState *gic;
++    CharFrontend serial;
++    MemoryRegion uart_region;
++    qemu_irq uart_irq;      /* SPI 173: the port's RX interrupt */
++    qemu_irq uart_tx_irq;   /* SPI 176: the port's TX interrupt */
++    uint8_t uart_reg[Z63_UART_PORT_SIZE];
++    uint8_t uart_rx[Z63_UART_RX_FIFO];
++    unsigned uart_rx_head, uart_rx_count;
++
++    /* The LI container to place in the Linux window, if -machine li-image=
++     * named one. li_ready records that the bytes and the patched device
++     * tree are in DRAM; the two addresses are what a later stage would hand
++     * to CPU3. Nothing else consumes them yet. */
++    char *li_image;
++    bool li_ready;
++    uint64_t li_kernel_addr;
++    uint64_t li_dtb_addr;
++    /* Set by -machine cpu3-entry=0xADDR to hand CPU3 to the LI payload at
++     * reset instead of leaving it for the RTOS's release controller. See
++     * the comment in z63_init. */
++    uint64_t cpu3_entry;
++
++    MemoryRegion dma_region[Z63_DMA_BANKS];
++    Z63DmaBank dma_bank[Z63_DMA_BANKS];
++    uint32_t dma_regs[Z63_DMA_CHANNELS][0x48 / 4];
++
++    MemoryRegion int_latch;
++    MemoryRegion counter;
++    uint32_t int_latch_value;
++    uint32_t counter_value;
++
++    MemoryRegion cpu_release;
++    uint32_t release_status;
++    /* System reset controller in the 0x0D154000 block, three words per
++     * window: [0..2] = clear window 0x0D154240 + 4*i, [3..5] = set window
++     * 0x0D154340 + 4*i. See the comment above z63_reset_masks. */
++    uint32_t reset_word[6];
++    ARMCPU *cpu[Z63_NUM_CPU];
++
++    MemoryRegion gpio_top;
++    uint16_t gpio_config[Z63_GPIO_BANKS][Z63_GPIO_WORDS];
++
++    MemoryRegion top;
++    uint32_t top_words[Z63_TOP_SIZE / 4];
++
++    MemoryRegion cgn;
++    uint32_t cgn_words[Z63_CGN_SIZE / 4];
++
++    MemoryRegion pctl;
++    uint32_t pctl_words[Z63_PCTL_WORDS];
++
++    MemoryRegion seq;
++    uint32_t seq_words[Z63_SEQ_SIZE / 4];
++    bool seq_done;
++
++    MemoryRegion id;
++    MemoryRegion cfg7;
++    uint32_t cfg7_words[Z63_CFG7_SIZE / 4];
++
++    MemoryRegion spi;
++    uint32_t spi_cfg[Z63_SPI_INST][3]; /* +0x48/+0x58/+0x60 of each window */
++
++    MemoryRegion aux;
++    uint32_t aux_words[Z63_AUX_INST][Z63_AUX_WORDS];
++
++    Z63Win emio[3];
++    uint32_t emio_e0_words[Z63_EMIO_E0_SIZE / 4];
++    uint32_t emio_e1_words[Z63_EMIO_E1_SIZE / 4];
++    uint32_t emio_e2_words[Z63_EMIO_E2_SIZE / 4];
++
++    /* The two instances of the 0x0c850000 / 0x16808000 bank pair. */
++    Z63Win pair[Z63_PAIR_INST];
++    uint32_t pair_a_words[Z63_PAIR_A_SIZE / 4];
++    uint32_t pair_b_words[Z63_PAIR_B_SIZE / 4];
++
++    MemoryRegion vpipe_region;
++    uint32_t vpipe[Z63_VPIPE_SIZE / 4];
++
++    MemoryRegion sib_region;
++    uint32_t sib[Z63_BLK_INST][Z63_BLK_WINDOW / 4];
++
++    MemoryRegion upk_region;
++    uint32_t upk[Z63_UPK_SIZE / 4];
++
++    uint8_t soc_revision; /* virtual; exposed as a machine property */
++    uint8_t soc_chip_id;  /* virtual; exposed as a machine property */
++} NikonZ63State;
++
++/* ------------------------------------------------------------------ */
++/* Boot ROM preparation.                                              */
++/*                                                                    */
++/* The image is copied into the RAM window by hand (not via            */
++/* load_image_targphys) on purpose: registering the file with the ROM  */
++/* loader makes rom_reset re-copy it at every reset, which silently     */
++/* wipes the two blocks the boot ROM patches in *after* the copy --     */
++/* the header at 0x40000000 and the per-CPU redistributor pointer      */
++/* table at 0x40164000.                                                */
++/* ------------------------------------------------------------------ */
++
++/* First 0x40 bytes of the window, verbatim from the runtime dump: the 0x30
++ * byte header the boot ROM leaves describing the module, plus the
++ * 55aa55aa/5555aaaa trailer that follows it. */
++static const uint8_t z63_boot_header[0x40] = {
++    0x51, 0xa1, 0x00, 0x04, 0x00, 0x00, 0x20, 0x08,
++    0x00, 0x00, 0x20, 0x08, 0x00, 0x00, 0x00, 0x00,
++    0x90, 0x4a, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
++    0x00, 0x00, 0x16, 0x40, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x16, 0x40, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x16, 0x40, 0x00, 0x00, 0x00, 0x00,
++    0x55, 0xaa, 0x55, 0xaa, 0x55, 0x55, 0xaa, 0xaa,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* ------------------------------------------------------------------ */
++/* Main DMA                                                            */
++/* ------------------------------------------------------------------ */
++
++/* Anything the recovered protocol does not cover stops the VM instead of
++ * being papered over -- same policy as the unmodeled-access trap. */
++static void z63_dma_fail(unsigned bank, hwaddr offset, const char *what,
++                         uint64_t value)
++{
++    ARMCPU *cpu = ARM_CPU(current_cpu);
++    error_report("Z63_DMA %s bank=0x%08" HWADDR_PRIx " offset=+0x%" HWADDR_PRIx
++                 " value=0x%" PRIx64 " pc=0x%09" PRIx64
++                 " -- stopping (unsupported transfer?)",
++                 what, (hwaddr)z63_dma_bases[bank], offset, value,
++                 cpu ? cpu->env.pc : 0);
++    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 3);
++}
++
++static bool z63_dma_reg(unsigned offset, unsigned size, unsigned *channel,
++                        unsigned *reg)
++{
++    if (size != 4 || offset % 4 || offset >= Z63_DMA_BANK_SIZE) {
++        return false;
++    }
++    *channel = offset / Z63_DMA_CH_STRIDE;
++    *reg = offset % Z63_DMA_CH_STRIDE;
++    /* The two source-address words are write-only; nothing reads them back. */
++    return *reg <= 0x44 && *reg != 0x2c;
++}
++
++/* Perform the programmed transfer for real. The Z8 model paces itself in
++ * 4096-byte bursts on a timer and publishes completion at the end; both the
++ * boot path here and the later HAL path only ever observe completion via
++ * +0x10/+0x08, so completing inline is equivalent and deterministic. */
++static void z63_dma_start(NikonZ63State *s, unsigned channel, unsigned bank)
++{
++    uint32_t *r = s->dma_regs[channel];
++    bool fill = r[0x14 / 4] == 0x21;
++    uint32_t row_bytes = r[0x24 / 4] ? r[0x24 / 4] : 0x8000;
++    uint32_t rows = r[0x28 / 4] ? r[0x28 / 4] : 0x4000;
++    uint32_t src_pitch = r[0x1c / 4];
++    uint32_t dst_pitch = r[0x20 / 4];
++    uint64_t src = r[0x30 / 4] | ((uint64_t)r[0x34 / 4] << 32);
++    uint64_t dst = r[0x38 / 4] | ((uint64_t)r[0x3c / 4] << 32);
++    uint8_t pattern = r[0x18 / 4] & 0xff;
++    uint64_t span;
++    int row;
++
++    if ((!fill && r[0x14 / 4] != 0x20) ||
++        (fill && r[0x18 / 4] > 0xff) ||
++        (!fill && r[0x18 / 4] != 0) ||
++        !dst_pitch || dst_pitch < row_bytes ||
++        (!fill && (!src_pitch || src_pitch < row_bytes)) ||
++        (uint64_t)row_bytes * rows > Z63_DMA_MAX_SPAN) {
++        z63_dma_fail(bank, 0x14, "unsupported transfer tuple", r[0x14 / 4]);
++        return;
++    }
++
++    span = (uint64_t)(rows - 1) * dst_pitch + row_bytes;
++    {
++        g_autofree uint8_t *buf = g_malloc(row_bytes);
++
++        for (row = 0; row < rows; row++) {
++            uint64_t dst_row = dst + (uint64_t)row * dst_pitch;
++            uint64_t src_row = src + (uint64_t)row * src_pitch;
++
++            if (fill) {
++                memset(buf, pattern, row_bytes);
++            } else {
++                cpu_physical_memory_read(src_row, buf, row_bytes);
++            }
++            /* Row at a time; a bad address lands in the unmodeled trap. */
++            cpu_physical_memory_write(dst_row, buf, row_bytes);
++        }
++    }
++
++    (void)span;
++    r[0x10 / 4] = 2;
++    r[0x08 / 4] |= 1;
++}
++
++static uint64_t z63_dma_read(void *opaque, hwaddr offset, unsigned size)
++{
++    Z63DmaBank *b = opaque;
++    NikonZ63State *s = b->s;
++    unsigned channel, reg;
++
++    if (!z63_dma_reg(offset, size, &channel, &reg)) {
++        z63_dma_fail(b->bank, offset, "unsupported read", 0);
++        return 0;
++    }
++    return s->dma_regs[b->bank * 2 + channel][reg / 4];
++}
++
++static void z63_dma_write(void *opaque, hwaddr offset, uint64_t value,
++                          unsigned size)
++{
++    Z63DmaBank *b = opaque;
++    NikonZ63State *s = b->s;
++    unsigned lchannel, reg, channel;
++    uint32_t *r;
++    bool allowed = value <= UINT32_MAX;
++
++    if (!z63_dma_reg(offset, size, &lchannel, &reg)) {
++        z63_dma_fail(b->bank, offset, "unsupported write", value);
++        return;
++    }
++    channel = b->bank * 2 + lchannel;
++    r = s->dma_regs[channel];
++
++    switch (reg) {
++    case 0x00:
++    case 0x10:
++        allowed &= value <= 1;
++        break;
++    case 0x04:
++    case 0x08:
++        allowed &= !(value & ~(uint64_t)Z63_DMA_IRQ_MASK);
++        break;
++    case 0x0c:
++    case 0x44:
++        allowed = false; /* meaning unresolved: never guess */
++        break;
++    case 0x14:
++        allowed &= value == 0x20 || value == 0x21;
++        break;
++    case 0x18:
++        allowed &= value <= 0xff;
++        break;
++    case 0x1c:
++    case 0x20:
++        allowed &= value <= 0x8000;
++        break;
++    case 0x24:
++        allowed &= value < 0x8000;
++        break;
++    case 0x28:
++        allowed &= value < 0x4000;
++        break;
++    case 0x34:
++    case 0x3c:
++        allowed &= value <= 0xf;
++        break;
++    case 0x40:
++        allowed &= value <= 1; /* written by the HAL, never by boot code */
++        break;
++    default:
++        break; /* full 32-bit pitches and address low words */
++    }
++
++    if (!allowed) {
++        z63_dma_fail(b->bank, offset, "unsupported value", value);
++        return;
++    }
++
++    if (reg == 0x10 && value == 1) {
++        z63_dma_start(s, channel, b->bank);
++    } else if (reg == 0x00) {
++        memset(r, 0, 0x48);
++        r[0] = value;
++        r[0x10 / 4] = 2; /* idle */
++    } else if (reg == 0x10) {
++        r[reg / 4] = 2; /* idle */
++    } else if (reg == 0x08) {
++        r[reg / 4] &= ~(uint32_t)value; /* write 1 to clear */
++    } else {
++        r[reg / 4] = value;
++    }
++}
++
++static const MemoryRegionOps z63_dma_ops = {
++    .read = z63_dma_read,
++    .write = z63_dma_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void z63_create_dma(NikonZ63State *s)
++{
++    for (unsigned bank = 0; bank < Z63_DMA_BANKS; bank++) {
++        s->dma_bank[bank].s = s;
++        s->dma_bank[bank].bank = bank;
++        memory_region_init_io(&s->dma_region[bank], OBJECT(s), &z63_dma_ops,
++                              &s->dma_bank[bank], "z63-main-dma",
++                              Z63_DMA_BANK_SIZE);
++        memory_region_add_subregion(get_system_memory(),
++                                    z63_dma_bases[bank],
++                                    &s->dma_region[bank]);
++    }
++    for (unsigned ch = 0; ch < Z63_DMA_CHANNELS; ch++) {
++        s->dma_regs[ch][0x10 / 4] = 2; /* idle */
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Unmodeled-access trap: log and stop, never invent a response.       */
++/* ------------------------------------------------------------------ */
++
++static uint64_t z63_unmapped_read(void *opaque, hwaddr addr, unsigned size)
++{
++    ARMCPU *cpu = ARM_CPU(current_cpu);
++    error_report("Z63_UNMAPPED read  addr=0x%09" HWADDR_PRIx " size=%u pc=0x%09" PRIx64
++                 " -- stopping (unmodeled device?)", addr, size,
++                 cpu ? cpu->env.pc : 0);
++    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 3);
++    return 0;
++}
++
++static void z63_unmapped_write(void *opaque, hwaddr addr, uint64_t value,
++                               unsigned size)
++{
++    ARMCPU *cpu = ARM_CPU(current_cpu);
++    error_report("Z63_UNMAPPED write addr=0x%09" HWADDR_PRIx " size=%u value=0x%" PRIx64
++                 " pc=0x%09" PRIx64 " -- stopping (unmodeled device?)",
++                 addr, size, value, cpu ? cpu->env.pc : 0);
++    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 3);
++}
++
++static const MemoryRegionOps z63_unmapped_ops = {
++    .read = z63_unmapped_read,
++    .write = z63_unmapped_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8 },
++};
++
++/* Every device model stops the VM on an access it cannot justify, and always
++ * reports the offending PC: finding the guest instruction that made the
++ * access is what turns a stop into the next device to model. current_cpu is
++ * whichever vCPU is executing, so the PC is the one that actually trapped. */
++static void z63_stop_read(const char *block, hwaddr addr, unsigned size)
++{
++    ARMCPU *cpu = ARM_CPU(current_cpu);
++
++    error_report("Z63 %s unmodeled read  addr=0x%09" HWADDR_PRIx
++                 " size=%u pc=0x%09" PRIx64 " -- stopping",
++                 block, addr, size, cpu ? cpu->env.pc : 0);
++    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 3);
++}
++
++static void z63_stop_write(const char *block, hwaddr addr, unsigned size,
++                           uint64_t value)
++{
++    ARMCPU *cpu = ARM_CPU(current_cpu);
++
++    error_report("Z63 %s unmodeled write addr=0x%09" HWADDR_PRIx
++                 " size=%u value=0x%" PRIx64 " pc=0x%09" PRIx64
++                 " -- stopping", block, addr, size, value,
++                 cpu ? cpu->env.pc : 0);
++    qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 3);
++}
++
++/* ------------------------------------------------------------------ */
++/* The boot ROM's service page at 0x08201000, as a labelled stub       */
++/*                                                                     */
++/* STATUS: this is NOT a model of anything. It is the one place where  */
++/* the machine deliberately stands in for firmware it cannot have.     */
++/* Read the whole comment before enabling it.                          */
++/*                                                                     */
++/* Why it is needed. The image jumps into this page and the page is    */
++/* not in the image, not in the container, and not in any shipped      */
++/* component: it is mask ROM inside the SoC. Searched and ruled out    */
++/* the three other members of the same container -- ex2010_0200a0.bi   */
++/* opens with a table whose entries are 0x080200xx values and does not */
++/* decode as AArch64 at 0x1000, vr2010_010000.bi carries a NikonBVR    */
++/* magic at +8, _tpj01_0210.bin opens with a jump table -- none of them */
++/* is this page. A runtime dump cannot supply it either; nothing reads */
++/* it back.                                                            */
++/*                                                                     */
++/* What is actually known, from the image alone. Exactly six           */
++/* trampolines branch into 0x08201000..0x08202000, each of the form    */
++/*   adrp x16, #0x8201000 ; add x16, x16, #imm ; br x16                */
++/* so each has exactly one purpose and exactly one caller:             */
++/*                                                                     */
++/*   0x08201000  from 0x40d709e8  in the ROM-service wrapper at        */
++/*                                0x40d709dc, right after calls to     */
++/*                                0x41186ae4 and 0x40d66d4c            */
++/*   0x0820102c  from 0x40d70a44  after daifset #3, as the tail of a   */
++/*                                wrapper that then returns             */
++/*   0x082012f4  from 0x40d70aa8  the w19==1 arm of the handler at     */
++/*                                0x40d70a54. This is NOT a shutdown   */
++/*                                path: the function sits in a group-6 */
++/*                                service table and returns normally   */
++/*                                to 0x40d70aac.                       */
++/*   0x08201350  from 0x40d70ab0  the other arm of the same handler    */
++/*   0x082013e0  from 0x40c9ce60  the Linux loader, after x2 is set to */
++/*                                0x0000000A07800000                   */
++/*   0x082013f8  from 0x40c9ce74  that loader's wait loop              */
++/*                                                                     */
++/* Each is entered with `bl`, so each is a call that is expected to    */
++/* return. What any of them does is unknown and is not guessed here.   */
++/*                                                                     */
++/* What the stub does, and refuses to do. A fetch at one of those six  */
++/* offsets returns `ret`, so the call returns to its caller and the    */
++/* guest continues; every such entry is logged with the entry, the     */
++/* call site and x0..x3, because that log is the whole point -- it is  */
++/* how the flow past this page gets discovered. A fetch anywhere else  */
++/* in the page still stops the VM the way every other unmodeled access */
++/* does, so an entry we do not know about cannot be silently absorbed. */
++/* No register is written, no memory is touched, and no value that the */
++/* firmware could have read from the ROM is invented. A write to the   */
++/* page stops as well.                                                 */
++/*                                                                     */
++/* It is off unless -machine rom-page=stub asks for it, so an          */
++/* unmodified run still stops at the page and says so.                 */
++/* ------------------------------------------------------------------ */
++
++#define Z63_ROMPAGE_BASE    0x08201000ULL
++#define Z63_ROMPAGE_SIZE    0x1000
++
++static const struct {
++    uint32_t offset;
++    uint64_t caller;
++} z63_rom_entries[] = {
++    { 0x000,  0x40d709e8 },
++    { 0x02c,  0x40d70a44 },
++    { 0x2f4,  0x40d70aa8 },
++    { 0x350,  0x40d70ab0 },
++    { 0x3e0,  0x40c9ce60 },
++    { 0x3f8,  0x40c9ce74 },
++};
++
++static uint64_t z63_rompage_read(void *opaque, hwaddr offset, unsigned size)
++{
++    ARMCPU *cpu = ARM_CPU(current_cpu);
++    uint64_t pc = cpu ? cpu->env.pc : 0;
++
++    for (size_t i = 0; i < ARRAY_SIZE(z63_rom_entries); i++) {
++        if (offset != z63_rom_entries[i].offset) {
++            continue;
++        }
++        if (pc != Z63_ROMPAGE_BASE + offset) {
++            /* Not a fetch at the entry, so the stub would be answering a
++             * data access with an instruction word. Report rather than do
++             * that, because returning 0xd65f03c0 as data would be inventing
++             * a ROM value. */
++            z63_stop_read("ROMPAGE-DATA", Z63_ROMPAGE_BASE + offset, size);
++            return 0;
++        }
++        error_report("Z63_ROMPAGE_STUB: boot-ROM service at 0x%09" PRIx64
++                     " entered from 0x%09" PRIx64 " with"
++                     " x0=0x%" PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64
++                     " x3=0x%" PRIx64 " -- returning `ret`, which is a"
++                     " labelled stand-in, not the ROM's behaviour",
++                     (uint64_t)Z63_ROMPAGE_BASE + offset,
++                     z63_rom_entries[i].caller,
++                     cpu ? cpu->env.regs[0] : 0, cpu ? cpu->env.regs[1] : 0,
++                     cpu ? cpu->env.regs[2] : 0, cpu ? cpu->env.regs[3] : 0);
++        return UINT64_C(0xd65f03c0); /* ret */
++    }
++
++    z63_stop_read("ROMPAGE", Z63_ROMPAGE_BASE + offset, size);
++    return 0;
++}
++
++static void z63_rompage_write(void *opaque, hwaddr offset, uint64_t value,
++                              unsigned size)
++{
++    z63_stop_write("ROMPAGE", Z63_ROMPAGE_BASE + offset, size, value);
++}
++
++static const MemoryRegionOps z63_rompage_ops = {
++    .read = z63_rompage_read,
++    .write = z63_rompage_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* nkj-uart, modelled from Nikon's own driver                          */
++/*                                                                     */
++/* The register map is not inferred. It is the published source:       */
++/* nkj_uart.c out of the official OSS release for these bodies (kept   */
++/* at reference-from-z8-research/nkj_uart.c, Copyright 2018 Nikon),    */
++/* 0x10 bytes per port -- which is also what the device tree says,     */
++/* `reg = <0 0xf000000 0 0x10>`, and what UART_PORT_SIZE means.        */
++/*                                                                     */
++/* The previous stand-in answered every read with 0x62 and treated     */
++/* every offset below 9 as a transmit register. Both were wrong: the   */
++/* data register is +0x04, and the firmware never writes it at all.    */
++/*                                                                     */
++/*   0x00 UA_MODE          ENABLE = bit0                               */
++/*   0x01 UA_CONTROL       TX_ENABLE=0 RX_ENABLE=1 TX_INT_IDLE=2       */
++/*                         TX_INT=3 RX_INT=4 RESET=7                   */
++/*   0x02 UA_CONFIG        CS8..CS9, ODD_PARITY=3, PARITY_ENABLE=4      */
++/*   0x03 UA_STATUS        TX_BUSY=0 TX_EMPTY=1 RX_READY=2             */
++/*                         OVERRUN_ERR=3 FRAME_ERR=4 PARITY_ERR=5      */
++/*                         ERR_CLR=7                                   */
++/*   0x04 UA_DATA          transmit (driver uses writew) / receive     */
++/*   0x06/0x07 UA_BAUD     16-bit, divisor = uartclk / baud - 1        */
++/*   0x0C UA_FIFO_CONTROL  16-bit; FIFO1_ENABLE=0 FIFO2_ENABLE=1       */
++/*                         FIFO1_RESET=2 FIFO2_RESET=3                 */
++/*                         TX_INT_ENABLE=9 TX_REQUESTED=10             */
++/*                         RX_IDLE_ENABLE=11                           */
++/*   0x0E UA_FIFO_BYTE     high byte = capacity, low byte = occupancy  */
++/*                                                                     */
++/* Every config write is a latch, and that is not a shortcut: the       */
++/* driver read-modify-writes UA_CONTROL (start_tx sets TX_ENABLE and    */
++/* TX_INT, stop_tx clears TX_INT) and reads UA_FIFO_CONTROL back        */
++/* before OR-ing into it, so those two must return what was written.    */
++/*                                                                     */
++/* Transmit is instantaneous here, so TX_BUSY reads 0 and TX_EMPTY      */
++/* reads 1 -- which is what both the driver's spin loops and the        */
++/* firmware's own +0x03 poll are waiting for. The baud register is      */
++/* kept but not interpreted: the driver computes 120000000/115200 - 1   */
++/* = 1040 = 0x410 itself and simply stores it, and the firmware's       */
++/* uart_init writes exactly that same 0x410, so nothing in the guest    */
++/* depends on the model knowing the clock.                             */
++/*                                                                     */
++/* The TX interrupt is a level the driver clears itself: start_tx sets  */
++/* TX_INT, TX_INT_ENABLE and TX_REQUESTED, the ISR drains the buffer,   */
++/* and stop_tx clears TX_INT and TX_INT_ENABLE, so the line falls       */
++/* again and cannot storm. Without it the tty write path would never    */
++/* drain. Kernel printk does not need it at all: nkj_console_putchar    */
++/* polls UA_STATUS and writes UA_DATA directly.                        */
++/*                                                                     */
++/* RX is a 128-byte FIFO, which is the fifosize the driver declares.    */
++/* RX_READY is level, and the driver's rx_chars loop clears it by       */
++/* reading UA_DATA, so the line falls when the FIFO empties. A byte     */
++/* arriving with no room sets OVERRUN_ERR, the bit the driver already   */
++/* watches for.                                                        */
++/*                                                                     */
++/* One write is deliberately left unexplained rather than guessed at:   */
++/* the firmware's uart_init does `+0x03 <- 1`, writing TX_BUSY into     */
++/* UA_STATUS, while the official driver only ever writes ERR_CLR there. */
++/* What bit 0 means on a status write is not documented anywhere, so    */
++/* it is accepted and given no effect.                                 */
++/*                                                                     */
++/* Console output needs no interrupt; console *input* does -- and the   */
++/* device tree is in the way. `console = "disabled"` makes nkj_uart_    */
++/* probe set is_real_serial = false, which skips request_irq entirely   */
++/* and turns start_tx into a discard. nkj_console_putchar ignores that  */
++/* flag, so TX still works and RX silently does not. A device tree      */
++/* carrying that property has to have it removed before a prompt can    */
++/* be answered, which is presumably what the Z8 project ended up doing  */
++/* to get RX and TX counts in /proc/interrupts.                        */
++/* ------------------------------------------------------------------ */
++
++static void z63_uart_update_irqs(NikonZ63State *s)
++{
++    uint8_t ctl = s->uart_reg[0x01];
++    uint16_t fc = s->uart_reg[0x0c] | ((uint16_t)s->uart_reg[0x0d] << 8);
++
++    /* RX: held while a byte is waiting and the driver asked for it. */
++    qemu_set_irq(s->uart_irq,
++                 s->uart_rx_count != 0 && (ctl & 0x02) && (ctl & 0x10));
++
++    /* TX: held while the driver wants room. It clears both enables in
++     * stop_tx, which is what makes this self-terminating. */
++    qemu_set_irq(s->uart_tx_irq,
++                 (ctl & 0x08) && (fc & 0x0200) && (fc & 0x0400));
++}
++
++static int z63_uart_can_receive(void *opaque)
++{
++    NikonZ63State *s = opaque;
++    return (int)sizeof(s->uart_rx) - (int)s->uart_rx_count;
++}
++
++static void z63_uart_receive(void *opaque, const uint8_t *buf, int size)
++{
++    NikonZ63State *s = opaque;
++
++    for (int i = 0; i < size; i++) {
++        if (s->uart_rx_count == sizeof(s->uart_rx)) {
++            s->uart_reg[0x03] |= 0x08; /* UA_STATUS_OVERRUN_ERR */
++            continue;
++        }
++        s->uart_rx[(s->uart_rx_head + s->uart_rx_count) % sizeof(s->uart_rx)] =
++            buf[i];
++        s->uart_rx_count++;
++    }
++    z63_uart_update_irqs(s);
++}
++
++static void z63_uart_event(void *opaque, QEMUChrEvent event)
++{
++}
++
++static uint64_t z63_uart_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (addr >= Z63_UART_PORT_SIZE) {
++        /* UART_NR is 1: there is exactly one port, and the firmware's
++         * uart_init only ever touches it. */
++        z63_stop_read("UART", Z63_UART_BASE + addr, size);
++        return 0;
++    }
++
++    switch (addr) {
++    case 0x03: {
++        uint8_t st = s->uart_reg[0x03] & ~0x01; /* TX_BUSY is never true */
++
++        st |= 0x02;                             /* TX_EMPTY: instant TX */
++        if (s->uart_rx_count) {
++            st |= 0x04;
++        } else {
++            st &= ~0x04;
++        }
++        return st;
++    }
++    case 0x04:
++        if (!s->uart_rx_count) {
++            /* The driver only reads the data register once RX_READY is
++             * set, so this is an access the hardware would not see. No
++             * meaning is claimed for the value. */
++            return 0;
++        }
++        {
++            uint8_t ch = s->uart_rx[s->uart_rx_head % sizeof(s->uart_rx)];
++
++            s->uart_rx_head = (s->uart_rx_head + 1) % sizeof(s->uart_rx);
++            s->uart_rx_count--;
++            z63_uart_update_irqs(s);
++            qemu_chr_fe_accept_input(&s->serial);
++            return ch;
++        }
++    case 0x0e:
++        /* Capacity in the high byte, occupancy in the low byte. Transmit
++         * is instantaneous, so nothing is ever queued. */
++        return (uint64_t)s->uart_reg[0x0f] << 8;
++    default:
++        return s->uart_reg[addr];
++    }
++}
++
++static void z63_uart_write(void *opaque, hwaddr addr, uint64_t value,
++                           unsigned size)
++{
++    NikonZ63State *s = opaque;
++    uint8_t v = value & 0xff;
++
++    if (addr >= Z63_UART_PORT_SIZE) {
++        z63_stop_write("UART", Z63_UART_BASE + addr, size, value);
++        return;
++    }
++
++    switch (addr) {
++    case 0x01:
++        if (v & 0x80) {
++            /* UA_CONTROL_RESET is "reset & disable all" in the driver. It
++             * is treated as a command bit: the block is cleared and the
++             * bit reads back zero. The driver never reads bit 7 back after
++             * writing it, and the firmware's only reader is the
++             * `read(+0x01) | 3` in uart_init, so this particular choice is
++             * not observable from either guest and is not claimed as a
++             * measured hardware behaviour. */
++            memset(s->uart_reg, 0, sizeof(s->uart_reg));
++            break;
++        }
++        s->uart_reg[0x01] = v;
++        break;
++    case 0x03:
++        if (v & 0x80) {
++            s->uart_reg[0x03] &= ~0x38; /* UA_STATUS_ERR_CLR */
++        }
++        /* Bit 0 is written by the firmware's uart_init and has no
++         * documented meaning on a status write. No effect is claimed. */
++        break;
++    case 0x04:
++        if (s->uart_reg[0x00] & 0x01) { /* only once UA_MODE_ENABLE is set */
++            uint8_t ch = v;
++
++            qemu_chr_fe_write(&s->serial, &ch, 1);
++        }
++        break;
++    default:
++        s->uart_reg[addr] = v;
++        break;
++    }
++
++    z63_uart_update_irqs(s);
++}
++
++static const MemoryRegionOps z63_uart_ops = {
++    .read = z63_uart_read,
++    .write = z63_uart_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++    /* The driver mixes readb/writeb with readw/writew, and UA_BAUD and
++     * UA_FIFO_CONTROL are 16-bit registers reached as two byte halves.
++     * Doing this at byte granularity lets the core split any access. */
++    .impl = { .min_access_size = 1, .max_access_size = 1 },
++};
++
++/* ------------------------------------------------------------------ */
++/* GICv3                                                               */
++/* ------------------------------------------------------------------ */
++
++static void z63_create_gic(NikonZ63State *s, int num_cpu)
++{
++    DeviceState *gicdev = qdev_new(TYPE_ARM_GICV3);
++    QList *redist;
++    int i;
++
++    s->gic = gicdev;
++    qdev_prop_set_uint32(gicdev, "revision", 3);
++    qdev_prop_set_uint32(gicdev, "num-cpu", num_cpu);
++    qdev_prop_set_uint32(gicdev, "num-irq", Z63_GIC_NUM_IRQ);
++    qdev_prop_set_bit(gicdev, "has-security-extensions", true);
++
++    /* One redistributor region covering every CPU */
++    redist = qlist_new();
++    qlist_append_int(redist, num_cpu);
++    qdev_prop_set_array(gicdev, "redist-region-count", redist);
++
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(gicdev), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 0, Z63_GIC_DIST_BASE);
++    sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 1, Z63_GIC_REDIST_BASE);
++
++    for (i = 0; i < num_cpu; i++) {
++        DeviceState *cpudev = DEVICE(qemu_get_cpu(i));
++        static const int timer_irq[] = {
++            [GTIMER_PHYS]     = 30, /* NS EL1 physical */
++            [GTIMER_VIRT]     = 27,
++            [GTIMER_HYP]      = 26,
++            [GTIMER_SEC]      = 29, /* S EL1 physical  */
++            [GTIMER_S_EL2_PHYS] = 20,
++        };
++
++        for (unsigned t = 0; t < ARRAY_SIZE(timer_irq); t++) {
++            qdev_connect_gpio_out(cpudev, t,
++                                  qdev_get_gpio_in(gicdev,
++                                                   Z63_GIC_PPI(i, timer_irq[t])));
++        }
++        sysbus_connect_irq(SYS_BUS_DEVICE(gicdev), i,
++                           qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
++        sysbus_connect_irq(SYS_BUS_DEVICE(gicdev), i + num_cpu,
++                           qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
++        sysbus_connect_irq(SYS_BUS_DEVICE(gicdev), i + 2 * num_cpu,
++                           qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
++        sysbus_connect_irq(SYS_BUS_DEVICE(gicdev), i + 3 * num_cpu,
++                           qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Bootstrap latches                                                  */
++/*                                                                    */
++/* Two single-register blocks the EL3 bootstrap touches right next to  */
++/* the GIC: an implementation-specific interrupt latch at 0x0d100004   */
++/* (immediate 0xffffffff) and the system counter enable at 0x0d140000  */
++/* (a lone 1, written per core while waking it). Both are plain        */
++/* storage; the sibling machine models them the same way.              */
++/* ------------------------------------------------------------------ */
++
++#define Z63_INT_LATCH_BASE  0x0D100004ULL
++#define Z63_COUNTER_BASE    0x0D140000ULL
++
++static uint64_t z63_latch_read(void *opaque, hwaddr offset, unsigned size)
++{
++    return *(uint32_t *)opaque;
++}
++
++static void z63_int_latch_write(void *opaque, hwaddr offset, uint64_t value,
++                                unsigned size)
++{
++    *(uint32_t *)opaque = value;
++}
++
++static void z63_counter_write(void *opaque, hwaddr offset, uint64_t value,
++                              unsigned size)
++{
++    if (offset || value != 1) {
++        error_report("Z63_COUNTER unmodeled write offset=+0x%" HWADDR_PRIx
++                     " value=0x%" PRIx64 " -- stopping", offset, value);
++        qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC, 3);
++        return;
++    }
++    *(uint32_t *)opaque = value;
++}
++
++static const MemoryRegionOps z63_int_latch_ops = {
++    .read = z63_latch_read,
++    .write = z63_int_latch_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static const MemoryRegionOps z63_counter_ops = {
++    .read = z63_latch_read,
++    .write = z63_counter_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* GPIO / pin configuration ("gpio-top", our DTB's PDR block)         */
++/*                                                                    */
++/* Five banks of pin configuration registers at 0x0d151000, offsets    */
++/* 0x00..0x60, 16-bit payload. Writes carry a write mask in the high   */
++/* half and the value in the low half, so a read-modify-write only     */
++/* touches the pins it names -- the image programs pin muxes here.     */
++/* ------------------------------------------------------------------ */
++
++static bool z63_gpio_offset(hwaddr addr, unsigned size)
++{
++    return size == 4 && !(addr & 3) && addr / 0x100 < Z63_GPIO_BANKS &&
++           (addr % 0x100) / 4 < Z63_GPIO_WORDS;
++}
++
++static uint64_t z63_gpio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (!z63_gpio_offset(addr, size)) {
++        z63_stop_read("GPIO_TOP", Z63_GPIO_TOP_BASE + addr, size);
++        return 0;
++    }
++    return s->gpio_config[addr / 0x100][(addr % 0x100) / 4];
++}
++
++static void z63_gpio_write(void *opaque, hwaddr addr, uint64_t value,
++                           unsigned size)
++{
++    NikonZ63State *s = opaque;
++    uint16_t *config;
++    uint16_t mask;
++
++    if (!z63_gpio_offset(addr, size)) {
++        z63_stop_write("GPIO_TOP", Z63_GPIO_TOP_BASE + addr, size, value);
++        return;
++    }
++    config = &s->gpio_config[addr / 0x100][(addr % 0x100) / 4];
++    mask = value >> 16;
++    *config = (*config & ~mask) | ((uint16_t)value & mask);
++}
++
++static const MemoryRegionOps z63_gpio_ops = {
++    .read = z63_gpio_read,
++    .write = z63_gpio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* TOP block at 0x0d150000                                             */
++/*                                                                    */
++/* Offset 0 is the SoC identity word -- bits 0..4 a chip id, bits      */
++/* 28..31 the silicon revision. This body's own getters read it the    */
++/* same way the Z8 sibling project documents: 0x40c2eb44 returns       */
++/* {word & 0x1f, word >> 28}, and 0x40c2eb88 picks offset 0x0c when    */
++/* the revision is below 3 and 0x10 otherwise, then returns             */
++/* {(w >> 16) & 0x1f, w & 0x1f}. So 0x0c and 0x10 are the identity     */
++/* selector pair, and all three reads below are read-only.             */
++/*                                                                    */
++/* The revision nibble is NOT measured. The BSP variant getter at      */
++/* 0x41188eac stores ((id >> 28) - 1) to 0x0a04ceedec, and no dump we  */
++/* hold reaches that address, so the value is a declared virtual board  */
++/* choice exposed as the soc-revision machine property rather than a    */
++/* silently invented constant.                                         */
++/*                                                                    */
++/* Everything else the firmware touches in this page is a plain 32-bit  */
++/* configuration word: the TOP init loop at 0x41187b00 does and/or/orr */
++/* read-modify-writes on the 0x2xx words, which only round-trip if the  */
++/* register stores what was written, and 0x40c2ebc8 builds 0x180..0x188 */
++/* from a byte array. No completion, lock or clock status is invented.  */
++/* ------------------------------------------------------------------ */
++
++static bool z63_top_is_config(hwaddr addr)
++{
++    switch (addr) {
++    case 0x004: /* mode selector written with 8 by the TOP init loop */
++    case 0x008: /* 3-bit selector written by 0x40c2eb6c */
++    case 0x180: case 0x184: case 0x188: /* pin/display clock setup */
++    case 0x208: case 0x20c: case 0x210: case 0x214:
++    case 0x21c: case 0x220: case 0x224:
++    case 0x234: case 0x23c: case 0x240: case 0x248:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static uint64_t z63_top_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3)) {
++        z63_stop_read("TOP", Z63_TOP_BASE + addr, size);
++        return 0;
++    }
++    switch (addr) {
++    case 0x000: /* identity: chip id | revision nibble */
++        return (s->soc_chip_id & 0x1f) | ((uint32_t)s->soc_revision << 28);
++    case 0x00c: /* identity selectors; virtual board default 0 */
++    case 0x010:
++        return 0;
++    default:
++        if (z63_top_is_config(addr)) {
++            return s->top_words[addr / 4];
++        }
++        z63_stop_read("TOP", Z63_TOP_BASE + addr, size);
++        return 0;
++    }
++}
++
++static void z63_top_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || !z63_top_is_config(addr)) {
++        z63_stop_write("TOP", Z63_TOP_BASE + addr, size, value);
++        return;
++    }
++    s->top_words[addr / 4] = value;
++}
++
++static const MemoryRegionOps z63_top_ops = {
++    .read = z63_top_read,
++    .write = z63_top_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Clock / power configuration bank at 0x0d152000                      */
++/*                                                                    */
++/* This firmware programs it as a table of constant 32-bit words:      */
++/* 0x41186ec0 writes 0x0d152090/094 and then 0x0d1520a0..0x0d1520dc    */
++/* straight from immediate values, and 0x401950d0 writes the same bank  */
++/* again from base 0x0d1520a0. Neither reads anything back, and the     */
++/* Z 6III Linux DTB calls this page CGN (clock generator).             */
++/*                                                                    */
++/* The Z8 sibling project models the 0xa0..0xe0 stretch as 2-bit gate   */
++/* command fields taken from the official clk-cgn.c. That protocol is   */
++/* deliberately NOT applied here: this body's writes are whole-word     */
++/* constants, not the pair-encoded commands clk-cgn.c describes, and    */
++/* nothing reads them back, so the minimal model that satisfies the     */
++/* observed accesses is plain storage. The whitelist is the union of    */
++/* the offsets this firmware is seen to write and the ones the sibling  */
++/* project documents for the same bank; everything else still stops.    */
++/* ------------------------------------------------------------------ */
++
++static bool z63_cgn_is_config(hwaddr addr)
++{
++    if (addr >= 0x0a0 && addr <= 0x0e0) {
++        return true;
++    }
++    switch (addr) {
++    case 0x000: case 0x008: case 0x010: case 0x014: case 0x018:
++    case 0x040: case 0x044: case 0x048: case 0x04c:
++    case 0x060: case 0x064: case 0x068: case 0x06c:
++    case 0x070: case 0x074: case 0x078:
++    case 0x080: /* 41187034 reads it into wzr as a flush */
++    case 0x090: case 0x094:
++    case 0x0d8: /* 41842158, 4184221c */
++        return true;
++    default:
++        return false;
++    }
++}
++
++static uint64_t z63_cgn_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || !z63_cgn_is_config(addr)) {
++        z63_stop_read("CGN", Z63_CGN_BASE + addr, size);
++        return 0;
++    }
++    return s->cgn_words[addr / 4];
++}
++
++static void z63_cgn_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || !z63_cgn_is_config(addr)) {
++        z63_stop_write("CGN", Z63_CGN_BASE + addr, size, value);
++        return;
++    }
++    s->cgn_words[addr / 4] = value;
++}
++
++static const MemoryRegionOps z63_cgn_ops = {
++    .read = z63_cgn_read,
++    .write = z63_cgn_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Peripheral control words at 0x0d150300                              */
++/*                                                                    */
++/* 0x41186f58 programs this block from immediates right after the CGN   */
++/* bank, and the values it uses line up with the per-word write masks   */
++/* the Z8 sibling project recovered from its own ROM table (their       */
++/* ROM4164c568/60a/64e). Every word this body writes fits that table    */
++/* exactly:                                                            */
++/*                                                                    */
++/*   +00 0x00280001  +04 0x000007ff  +08 0x000f3fff  +0c 0x000013ff    */
++/*   +10 0x6c3007fb  +20 0xff07fbf3  +24 0x00000000                    */
++/*                                                                    */
++/* -- each is a subset of its mask. That agreement across two separate  */
++/* firmwares is why the table is reused here rather than re-derived.    */
++/* +18 and +1c have a zero mask, so they are not populated words and    */
++/* still stop. Writes that set bits outside their mask also stop: that  */
++/* is the sibling's rule and nothing here justifies relaxing it.        */
++/*                                                                    */
++/* The registers store what was written -- the firmware performs its    */
++/* own locked read-modify-write on them. No device or transfer          */
++/* completion is invented.                                             */
++/* ------------------------------------------------------------------ */
++
++static const uint32_t z63_pctl_masks[Z63_PCTL_WORDS] = {
++    0xffaffbffU, /* +00 */
++    0x00000fffU, /* +04 */
++    0x00ff3fffU, /* +08 */
++    0x000f3fffU, /* +0c */
++    0xffff3fffU, /* +10 */
++    0x0000000fU, /* +14 */
++    0x00000000U, /* +18 -- not a populated word */
++    0x00000000U, /* +1c -- not a populated word */
++    0xffbffbffU, /* +20 */
++    0x00000fffU, /* +24 */
++};
++
++static bool z63_pctl_word(hwaddr addr, unsigned size, uint64_t value,
++                          bool write)
++{
++    if (size != 4 || (addr & 3) || addr / 4 >= Z63_PCTL_WORDS) {
++        return false;
++    }
++    if (!z63_pctl_masks[addr / 4]) {
++        return false;
++    }
++    return !write || !(value & ~(uint64_t)z63_pctl_masks[addr / 4]);
++}
++
++static uint64_t z63_pctl_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (!z63_pctl_word(addr, size, 0, false)) {
++        z63_stop_read("PCTL", Z63_PCTL_BASE + addr, size);
++        return 0;
++    }
++    return s->pctl_words[addr / 4];
++}
++
++static void z63_pctl_write(void *opaque, hwaddr addr, uint64_t value,
++                           unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (!z63_pctl_word(addr, size, value, true)) {
++        z63_stop_write("PCTL", Z63_PCTL_BASE + addr, size, value);
++        return;
++    }
++    s->pctl_words[addr / 4] = value;
++}
++
++static const MemoryRegionOps z63_pctl_ops = {
++    .read = z63_pctl_read,
++    .write = z63_pctl_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Configuration sequencer at 0x0d158000                               */
++/*                                                                    */
++/* 0x41187018 runs exactly the handshake the Z8 sibling project         */
++/* documents, with the same two magic constants, the same poll bit and  */
++/* the same ack value:                                                 */
++/*                                                                    */
++/*     write 0x0d158040 = 0xcdce0c34   (configuration)                 */
++/*     write 0x0d158000 = 0x0000aa02   (command)                       */
++/*     poll  0x0d15800c until bit 5                                     */
++/*     write 0x0d158010 = 0x20         (acknowledge)                    */
++/*                                                                    */
++/* The done bit is NOT hardwired high. This is an explicit              */
++/* configuration -> command -> complete -> acknowledge state machine,    */
++/* so the poll only succeeds because the command actually arrived; a     */
++/* machine that simply returned 0x20 would be asserting completion that  */
++/* nothing performed. The acknowledge clears it again. Nothing further   */
++/* is inferred about what the sequencer configures -- no PLL lock, no    */
++/* rate, no clock status.                                               */
++/*                                                                    */
++/* 0x0d158080..0x09c receives a descending byte run 0x1f..0x00 packed   */
++/* into words and is stored verbatim; its meaning is unknown.            */
++/* ------------------------------------------------------------------ */
++
++#define Z63_SEQ_DONE   0x20
++#define Z63_SEQ_CONFIG 0xCDCE0C34
++#define Z63_SEQ_CMD    0x0000AA02
++
++/* Accepted offsets, each one taken from an instruction that builds it:
++ *
++ *   000  40c2f450, 41186f98   command register (handshake below)
++ *   008  40c2f1dc             `str wzr, [0d158008]` after copying 00c into 010
++ *   00c  41186f98             status; this is the word the handshake polls
++ *   010  40c2f1dc             ack
++ *   018  40c2f3b8, 41187098   read for its bits and read into wzr as a flush
++ *   020  40c2f494             `str w9, [x21, #0x20]` with x21 = 0d158000,
++ *                             the first of four consecutive stores into the
++ *                             block -- 020, 040, 010, 008 -- followed by the
++ *                             command word at 000. The first value the boot
++ *                             puts here is 0x08000000 (bit 27).
++ *   040  41186f98             config written before the command; also the
++ *                             second of those four stores (w10)
++ *   050  40c2f254             byte-order word, written from a per-unit pair
++ *   080..09c  41186f98, 40c2f254  eight words; 40c2f254 fills them with
++ *                             00010203, 04050607 ... 1c1d1e1f, i.e. the
++ *                             identity byte order of a 32-byte lane table
++ *
++ * Anything else in the block, and every width other than 4, still stops. */
++static bool z63_seq_is_word(hwaddr addr)
++{
++    switch (addr) {
++    case 0x000: case 0x008: case 0x00c: case 0x010: case 0x018:
++    case 0x020: case 0x040: case 0x050:
++        return true;
++    default:
++        return addr >= 0x080 && addr <= 0x09c;
++    }
++}
++
++static uint64_t z63_seq_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++    uint32_t value;
++
++    if (size != 4 || (addr & 3) || !z63_seq_is_word(addr)) {
++        z63_stop_read("SEQ", Z63_SEQ_BASE + addr, size);
++        return 0;
++    }
++    value = s->seq_words[addr / 4];
++    if (addr == 0x00c && s->seq_done) {
++        value |= Z63_SEQ_DONE;
++    }
++    return value;
++}
++
++static void z63_seq_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || !z63_seq_is_word(addr)) {
++        z63_stop_write("SEQ", Z63_SEQ_BASE + addr, size, value);
++        return;
++    }
++    s->seq_words[addr / 4] = value;
++
++    if (addr == 0x000 && value == Z63_SEQ_CMD &&
++        s->seq_words[0x040 / 4] == Z63_SEQ_CONFIG) {
++        /* The sequencer accepted a command that followed its configuration. */
++        s->seq_done = true;
++    } else if (addr == 0x010 && (value & Z63_SEQ_DONE)) {
++        s->seq_done = false;
++    }
++}
++
++static const MemoryRegionOps z63_seq_ops = {
++    .read = z63_seq_read,
++    .write = z63_seq_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Identification block at 0x0d153000                                  */
++/*                                                                    */
++/* 40d6f9b0 reads +0x00 and compares it with 0x53; only if it matches   */
++/* does 40d6f9bc read +0x04 and compare it with 0x00030001; only if     */
++/* that also matches does 40d6f9d0 read +0x40 and throw the result      */
++/* away. This is the same conditional diagnostic the Z8 notes describe  */
++/* at their 40d69678, down to both constants, so the sibling project    */
++/* reached the same conclusion: it is a diagnostic, and the constants   */
++/* are what the code compares against, not a measured reset value.      */
++/*                                                                    */
++/* The model returns 0, i.e. "does not match". That is a declaration,   */
++/* not a measurement: no dump in this project covers this block. The    */
++/* consequence is bounded and visible -- the firmware skips one read    */
++/* whose only effect is a bus flush -- and choosing 0x53 would be       */
++/* fabricating a value to reach a branch nothing in the code depends    */
++/* on. The block is read-only; a write stops.                           */
++/* ------------------------------------------------------------------ */
++
++static uint64_t z63_id_read(void *opaque, hwaddr addr, unsigned size)
++{
++    if (size != 4 || (addr & 3) ||
++        (addr != 0x000 && addr != 0x004 && addr != 0x040)) {
++        z63_stop_read("ID", Z63_ID_BASE + addr, size);
++        return 0;
++    }
++    return 0;
++}
++
++static void z63_id_write(void *opaque, hwaddr addr, uint64_t value,
++                         unsigned size)
++{
++    z63_stop_write("ID", Z63_ID_BASE + addr, size, value);
++}
++
++static const MemoryRegionOps z63_id_ops = {
++    .read = z63_id_read,
++    .write = z63_id_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Configuration bank at 0x0d157000                                    */
++/*                                                                    */
++/* 40c2f024 works on +0x010: it reads the word, ORs in bit 0 and        */
++/* writes it back, then does the same to +0x004, and folds two bits of  */
++/* its argument into +0x008. 40c2f088 and 40c2f0ac do the same around   */
++/* +0x790 and +0x794. Those read-modify-write sequences only behave if  */
++/* the read returns what was last written, so this is plain storage     */
++/* with no seed value: a word that was never written reads back 0, and  */
++/* the model does not claim that 0 is what silicon reports.             */
++/* ------------------------------------------------------------------ */
++
++static bool z63_cfg7_is_word(hwaddr addr)
++{
++    switch (addr) {
++    case 0x010: case 0x014: case 0x018:
++    case 0x790: case 0x794:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static uint64_t z63_cfg7_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || !z63_cfg7_is_word(addr)) {
++        z63_stop_read("CFG7", Z63_CFG7_BASE + addr, size);
++        return 0;
++    }
++    return s->cfg7_words[addr / 4];
++}
++
++static void z63_cfg7_write(void *opaque, hwaddr addr, uint64_t value,
++                           unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || !z63_cfg7_is_word(addr)) {
++        z63_stop_write("CFG7", Z63_CFG7_BASE + addr, size, value);
++        return;
++    }
++    s->cfg7_words[addr / 4] = value;
++}
++
++static const MemoryRegionOps z63_cfg7_ops = {
++    .read = z63_cfg7_read,
++    .write = z63_cfg7_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* SPI controller at 0x0e700000                                        */
++/*                                                                    */
++/* 40c14420 walks a DRAM table twelve times, 0x100 apart, and for each  */
++/* entry that is flagged present it does:                               */
++/*                                                                    */
++/*   n  = table[entry].index                                            */
++/*   p  = 0x0e700000 + n * 0x100                                        */
++/*   p[0x60] |= 1                          -- power the chip select up  */
++/*   drv[i] = 0x0e700000[i].0x48 & 0x1ff   -- read back its setting     */
++/*                                                                    */
++/* The Linux device tree has a node named spi@0x0e700500, and its       */
++/* property names include cs_pdr_addr and cs_pdr_bit -- chip-select     */
++/* power-down address and bit -- with cs_pdr_addr = 0x58 and            */
++/* cs_pdr_bit = 0xc. The node's reg property is <0 0xe700500 0 0x100    */
++/* 0 0xd151000 0 0x500>, so the window is the 0x100 the loop walks and  */
++/* the second reg is exactly the five GPIO banks modelled above.        */
++/*                                                                    */
++/* An earlier version of this comment claimed the 0x60 write was the    */
++/* chip-select power control. The device tree falsifies that: the       */
++/* power-down register is +0x58, and the firmware's write is +0x60. So  */
++/* +0x58 is accepted on the device tree's authority alone -- no         */
++/* firmware access to it has been observed -- while +0x60 and +0x48     */
++/* rest on the firmware, and none of the three has a claimed meaning.   */
++/*                                                                    */
++/* The bus carries an Infineon SLB9670 TPM 2.0, node slb9670@0 on this  */
++/* controller. That is why a TPM is expected to answer later; nothing   */
++/* here models it, and a TPM command that needs a real response will    */
++/* stop and say so rather than be invented.                             */
++/*                                                                    */
++/* The +0x48 read is stored into a DRAM config block, so a              */
++/* never-written window hands back 0; the model does not assert that 0  */
++/* is what silicon reports, and no reset value is invented for it.      */
++/* ------------------------------------------------------------------ */
++
++/* Returns the slot for +0x48, +0x58 or +0x60, false for anything else. */
++static bool z63_spi_slot(hwaddr addr, unsigned *inst, unsigned *slot)
++{
++    hwaddr off;
++
++    if (addr >= (hwaddr)Z63_SPI_INST * Z63_SPI_STRIDE) {
++        return false;
++    }
++    *inst = addr / Z63_SPI_STRIDE;
++    off = addr % Z63_SPI_STRIDE;
++    if (off == 0x48) {
++        *slot = 0;
++        return true;
++    }
++    if (off == 0x58) {
++        *slot = 1;
++        return true;
++    }
++    if (off == 0x60) {
++        *slot = 2;
++        return true;
++    }
++    return false;
++}
++
++static uint64_t z63_spi_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++    unsigned inst, slot;
++
++    if (size != 4 || (addr & 3) || !z63_spi_slot(addr, &inst, &slot)) {
++        z63_stop_read("SPI", Z63_SPI_BASE + addr, size);
++        return 0;
++    }
++    return s->spi_cfg[inst][slot];
++}
++
++static void z63_spi_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    NikonZ63State *s = opaque;
++    unsigned inst, slot;
++
++    if (size != 4 || (addr & 3) || !z63_spi_slot(addr, &inst, &slot)) {
++        z63_stop_write("SPI", Z63_SPI_BASE + addr, size, value);
++        return;
++    }
++    s->spi_cfg[inst][slot] = value;
++}
++
++static const MemoryRegionOps z63_spi_ops = {
++    .read = z63_spi_read,
++    .write = z63_spi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Unnamed auxiliary pair at 0x0c86e000 and 0x0c86f000                  */
++/*                                                                    */
++/* 40c157d4 builds two of these from 40c157dc/40c157e0 and touches      */
++/* exactly three words in each, all at the end of the function:         */
++/*                                                                    */
++/*   [0x0c86e000] = 0xffffffff   [0x0c86e004] = 0   [0x0c86e010] = -1  */
++/*   [0x0c86f000] = 0xffffffff   [0x0c86f004] = 0   [0x0c86f010] = -1  */
++/*                                                                    */
++/* Everything before that builds a descriptor table in DRAM at          */
++/* 0xa02dc41a8 whose entries are pointers into the pin-configuration    */
++/* banks at 0x0d151000 (base+0, +4, +8, +0xc, +0x14, and the second     */
++/* bank at +0x100). So the driver pairs a GPIO-register descriptor list  */
++/* with these two blocks, but nothing here says what the blocks are.    */
++/*                                                                    */
++/* The name is therefore not established. Neither Linux device tree     */
++/* mentions 0x0c86e000 or 0x0c86f000, and a scan of every movz/movk     */
++/* constant in 0x0c800000..0x0c900000 finds only 0x0c850000 (IPC),      */
++/* 0x0c851000 (the ipcu node), 0x0c86a010 and this pair. The block is    */
++/* modelled as what the code addresses and no more: three words per      */
++/* instance, two instances 0x1000 apart, plain storage and no claimed    */
++/* semantics for the all-ones writes.                                   */
++/* ------------------------------------------------------------------ */
++
++static bool z63_aux_slot(hwaddr addr, unsigned *inst, unsigned *slot)
++{
++    hwaddr off;
++
++    if (addr >= (hwaddr)Z63_AUX_INST * Z63_AUX_STRIDE) {
++        return false;
++    }
++    *inst = addr / Z63_AUX_STRIDE;
++    off = addr % Z63_AUX_STRIDE;
++    switch (off) {
++    case 0x000:
++        *slot = 0;
++        return true;
++    case 0x004:
++        *slot = 1;
++        return true;
++    case 0x010:
++        *slot = 2;
++        return true;
++    default:
++        return false;
++    }
++}
++
++static uint64_t z63_aux_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++    unsigned inst, slot;
++
++    if (size != 4 || (addr & 3) || !z63_aux_slot(addr, &inst, &slot)) {
++        z63_stop_read("AUX", Z63_AUX_BASE + addr, size);
++        return 0;
++    }
++    return s->aux_words[inst][slot];
++}
++
++static void z63_aux_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    NikonZ63State *s = opaque;
++    unsigned inst, slot;
++
++    if (size != 4 || (addr & 3) || !z63_aux_slot(addr, &inst, &slot)) {
++        z63_stop_write("AUX", Z63_AUX_BASE + addr, size, value);
++        return;
++    }
++    s->aux_words[inst][slot] = value;
++}
++
++static const MemoryRegionOps z63_aux_ops = {
++    .read = z63_aux_read,
++    .write = z63_aux_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Three flat register windows in 0x0e000000..0x0e210000                */
++/*                                                                    */
++/* These are reached by the driver-init chain 40c13f98 calls:           */
++/*   40c140cc, 40c143f8, 40c157d4, 40c164e8, 40c16c24, 40c173b8,        */
++/*   40c18ce8, 40c19a7c, 40c1b454                                       */
++/* The two already handled from that chain are the auxiliary pair at    */
++/* 0x0c86e000 (40c157d4) and the SPI block at 0x0e700000 (40c14408).    */
++/*                                                                    */
++/* A constant sweep of the image bounds where these banks are but NOT   */
++/* which offsets live in them, and the run proved that: the first       */
++/* version of this model accepted only movz/movk constants and stopped  */
++/* at 0x0e005028, which 40c16ca8 forms as `add x23, x21, #0x28` on a    */
++/* base that walks 0x400 at a time. An offset reached as base+offset    */
++/* never appears as a constant, so no whitelist can be complete, and    */
++/* the same reason is why the video array at 0x14000000 has none.       */
++/*                                                                    */
++/* So each bank is a plain register file over the span its own bases     */
++/* bound, and no individual register is claimed to mean anything:       */
++/*                                                                    */
++/*   E0  0x0e000000..0x0e005fff   6 bases at +n*0x1000, from 40c19638,   */
++/*                                0x40c14100, 40c19328, 40c1af98;       */
++/*                                40c16c24 walks a further 4 sub-blocks  */
++/*                                of 0x400 inside the last one.          */
++/*   E1  0x0e100000..0x0e12ffff   3 bases at +n*0x10000, built by        */
++/*                                40c16534/40c16538/40c16554, which set  */
++/*                                bit 28 then bit 31 of each.            */
++/*   E2  0x0e200000..0x0e2005ff   6 bases at +n*0x100, built by          */
++/*                                40c173bc/40c17574/40c175f8.           */
++/*                                                                    */
++/* What the banks ARE is not established. They are not in the Linux      */
++/* device tree and neither local analysis nor the Z8 notes name them.    */
++/* Reads return the last write, unwritten words read 0, and every        */
++/* address outside the three spans still stops with its PC.              */
++/* ------------------------------------------------------------------ */
++
++static uint64_t z63_win_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Z63Win *w = opaque;
++
++    if (size != 4 || (addr & 3) || addr >= w->size) {
++        z63_stop_read(w->name, w->base + addr, size);
++        return 0;
++    }
++    return w->words[addr / 4];
++}
++
++static void z63_win_write(void *opaque, hwaddr addr, uint64_t value,
++                           unsigned size)
++{
++    Z63Win *w = opaque;
++
++    if (size != 4 || (addr & 3) || addr >= w->size) {
++        z63_stop_write(w->name, w->base + addr, size, value);
++        return;
++    }
++    w->words[addr / 4] = value;
++}
++
++static const MemoryRegionOps z63_win_ops = {
++    .read = z63_win_read,
++    .write = z63_win_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++/* ------------------------------------------------------------------ */
++/* Video pipeline register array at 0x14000000                         */
++/*                                                                    */
++/* sub_41187344 (a driver entry reached only through a registration     */
++/* table -- it has no direct caller) sweeps this block writing 0x880000 */
++/* to channel registers, then small mode words. Instances are 0x4000    */
++/* apart and all of its addresses land on +0x3080, +0x3f60 or +0x3f68.  */
++/*                                                                    */
++/* The offsets are NOT enumerable from code, which is why there is no   */
++/* whitelist here. sub_41187994 picks its target out of a runtime table */
++/* (`mul x14, x8, x10; ldr w14, [x9, x14]; add w15, w14, #0x10`), and  */
++/* the observed access at 0x14154050 is instance 85 offset 0x50 -- not  */
++/* any offset any immediate in the image mentions. The instance count   */
++/* is likewise table-driven, so the bound comes from the firmware's own */
++/* 40-entry channel table at ROM 0x44b15614: every entry is            */
++/* `0x14000000 + n*0x4000 + 0x3080` and the highest n is 109.          */
++/*                                                                    */
++/* The neighbouring interrupt-source table calls this stretch of the    */
++/* SoC the video pipeline (SIF_0..7, PPC_0..4, PERSUIT_0..31, MIPU, ...);*/
++/* the block is not in the Linux device tree, i.e. Linux never touches  */
++/* it. Which instance is which channel is not established, and no       */
++/* individual register is claimed to mean anything: this is a plain     */
++/* register file over one 0x4000-byte window per instance, and every    */
++/* offset outside those windows still stops.                            */
++/*                                                                    */
++/* The 0x3f60/0x3f68 registers are written eight bytes wide; the impl   */
++/* access size is 4 so QEMU splits those into the two halves.           */
++/* ------------------------------------------------------------------ */
++
++static uint64_t z63_vpipe_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || addr >= Z63_VPIPE_SIZE) {
++        z63_stop_read("VPIPE", Z63_VPIPE_BASE + addr, size);
++        return 0;
++    }
++    return s->vpipe[addr / 4];
++}
++
++static void z63_vpipe_write(void *opaque, hwaddr addr, uint64_t value,
++                            unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || addr >= Z63_VPIPE_SIZE) {
++        z63_stop_write("VPIPE", Z63_VPIPE_BASE + addr, size, value);
++        return;
++    }
++    s->vpipe[addr / 4] = value;
++}
++
++static const MemoryRegionOps z63_vpipe_ops = {
++    .read = z63_vpipe_read,
++    .write = z63_vpipe_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 8 },
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Five sibling blocks at 0x11800000 + n * 0x800000                     */
++/*                                                                    */
++/* This family was found by reading the immediates of the video         */
++/* driver rather than by a trap, and it is the reason a single          */
++/* 0x1180002c gate guards two separate functions:                       */
++/*                                                                    */
++/*   401951b8  polls +0x8c8 on 0x11800000, 0x12000000, 0x12800000,      */
++/*             0x13000000 and 0x13800000 in turn -- instantiating the   */
++/*             same register offset on five consecutive bases           */
++/*   40c312dc  builds a base 0x1180f018 and then                     */
++/*   40c312e0  `add w0, w8, w19, lsl #23` -- +n*0x800000, the stride    */
++/*   40c30258  loads 0x11800000 alongside the constant 0x800004         */
++/*   411870c8  `cmp w0, #4` selects the instance for the upload path    */
++/*                                                                    */
++/* The same 64 KB window covers every 0x138xxxxx address the firmware   */
++/* is known to touch (0x0000, 0x5000, 0x5100, 0x5400, 0x5500, 0x5800,   */
++/* 0x7458, 0x7d00, 0x7d20) because 0x13800000 is instance 4. That the   */
++/* 40-entry channel table in the upload path also lands entirely inside */
++/* instance 4 is a consistency check the family model passes.           */
++/*                                                                    */
++/* What the blocks ARE is not established: they are not in the Linux    */
++/* device tree and neither the Z8 notes nor the local analysis names    */
++/* 0x11800000. So this is a plain register file, and offset 0x02c is    */
++/* the one exception the firmware forces: 411870d8 and 41187458 both    */
++/* `cbz` on it, and 41187458's zero branch silently skips the whole     */
++/* video upload. It is therefore modelled as a read-only capability     */
++/* word that reads back 1, i.e. "present" -- the only thing either      */
++/* consumer distinguishes. The value is a declared board choice, like   */
++/* soc-revision, not a measured register; nothing claims bit meanings,  */
++/* and a write there stops rather than being absorbed.                  */
++/* ------------------------------------------------------------------ */
++
++static uint64_t z63_sib_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++    unsigned inst;
++    hwaddr off;
++
++    if (size != 4 || (addr & 3) ||
++        addr >= (hwaddr)Z63_BLK_INST * Z63_BLK_STRIDE) {
++        z63_stop_read("SIBLING", Z63_BLK_BASE + addr, size);
++        return 0;
++    }
++    inst = addr / Z63_BLK_STRIDE;
++    off = addr % Z63_BLK_STRIDE;
++    if (off == Z63_BLK_CAP) {
++        return 1;
++    }
++    if (off >= Z63_BLK_WINDOW) {
++        z63_stop_read("SIBLING", Z63_BLK_BASE + addr, size);
++        return 0;
++    }
++    return s->sib[inst][off / 4];
++}
++
++static void z63_sib_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    NikonZ63State *s = opaque;
++    unsigned inst;
++    hwaddr off;
++
++    if (size != 4 || (addr & 3) ||
++        addr >= (hwaddr)Z63_BLK_INST * Z63_BLK_STRIDE) {
++        z63_stop_write("SIBLING", Z63_BLK_BASE + addr, size, value);
++        return;
++    }
++    inst = addr / Z63_BLK_STRIDE;
++    off = addr % Z63_BLK_STRIDE;
++    if (off >= Z63_BLK_WINDOW) {
++        z63_stop_write("SIBLING", Z63_BLK_BASE + addr, size, value);
++        return;
++    }
++    if (off == Z63_BLK_CAP) {
++        z63_stop_write("SIBLING", Z63_BLK_BASE + addr, size, value);
++        return;
++    }
++    s->sib[inst][off / 4] = value;
++}
++
++static const MemoryRegionOps z63_sib_ops = {
++    .read = z63_sib_read,
++    .write = z63_sib_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* Driver upload window at 0x14c00000                                   */
++/*                                                                    */
++/* sub_411870c8 fills exactly two 0x1ac-byte tables here, from ROM      */
++/* 0x44b13d78 + n*0x1ac into +0x0000 and 0x44b145d4 + n*0x1ac into      */
++/* +0x1000, where n is the same 0..4 instance selector. Both targets    */
++/* are fixed, so this is a flat window and not an indexed array. The    */
++/* region is sized to 0x2000, which covers both tables with slack; a    */
++/* read of what was written returns it, and anything else stops.        */
++/* ------------------------------------------------------------------ */
++
++static uint64_t z63_upk_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || addr >= Z63_UPK_SIZE) {
++        z63_stop_read("UPLOAD", Z63_UPK_BASE + addr, size);
++        return 0;
++    }
++    return s->upk[addr / 4];
++}
++
++static void z63_upk_write(void *opaque, hwaddr addr, uint64_t value,
++                          unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (size != 4 || (addr & 3) || addr >= Z63_UPK_SIZE) {
++        z63_stop_write("UPLOAD", Z63_UPK_BASE + addr, size, value);
++        return;
++    }
++    s->upk[addr / 4] = value;
++}
++
++static const MemoryRegionOps z63_upk_ops = {
++    .read = z63_upk_read,
++    .write = z63_upk_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* System reset controller, 0x0D154000 block                          */
++/*                                                                    */
++/* Two write-only windows over the same three 32-bit words:            */
++/*                                                                    */
++/*   0x0D154240 + 4*i   clear -- writing 1 clears bit i                */
++/*   0x0D154340 + 4*i   set   -- writing 1 sets bit i                  */
++/*                                                                    */
++/* The set of bits the firmware can reach is not a guess. The image    */
++/* carries an 83-entry table of (offset, bit) byte pairs at 0x4184BD5C,*/
++/* consumed by the routine pair at 0x40c2dbb0 and 0x40c2dbf8:          */
++/*                                                                    */
++/*   cmp  w1, #0x52                 index > 82 returns                 */
++/*   x8 = 0x4184BD5C + index*2      ldrb offset, ldrb bit              */
++/*   x9 = 0x0D154000 + offset                                          */
++/*   lsl  w8, #1, bit               str w8, [x9, #0x340]  (or #0x240)  */
++/*                                                                    */
++/* Unioning the 83 routes gives three masks -- 0x01FFFFFF, 0xFFFF7FFF, */
++/* 0xFFFFF0FE -- and they are bit for bit the same three words the Z8  */
++/* project derives from its own image (n-research z8-qemu,             */
++/* src/reset-controls.h, from a table at 0x4164C494 with the same 83   */
++/* routes). Two different EXPEED 7 images agreeing on the complete     */
++/* route set is the strongest evidence available that these three      */
++/* words are the whole window and that no other offset is addressable. */
++/*                                                                    */
++/* The whole boot touches this block six times, all in the offset-4    */
++/* word, and the sequence is worth keeping:                            */
++/*                                                                    */
++/*   244 <- 0x02   clear bit 1   release CPU1                          */
++/*   044 -> poll   status                                              */
++/*   244 <- 0x04   clear bit 2   release CPU2                          */
++/*   044 -> poll   status                                              */
++/*   344 <- 0x80   set   bit 7                                         */
++/*   244 <- 0x80   clear bit 7   reset pulse on the same resource      */
++/*                                                                    */
++/* CPU3 is never released: bit 3 of the clear word is never written.   */
++/* That is not an omission in the model. The Linux device tree shipped */
++/* in the same package declares a single cpu@3, so core 3 belongs to   */
++/* the LI image and this stage deliberately leaves it in reset -- which*/
++/* is why booting eg alone can never produce a Linux console.          */
++/*                                                                    */
++/* Only CPU0 runs from reset. For cores 1..3 the EL3 code in the image */
++/* builds a boot block in the mailbox, clears the core's reset bit and */
++/* polls +0x044 until the matching status bit appears. The model       */
++/* performs exactly that: it validates the mailbox, resets the target  */
++/* CPU and points it at the posted entry address.                      */
++/*                                                                    */
++/* Modelling: the six words are latched per address and read back      */
++/* verbatim; no meaning is claimed for any bit except the core         */
++/* releases above. A write carrying a bit outside the derived mask is  */
++/* a route this firmware does not have, so it stops rather than guess. */
++/* ------------------------------------------------------------------ */
++
++static const uint32_t z63_reset_masks[3] = {
++    0x01ffffffU, 0xffff7fffU, 0xfffff0feU,
++};
++
++static void z63_start_secondary(CPUState *cs, run_on_cpu_data data)
++{
++    ARMCPU *cpu = ARM_CPU(cs);
++    uint64_t entry = data.host_ulong;
++
++    cpu_reset(cs);
++    cpu->env.pc = entry;
++    cpu->power_state = PSCI_ON;
++    cs->halted = false;
++    error_report("Z63: released CPU%d at pc=0x%08" PRIx64, cs->cpu_index, entry);
++}
++
++static uint64_t z63_release_read(void *opaque, hwaddr offset, unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    if (offset == 0x44) {
++        return s->release_status;
++    }
++    if (offset >= 0x240 && offset < 0x24c && !(offset & 3)) {
++        return s->reset_word[(offset - 0x240) / 4];
++    }
++    if (offset >= 0x340 && offset < 0x34c && !(offset & 3)) {
++        return s->reset_word[3 + (offset - 0x340) / 4];
++    }
++    z63_stop_read("RESET", Z63_RELEASE_BASE + offset, size);
++    return 0;
++}
++
++static void z63_release_write(void *opaque, hwaddr offset, uint64_t value,
++                              unsigned size)
++{
++    NikonZ63State *s = opaque;
++
++    unsigned win, idx, i;
++
++    if (offset >= 0x240 && offset < 0x24c && !(offset & 3)) {
++        win = 0;
++    } else if (offset >= 0x340 && offset < 0x34c && !(offset & 3)) {
++        win = 1;
++    } else {
++        z63_stop_write("RESET", Z63_RELEASE_BASE + offset, size, value);
++        return;
++    }
++    idx = (offset - (win ? 0x340 : 0x240)) / 4;
++
++    if (value & ~(uint64_t)z63_reset_masks[idx]) {
++        z63_stop_write("RESET-ROUTE", Z63_RELEASE_BASE + offset, size, value);
++        return;
++    }
++    s->reset_word[win * 3 + idx] = value;
++
++    if (win == 1) {
++        /* Writing a core bit in the set window holds that core in reset.
++         * No image path does it and the model does not implement it, so
++         * report rather than silently swallow it. */
++        if (value & UINT64_C(0x0e)) {
++            error_report("Z63_RESET: core reset asserted with 0x%" PRIx64
++                         " at +0x%" PRIx64 " -- not modelled, stopping",
++                         value, (uint64_t)offset);
++            qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC,
++                                                   3);
++        }
++        return;
++    }
++    if (idx != 1) {
++        return; /* only the offset-4 clear word carries core releases */
++    }
++
++    for (i = 1; i < 4; i++) {
++        uint32_t magic = 0;
++        uint64_t entry = 0;
++
++        if (!(value & (1U << i))) {
++            continue;
++        }
++        cpu_physical_memory_read(Z63_MAILBOX_MAGIC, &magic, sizeof(magic));
++        cpu_physical_memory_read(Z63_MAILBOX_ENTRY + (i - 1) * 8, &entry,
++                                 sizeof(entry));
++        magic = le32_to_cpu(magic);
++        entry = le64_to_cpu(entry);
++
++        if (magic != Z63_BOOT_MAGIC || !entry) {
++            error_report("Z63_RELEASE CPU%d: bad mailbox magic=0x%08x entry=0x%"
++                         PRIx64 " -- stopping", i, magic, entry);
++            qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC,
++                                                   3);
++            return;
++        }
++        if (s->release_status & (1U << i)) {
++            error_report("Z63_RELEASE CPU%d released twice -- stopping", i);
++            qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC,
++                                                   3);
++            return;
++        }
++        async_run_on_cpu(CPU(s->cpu[i]), z63_start_secondary,
++                         RUN_ON_CPU_HOST_ULONG(entry));
++        s->release_status |= 1U << i;
++    }
++}
++
++static const MemoryRegionOps z63_release_ops = {
++    .read = z63_release_read,
++    .write = z63_release_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* The LI (Linux) payload                                              */
++/*                                                                     */
++/* `li2010_*.bi` is not a flat image, it is a container:                */
++/*                                                                     */
++/*   0x000  "NISI"                       magic                          */
++/*   0x010  u32 count = 4                followed by "0200i1"           */
++/*   0x020  count x {u32 first_block, u32 blocks, u64 bytes}            */
++/*   ...    the members, 0x800-aligned, in directory order              */
++/*                                                                     */
++/* Each entry is self-checking: its offset is first_block << 11 and its */
++/* block count must be ceil(bytes / 0x800). On the shipped 2.00         */
++/* container all four agree exactly -- the kernel at block 1 (6,101,000 */
++/* bytes), the initramfs at block 0xba5 (21,274,826), and the two       */
++/* device trees at blocks 0x343a (3,845) and 0x343c (3,168). The        */
++/* container carries no member names, so members are identified here by */
++/* content and never by directory order, and an unrecognised member is  */
++/* an error rather than something to skip.                              */
++/*                                                                     */
++/* Where they go is not a guess either. The running image's own SOLID   */
++/* region table (0x455C3810) declares its Linux window, and the device  */
++/* tree in this same container declares a memory@ node that lands        */
++/* exactly inside it, ending precisely where its share_mem begins. The  */
++/* kernel goes at the base of that window: its Image header says        */
++/* text_offset = 0, so it must start a 2 MiB-aligned region and may not */
++/* be placed anywhere else. The device tree sits 32 MiB above it and    */
++/* the initramfs above that, both 2 MiB aligned and both far below      */
++/* share_mem.                                                           */
++/*                                                                     */
++/* The device tree is patched twice, and both patches are required:     */
++/*                                                                     */
++/*   - /chosen gets linux,initrd-start and linux,initrd-end. That is    */
++/*     the only way arm64 Linux learns about an initramfs; there is no  */
++/*     command-line alternative.                                        */
++/*   - the console property is removed from the nkj-uart node. There it */
++/*     reads "disabled", which makes nkj_uart_probe set is_real_serial  */
++/*     false, skip request_irq and turn start_tx into a discard --       */
++/*     transmit would still work, because nkj_console_putchar ignores   */
++/*     the flag and writes the data register directly, but receive      */
++/*     would never do anything. Z8's verified Linux reports non-zero rx */
++/*     interrupt counts on ttyS0, so its device tree cannot have        */
++/*     carried that property either.                                    */
++/*                                                                     */
++/* Two device trees ship in the container and they are NOT              */
++/* interchangeable: one declares a memory window that lands exactly on  */
++/* share_mem, the other declares a smaller one that does not. The one   */
++/* consistent with the running image's region table is selected by      */
++/* comparing reg against that window, and if neither matches -- or both */
++/* do -- the load fails outright rather than silently choosing one.     */
++/*                                                                     */
++/* Scope: this function only places bytes and returns. It starts no CPU */
++/* and describes no hardware. Booting this payload is a separate,       */
++/* later step, and whatever stands in for the boot ROM there must be    */
++/* labelled as the stand-in it is.                                      */
++/* ------------------------------------------------------------------ */
++
++/* The Linux window, as the running image's region table declares it. */
++#define Z63_LI_MEM_BASE     0x0A07800000ULL
++#define Z63_LI_MEM_SIZE     0x0D400000ULL
++#define Z63_LI_MEMBER_MAX   8
++
++static bool z63_li_dtb_matches_window(const void *dtb)
++{
++    int node = -1;
++
++    while ((node = fdt_next_node(dtb, node, NULL)) >= 0) {
++        const char *name = fdt_get_name(dtb, node, NULL);
++        const fdt32_t *reg;
++        int len;
++
++        if (name == NULL || strncmp(name, "memory@", 7) != 0) {
++            continue;
++        }
++        reg = fdt_getprop(dtb, node, "reg", &len);
++        if (reg == NULL || len < 16) {
++            continue;
++        }
++        /* Two 64-bit cells, big endian: base then size. */
++        if (((uint64_t)fdt32_to_cpu(reg[0]) << 32 | fdt32_to_cpu(reg[1]))
++              == Z63_LI_MEM_BASE &&
++            ((uint64_t)fdt32_to_cpu(reg[2]) << 32 | fdt32_to_cpu(reg[3]))
++              == Z63_LI_MEM_SIZE) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void z63_load_li(NikonZ63State *s)
++{
++    g_autofree char *file = NULL;
++    GError *err = NULL;
++    gsize len = 0;
++    const uint8_t *img;
++    const uint8_t *kernel = NULL, *initrd = NULL;
++    const uint8_t *dtb[Z63_LI_MEMBER_MAX];
++    size_t kernel_len = 0, initrd_len = 0;
++    size_t dtb_len[Z63_LI_MEMBER_MAX];
++    unsigned ndtb = 0, pick = Z63_LI_MEMBER_MAX;
++    uint32_t count;
++
++    if (s->li_image == NULL) {
++        return;
++    }
++    if (!g_file_get_contents(s->li_image, &file, &len, &err)) {
++        error_report("Z63_LI: cannot read '%s': %s", s->li_image, err->message);
++        exit(1);
++    }
++    img = (const uint8_t *)file;
++    if (len < 0x30 || memcmp(img, "NISI", 4) != 0) {
++        error_report("Z63_LI: '%s' does not start with a NISI header",
++                     s->li_image);
++        exit(1);
++    }
++    count = ldl_le_p(img + 0x10);
++    if (count == 0 || count > Z63_LI_MEMBER_MAX ||
++        0x20 + (uint64_t)count * 16 > len) {
++        error_report("Z63_LI: '%s' declares %u members, which does not fit a "
++                     "%zu-byte file", s->li_image, count, (size_t)len);
++        exit(1);
++    }
++
++    for (uint32_t i = 0; i < count; i++) {
++        const uint8_t *e = img + 0x20 + (size_t)i * 16;
++        uint32_t first = ldl_le_p(e);
++        uint32_t blocks = ldl_le_p(e + 4);
++        uint64_t bytes = ldq_le_p(e + 8);
++        uint64_t off = (uint64_t)first << Z63_LI_BLOCK_SHIFT;
++        const uint8_t *p;
++
++        if (bytes == 0 || off > len || bytes > len - off ||
++            blocks != DIV_ROUND_UP(bytes, 1U << Z63_LI_BLOCK_SHIFT)) {
++            error_report("Z63_LI: member %u contradicts its own directory "
++                         "entry (block %#x, %u blocks, %" PRIu64 " bytes) in a "
++                         "%zu-byte file", i, first, blocks, bytes, (size_t)len);
++            exit(1);
++        }
++        p = img + off;
++
++        if (bytes >= 2 && p[0] == 0x1f && p[1] == 0x8b) {
++            initrd = p;
++            initrd_len = bytes;
++        } else if (bytes >= 8 && ldl_be_p(p) == 0xd00dfeed) {
++            dtb[ndtb] = p;
++            dtb_len[ndtb] = bytes;
++            ndtb++;
++        } else if (bytes >= 0x3c && memcmp(p + 0x38, "ARM\x64", 4) == 0) {
++            kernel = p;
++            kernel_len = bytes;
++        } else {
++            error_report("Z63_LI: member %u (%" PRIu64 " bytes, starting %02x "
++                         "%02x %02x %02x) is neither an arm64 Image, a gzip "
++                         "initramfs nor a device tree",
++                         i, bytes, p[0], p[1], p[2], p[3]);
++            exit(1);
++        }
++    }
++
++    if (kernel == NULL || initrd == NULL || ndtb == 0) {
++        error_report("Z63_LI: '%s' has kernel=%s initramfs=%s dtb=%u, and all "
++                     "three are needed", s->li_image,
++                     kernel ? "yes" : "no", initrd ? "yes" : "no", ndtb);
++        exit(1);
++    }
++
++    for (unsigned i = 0; i < ndtb; i++) {
++        if (z63_li_dtb_matches_window(dtb[i])) {
++            if (pick != Z63_LI_MEMBER_MAX) {
++                error_report("Z63_LI: two device trees both declare the "
++                             "0x%" PRIx64 " window; refusing to choose",
++                             (uint64_t)Z63_LI_MEM_BASE);
++                exit(1);
++            }
++            pick = i;
++        }
++    }
++    if (pick == Z63_LI_MEMBER_MAX) {
++        error_report("Z63_LI: none of the %u device trees declares a memory@ "
++                     "window of 0x%" PRIx64 " bytes at 0x%" PRIx64
++                     " -- this container does not match this firmware",
++                     ndtb, (uint64_t)Z63_LI_MEM_SIZE,
++                     (uint64_t)Z63_LI_MEM_BASE);
++        exit(1);
++    }
++
++    /* Patch the chosen tree in a scratch buffer, then hand both the buffer
++     * and the payload members to the ROM loader, which copies them into RAM
++     * as the machine resets. */
++    {
++        g_autofree uint8_t *buf = g_malloc0(Z63_LI_DTB_RESERVE);
++        const uint64_t ir_end = Z63_LI_INITRD_ADDR + initrd_len;
++        int rc, node;
++        bool had_console;
++
++        rc = fdt_open_into(dtb[pick], buf, Z63_LI_DTB_RESERVE);
++        if (rc != 0) {
++            error_report("Z63_LI: fdt_open_into on the %zu-byte device tree: "
++                         "%s", dtb_len[pick], fdt_strerror(rc));
++            exit(1);
++        }
++        node = fdt_path_offset(buf, "/chosen");
++        if (node < 0) {
++            error_report("Z63_LI: device tree has no /chosen node to put the "
++                         "initramfs range in");
++            exit(1);
++        }
++        rc = fdt_setprop_u64(buf, node, "linux,initrd-start",
++                             Z63_LI_INITRD_ADDR);
++        if (rc == 0) {
++            rc = fdt_setprop_u64(buf, node, "linux,initrd-end", ir_end);
++        }
++        if (rc != 0) {
++            error_report("Z63_LI: cannot set the initramfs range on /chosen: "
++                         "%s", fdt_strerror(rc));
++            exit(1);
++        }
++
++        node = fdt_node_offset_by_compatible(buf, -1, "nikon,nkj-uart");
++        if (node < 0) {
++            error_report("Z63_LI: device tree has no nikon,nkj-uart node, so "
++                         "the serial driver's console flag cannot be cleared");
++            exit(1);
++        }
++        had_console = fdt_getprop(buf, node, "console", NULL) != NULL;
++        if (had_console) {
++            rc = fdt_delprop(buf, node, "console");
++            if (rc != 0) {
++                error_report("Z63_LI: cannot remove the console property "
++                             "from nikon,nkj-uart: %s", fdt_strerror(rc));
++                exit(1);
++            }
++        }
++        fdt_pack(buf);
++
++        rom_add_blob_fixed("z63-li-kernel", kernel, kernel_len,
++                           Z63_LI_KERNEL_ADDR);
++        rom_add_blob_fixed("z63-li-initrd", initrd, initrd_len,
++                           Z63_LI_INITRD_ADDR);
++        rom_add_blob_fixed("z63-li-dtb", buf, fdt_totalsize(buf),
++                           Z63_LI_DTB_ADDR);
++
++        s->li_kernel_addr = Z63_LI_KERNEL_ADDR;
++        s->li_dtb_addr = Z63_LI_DTB_ADDR;
++        s->li_ready = true;
++
++        error_report("Z63_LI: from '%s': kernel %zu bytes at 0x%" PRIx64
++                     ", initramfs %zu bytes at 0x%" PRIx64
++                     ", device tree %u bytes at 0x%" PRIx64
++                     " (console property %s, initrd range %#" PRIx64
++                     "-%#" PRIx64 ")",
++                     s->li_image, kernel_len, (uint64_t)Z63_LI_KERNEL_ADDR,
++                     initrd_len, (uint64_t)Z63_LI_INITRD_ADDR,
++                     fdt_totalsize(buf), (uint64_t)Z63_LI_DTB_ADDR,
++                     had_console ? "removed" : "was already absent",
++                     (uint64_t)Z63_LI_INITRD_ADDR, ir_end);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* CPU3 -> LI payload hand-off                                          */
++/*                                                                     */
++/* The RTOS never releases CPU3 on its own (the DTB declares the core, */
++/* but the image has no path that starts it), so when the LI payload   */
++/* is loaded and -machine cpu3-entry=0xADDR names the kernel entry,    */
++/* this hands CPU3 to the LI payload. It is a labelled stand-in for    */
++/* the boot ROM's role at the RTOS->Linux hand-off, not a model of the */
++/* ROM: the arm64 boot-protocol state (x0 = the patched DTB's physical */
++/* address, x1..x3 = 0) is written into CPU3's registers, and it is    */
++/* started. The GIC, timer and memory mapping are already configured   */
++/* by the RTOS before it ever reaches this point, which is why no GIC  */
++/* shim is needed -- that is exactly what Nikon's BSP leaves empty in  */
++/* gic_dist_init() for this SoC.                                        */
++/*                                                                     */
++/* The kernel cannot simply be dropped in at EL1h: its boot path       */
++/* (`__enable_mmu`) assumes a bootloader has already invalidated the   */
++/* branch predictors, the TLB and the instruction cache, and QEMU's    */
++/* cold vCPU has none of that done, so the `isb` after the MMU-on      */
++/* `msr sctlr_el1` never returns (the CPU re-executes from a stale TB  */
++/* forever). On the real SoC the mask ROM's release path (service      */
++/* 0x082013e0, called from the RTOS's Linux loader at 0x40c9ce30) does */
++/* this maintenance and then `eret`s the kernel in at EL1h. That ROM   */
++/* is not in any firmware component, so the short sequence below is    */
++/* written into secure SRAM (which neither the eg nor the li image     */
++/* ever touches) as a LABELLED STAND-IN for it -- helper code for the  */
++/* The actual "run a stage like ATF's BL31, then drop to EL1" work is    */
++/* done by QEMU's own arm_emulate_firmware_reset(cs, 1): it sets the     */
++/* EL3 control state a real firmware would (SCR_EL3.RW/NS/HCE, clears    */
++/* CPTR_EL3, sets HCR_EL2.RW) and puts the vCPU at EL1h with DAIF        */
++/* masked, which is exactly the arm64 Linux boot protocol's requirement. */
++/* Using it keeps every EL-mode control bit under QEMU's maintenance     */
++/* instead of hand-assembling a stand-in for the ROM in guest memory.    */
++/* This still is a labelled stand-in for the boot ROM's role at the      */
++/* RTOS->Linux hand-off: the ROM itself is not in any firmware component,*/
++/* so no code here models what it does -- only its externally visible    */
++/* effect (CPU3 runs the kernel at EL1h) is reproduced.                 */
++/*                                                                     */
++/* This runs from the machine's reset callback, AFTER the device-level  */
++/* cold reset, so the CPU state it writes is not wiped by the reset     */
++/* that follows z63_init.                                               */
++/* ------------------------------------------------------------------ */
++
++static void z63_cpu3_handoff(NikonZ63State *s, int num_cpu)
++{
++    CPUState *cs = CPU(s->cpu[3]);
++    ARMCPU *cpu = ARM_CPU(cs);
++
++    error_report("Z63_LI_BOOT: handing CPU3 to the LI payload at 0x%"
++                 PRIx64 " (dtb at 0x%" PRIx64 ") -- a labelled stand-in "
++                 "for the boot ROM's RTOS->Linux hand-off",
++                 s->cpu3_entry, s->li_dtb_addr);
++
++    /* arm64 Linux boot protocol: x0 = DTB physical address, x1..x3 = 0. */
++    cpu->env.xregs[0] = s->li_dtb_addr;
++    cpu->env.xregs[1] = 0;
++    cpu->env.xregs[2] = 0;
++    cpu->env.xregs[3] = 0;
++
++    /* Configure the EL3 control state as a firmware stage would and drop
++     * the vCPU to EL1h with DAIF masked (the arm64 boot protocol). This
++     * replaces the mask ROM's release path (service 0x082013e0, called
++     * from the RTOS's Linux loader at 0x40c9ce30) which is unavailable. */
++    arm_emulate_firmware_reset(cs, 1);
++
++    cpu->env.pc = s->cpu3_entry;
++    cpu->power_state = PSCI_ON;
++    cs->halted = false;
++    s->release_status |= 1U << 3;
++    (void)num_cpu;
++}
++
++static void z63_machine_reset(MachineState *machine, ResetType type)
++{
++    NikonZ63State *s = NIKON_Z63(machine);
++
++    qemu_devices_reset(type);
++    if (s->li_ready && s->cpu3_entry != 0 && machine->smp.cpus > 3) {
++        z63_cpu3_handoff(s, machine->smp.cpus);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Machine init                                                        */
++/* ------------------------------------------------------------------ */
++
++static void z63_init(MachineState *machine)
++{
++    NikonZ63State *s = (NikonZ63State *)machine;
++    MemoryRegion *sysmem = get_system_memory();
++    int num_cpu = machine->smp.cpus;
++
++    /* CPUs: Cortex-A53, TCG only. Only CPU0 executes from reset -- the RTOS
++     * releases cores 1..3 through the mailbox/release handshake, which is
++     * how it gets its own entry address per core. All of them share the
++     * image entry as rvbar, and the counter runs at 24 MHz (the image writes
++     * exactly that to CNTFRQ_EL0 early on). */
++    for (int i = 0; i < num_cpu; i++) {
++        Object *cpuobj = object_new(machine->cpu_type);
++        CPUState *cs = CPU(cpuobj);
++
++        cs->start_powered_off = (i != 0);
++        object_property_set_uint(cpuobj, "rvbar", Z63_IMAGE_ENTRY, &error_fatal);
++        object_property_set_int(cpuobj, "mp-affinity", i, &error_fatal);
++        object_property_set_int(cpuobj, "cntfrq", 24000000, &error_fatal);
++        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
++        s->cpu[i] = ARM_CPU(cpuobj);
++    }
++
++    z63_create_gic(s, num_cpu);
++
++    /* Catch-all trap at the lowest priority */
++    memory_region_init_io(&s->unmapped, OBJECT(machine), &z63_unmapped_ops, s,
++                          "z63-unmapped", UINT64_C(0x1000000000));
++    memory_region_add_subregion_overlap(sysmem, 0, &s->unmapped, -1000);
++
++    /* Real RAM */
++    memory_region_init_ram(&s->dram, NULL, "z63-dram", Z63_DRAM_SIZE,
++                           &error_fatal);
++    memory_region_add_subregion(sysmem, Z63_DRAM_BASE, &s->dram);
++
++    /* Place the LI payload, if one was named. This only fills the Linux
++     * window; the cores that will run it are still held. See z63_load_li. */
++    z63_load_li(s);
++
++    /* When the LI payload is in place and -machine cpu3-entry=0xADDR names
++     * where CPU3 should start, that core is handed to the LI payload. The
++     * actual register writes and the stub load happen in z63_cpu3_handoff,
++     * which runs from the machine's reset callback: the machine-level cold
++     * reset follows z63_init and would otherwise wipe both the stub's RAM
++     * page and the CPU state (cpu_reset would put CPU3's PC back at the
++     * image's rvbar and re-halt it). */
++
++    /* The boot ROM's service page, only when explicitly asked for. Without
++     * it, reaching the page stops the VM and says where from. */
++    if (s->rom_page_stub) {
++        error_report("Z63: boot-ROM service page 0x%08" PRIx64 " is being "
++                     "answered by a labelled stub (`ret` at the six known "
++                     "entries, stop anywhere else). This is a stand-in for "
++                     "mask ROM that is not in any firmware package, not a "
++                     "model of it -- see the comment above z63_rompage_read.",
++                     (uint64_t)Z63_ROMPAGE_BASE);
++        memory_region_init_io(&s->rom_page, OBJECT(machine), &z63_rompage_ops,
++                              s, "z63-boot-rom-page", Z63_ROMPAGE_SIZE);
++        memory_region_add_subregion(sysmem, Z63_ROMPAGE_BASE, &s->rom_page);
++    }
++
++    /* Boot mailbox: 4 KiB of RAM the CPU-release handshake reads back. The
++     * RTOS posts a 0x0400a151 block plus each secondary's entry address
++     * here before ringing the release controller. */
++    memory_region_init_ram(&s->mailbox, NULL, "z63-boot-mailbox",
++                           Z63_MAILBOX_SIZE, &error_fatal);
++    memory_region_add_subregion(sysmem, Z63_MAILBOX_BASE, &s->mailbox);
++
++    /* The RTOS image window is RAM on the real camera (and the header
++     * declares it 128 MiB). Model it as RAM: self-modifying code, the
++     * runtime log area and the boot ROM's patched tables all live here. */
++    memory_region_init_ram(&s->rom, NULL, "z63-image-window", Z63_ROM_SIZE,
++                           &error_fatal);
++    memory_region_add_subregion(sysmem, Z63_IMAGE_WINDOW_BASE, &s->rom);
++
++    /* A small scratch page around the boot header in case the boot ROM
++     * re-reads it from an SRAM alias; harmless if never touched. */
++    memory_region_init_ram(&s->boot_header_ram, NULL, "z63-boot-header",
++                           0x1000, &error_fatal);
++
++    /* UART sink: plain MemoryRegion overlay plus one wired IRQ line.
++     * No SysBusDevice needed for an anonymous trap region. */
++    if (!qemu_chr_fe_init(&s->serial, serial_hd(0), &error_abort)) {
++        /* no serial requested; keep a null backend */
++    }
++    qemu_chr_fe_set_handlers(&s->serial, z63_uart_can_receive,
++                             z63_uart_receive, z63_uart_event, NULL, s, NULL,
++                             true);
++    memory_region_init_io(&s->uart_region, OBJECT(machine), &z63_uart_ops, s,
++                          "z63-uart", Z63_UART_SIZE);
++    memory_region_add_subregion(sysmem, Z63_UART_BASE, &s->uart_region);
++    /* Both of the port's interrupts, in the driver's order: index 0 is the
++     * rx irq (SPI 173) and index 1 is tx_irq (SPI 176). */
++    s->uart_irq = qdev_get_gpio_in(s->gic, Z63_GIC_SPI(Z63_UART_IRQ_SPI));
++    s->uart_tx_irq = qdev_get_gpio_in(s->gic,
++                                      Z63_GIC_SPI(Z63_UART_TX_IRQ_SPI));
++
++    z63_create_dma(s);
++
++    /* CPU release controller: read +0x44 for status, write 1<<cpu to +0x244
++     * to start one. Anything else stops the VM (see z63_release_write). */
++    memory_region_init_io(&s->cpu_release, OBJECT(machine), &z63_release_ops, s,
++                          "z63-cpu-release", Z63_RELEASE_SIZE);
++    memory_region_add_subregion(sysmem, Z63_RELEASE_BASE, &s->cpu_release);
++
++    /* Bootstrap latches (see the note by z63_int_latch_write). */
++    memory_region_init_io(&s->int_latch, OBJECT(machine), &z63_int_latch_ops,
++                          &s->int_latch_value, "z63-int-latch", 4);
++    memory_region_add_subregion(sysmem, Z63_INT_LATCH_BASE, &s->int_latch);
++    memory_region_init_io(&s->counter, OBJECT(machine), &z63_counter_ops,
++                          &s->counter_value, "z63-counter-enable", 4);
++    memory_region_add_subregion(sysmem, Z63_COUNTER_BASE, &s->counter);
++
++    /* Pin configuration ("gpio-top", see z63_gpio_write). */
++    memory_region_init_io(&s->gpio_top, OBJECT(machine), &z63_gpio_ops, s,
++                          "z63-gpio-top", 0x1000);
++    memory_region_add_subregion(sysmem, Z63_GPIO_TOP_BASE, &s->gpio_top);
++
++    /* TOP block: identity word plus configuration words (see z63_top_read). */
++    memory_region_init_io(&s->top, OBJECT(machine), &z63_top_ops, s,
++                          "z63-top", Z63_TOP_SIZE);
++    memory_region_add_subregion(sysmem, Z63_TOP_BASE, &s->top);
++
++    /* Clock/power configuration bank (see z63_cgn_write). */
++    memory_region_init_io(&s->cgn, OBJECT(machine), &z63_cgn_ops, s,
++                          "z63-cgn", Z63_CGN_SIZE);
++    memory_region_add_subregion(sysmem, Z63_CGN_BASE, &s->cgn);
++
++    /* Peripheral control words (see z63_pctl_write). */
++    memory_region_init_io(&s->pctl, OBJECT(machine), &z63_pctl_ops, s,
++                          "z63-peripheral-control", Z63_PCTL_WORDS * 4);
++    memory_region_add_subregion(sysmem, Z63_PCTL_BASE, &s->pctl);
++
++    /* Configuration sequencer (see z63_seq_read). */
++    memory_region_init_io(&s->seq, OBJECT(machine), &z63_seq_ops, s,
++                          "z63-sequencer", Z63_SEQ_SIZE);
++    memory_region_add_subregion(sysmem, Z63_SEQ_BASE, &s->seq);
++
++    /* Identification/diagnostic block (see z63_id_read). */
++    memory_region_init_io(&s->id, OBJECT(machine), &z63_id_ops, s,
++                          "z63-id-block", Z63_ID_SIZE);
++    memory_region_add_subregion(sysmem, Z63_ID_BASE, &s->id);
++
++    /* Configuration bank (see z63_cfg7_read). */
++    memory_region_init_io(&s->cfg7, OBJECT(machine), &z63_cfg7_ops, s,
++                          "z63-cfg7", Z63_CFG7_SIZE);
++    memory_region_add_subregion(sysmem, Z63_CFG7_BASE, &s->cfg7);
++
++    /* SPI controller (see z63_spi_read). */
++    memory_region_init_io(&s->spi, OBJECT(machine), &z63_spi_ops, s,
++                          "z63-spi", (uint64_t)Z63_SPI_INST * Z63_SPI_STRIDE);
++    memory_region_add_subregion(sysmem, Z63_SPI_BASE, &s->spi);
++
++    /* Unnamed auxiliary pair (see z63_aux_read). */
++    memory_region_init_io(&s->aux, OBJECT(machine), &z63_aux_ops, s,
++                          "z63-aux", (uint64_t)Z63_AUX_INST * Z63_AUX_STRIDE);
++    memory_region_add_subregion(sysmem, Z63_AUX_BASE, &s->aux);
++
++    /* Register windows in 0x0e000000..0x0e210000 (see z63_win_read). The
++     * gaps between them are deliberately left unmapped so an address in a
++     * gap stops as unmapped rather than being absorbed into a bank. */
++    {
++        Z63Win *w = s->emio;
++        unsigned i;
++
++        w[0].name = "EMIO-E0"; w[0].base = Z63_EMIO_E0_BASE;
++        w[0].size = Z63_EMIO_E0_SIZE; w[0].words = s->emio_e0_words;
++        w[1].name = "EMIO-E1"; w[1].base = Z63_EMIO_E1_BASE;
++        w[1].size = Z63_EMIO_E1_SIZE; w[1].words = s->emio_e1_words;
++        w[2].name = "EMIO-E2"; w[2].base = Z63_EMIO_E2_BASE;
++        w[2].size = Z63_EMIO_E2_SIZE; w[2].words = s->emio_e2_words;
++        for (i = 0; i < 3; i++) {
++            memory_region_init_io(&w[i].region, OBJECT(machine), &z63_win_ops,
++                                  &w[i], w[i].name, w[i].size);
++            memory_region_add_subregion(sysmem, w[i].base, &w[i].region);
++        }
++    }
++
++    /* The 0x0c850000 / 0x16808000 bank pair (see Z63_PAIR_A_BASE). Same
++     * accessor as the EMIO windows: accepted whole and stored word by word. */
++    {
++        Z63Win *w = s->pair;
++        unsigned i;
++
++        w[0].name = "PAIR-A"; w[0].base = Z63_PAIR_A_BASE;
++        w[0].size = Z63_PAIR_A_SIZE; w[0].words = s->pair_a_words;
++        w[1].name = "PAIR-B"; w[1].base = Z63_PAIR_B_BASE;
++        w[1].size = Z63_PAIR_B_SIZE; w[1].words = s->pair_b_words;
++        for (i = 0; i < Z63_PAIR_INST; i++) {
++            memory_region_init_io(&w[i].region, OBJECT(machine), &z63_win_ops,
++                                  &w[i], w[i].name, w[i].size);
++            memory_region_add_subregion(sysmem, w[i].base, &w[i].region);
++        }
++    }
++
++    /* Video pipeline register array (see z63_vpipe_read). */
++    memory_region_init_io(&s->vpipe_region, OBJECT(machine), &z63_vpipe_ops, s,
++                          "z63-video-pipeline", Z63_VPIPE_SIZE);
++    memory_region_add_subregion(sysmem, Z63_VPIPE_BASE, &s->vpipe_region);
++
++    /* Five sibling blocks, one subregion per instance (see z63_sib_read).
++     * The region spans the whole family so an access between instances
++     * reaches the model and stops with a PC, rather than landing in the
++     * unassigned pool where the address would still be reported but the
++     * block would not. */
++    memory_region_init_io(&s->sib_region, OBJECT(machine), &z63_sib_ops, s,
++                          "z63-sibling-blocks",
++                          (uint64_t)Z63_BLK_INST * Z63_BLK_STRIDE);
++    memory_region_add_subregion(sysmem, Z63_BLK_BASE, &s->sib_region);
++
++    /* Driver upload window (see z63_upk_read). */
++    memory_region_init_io(&s->upk_region, OBJECT(machine), &z63_upk_ops, s,
++                          "z63-upload-window", Z63_UPK_SIZE);
++    memory_region_add_subregion(sysmem, Z63_UPK_BASE, &s->upk_region);
++
++    /* Load the decrypted factory eg image. The file starts with the EL3
++     * reset code; on the real camera it lands at 0x40160000 (the boot ROM
++     * writes the 0x40000000 header itself). The copy is done by hand into
++     * the RAM window -- see the note by z63_boot_header -- so that the
++     * header and the per-CPU redistributor table the boot ROM patches in
++     * afterwards are not undone by the ROM loader's reset. */
++    if (machine->firmware) {
++        gchar *buf = NULL;
++        gsize len = 0;
++        GError *err = NULL;
++        uint8_t *ram = memory_region_get_ram_ptr(&s->rom);
++
++        if (!g_file_get_contents(machine->firmware, &buf, &len, &err)) {
++            error_report("Z63: cannot read RTOS image '%s': %s",
++                         machine->firmware, err->message);
++            exit(1);
++        }
++        if (len > Z63_ROM_SIZE - (Z63_IMAGE_LOAD_BASE - Z63_IMAGE_WINDOW_BASE)) {
++            error_report("Z63: image '%s' (%zu bytes) does not fit the window",
++                         machine->firmware, (size_t)len);
++            exit(1);
++        }
++        error_report("Z63: virtual SoC identity at 0x%08" PRIx64 ": "
++                     "revision=%u chip-id=%u (declared board choice, "
++                     "not measured -- override with -machine soc-revision=N)",
++                     (uint64_t)Z63_TOP_BASE, s->soc_revision, s->soc_chip_id);
++
++        memcpy(ram + (Z63_IMAGE_LOAD_BASE - Z63_IMAGE_WINDOW_BASE), buf, len);
++        g_free(buf);
++        error_report("Z63: loaded %zu bytes at 0x%08" PRIx64
++                     ", entry rvbar=0x%08" PRIx64,
++                     (size_t)len, (uint64_t)Z63_IMAGE_LOAD_BASE,
++                     (uint64_t)Z63_IMAGE_ENTRY);
++
++        /* Boot ROM patches, applied after the copy (see above). */
++        memcpy(ram, z63_boot_header, sizeof(z63_boot_header));
++        for (int i = 0; i < num_cpu; i++) {
++            uint64_t typer_addr = Z63_GIC_REDIST_BASE + (uint64_t)i * 0x20000
++                                  + 0x14;
++            uint64_t typer_le = cpu_to_le64(typer_addr);
++            cpu_physical_memory_write(Z63_CPU_TABLE_ADDR + i * 8,
++                                      &typer_le, sizeof(typer_le));
++        }
++    } else {
++        error_report("Z63: -bios <eg2010_0200i1.bi> is required");
++        exit(1);
++    }
++}
++
++static void z63_machine_instance_init(Object *obj)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    s->soc_revision = Z63_SOC_REVISION_DEFAULT;
++    s->soc_chip_id = Z63_SOC_CHIP_ID_DEFAULT;
++}
++
++static void z63_prop_get_soc_revision(Object *obj, Visitor *v, const char *name,
++                                      void *opaque, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++    uint8_t value = s->soc_revision;
++
++    visit_type_uint8(v, name, &value, errp);
++}
++
++static void z63_prop_set_soc_revision(Object *obj, Visitor *v, const char *name,
++                                      void *opaque, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++    uint8_t value;
++
++    if (!visit_type_uint8(v, name, &value, errp)) {
++        return;
++    }
++    if (value > 15) {
++        error_setg(errp, "soc-revision is bits 28..31 of the identity word, "
++                         "so it must be 0..15");
++        return;
++    }
++    s->soc_revision = value;
++}
++
++static void z63_prop_get_soc_chip_id(Object *obj, Visitor *v, const char *name,
++                                     void *opaque, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++    uint8_t value = s->soc_chip_id;
++
++    visit_type_uint8(v, name, &value, errp);
++}
++
++static void z63_prop_set_soc_chip_id(Object *obj, Visitor *v, const char *name,
++                                     void *opaque, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++    uint8_t value;
++
++    if (!visit_type_uint8(v, name, &value, errp)) {
++        return;
++    }
++    if (value > 31) {
++        error_setg(errp, "soc-chip-id is bits 0..4 of the identity word, "
++                         "so it must be 0..31");
++        return;
++    }
++    s->soc_chip_id = value;
++}
++
++static char *z63_prop_get_li_image(Object *obj, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    return g_strdup(s->li_image);
++}
++
++static void z63_prop_set_li_image(Object *obj, const char *value, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    g_free(s->li_image);
++    s->li_image = g_strdup(value);
++}
++
++static bool z63_prop_get_rom_page_stub(Object *obj, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    return s->rom_page_stub;
++}
++
++static void z63_prop_set_rom_page_stub(Object *obj, bool value, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    s->rom_page_stub = value;
++}
++
++static void z63_prop_get_cpu3_entry(Object *obj, Visitor *v, const char *name,
++                                    void *opaque, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++    uint64_t value = s->cpu3_entry;
++
++    visit_type_uint64(v, name, &value, errp);
++}
++
++static void z63_prop_set_cpu3_entry(Object *obj, Visitor *v, const char *name,
++                                    void *opaque, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++    uint64_t value;
++
++    if (!visit_type_uint64(v, name, &value, errp)) {
++        return;
++    }
++    s->cpu3_entry = value;
++}
++
++static void z63_machine_class_init(ObjectClass *oc, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++    static const char * const valid_cpu_types[] = {
++        ARM_CPU_TYPE_NAME("cortex-a53"),
++        NULL,
++    };
++
++    mc->desc = "Nikon Z 6III RTOS research machine (TCG, GICv3, experimental)";
++    mc->init = z63_init;
++    mc->reset = z63_machine_reset;
++    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a53");
++    mc->valid_cpu_types = valid_cpu_types;
++    mc->max_cpus = 8;
++    mc->default_cpus = Z63_NUM_CPU; /* EXPEED 7: 4-core cluster (DTB cpu@3) */
++    mc->ignore_memory_transaction_failures = false;
++    mc->no_cdrom = 1;
++    mc->no_floppy = 1;
++    mc->no_parallel = 1;
++    mc->default_ram_size = Z63_DRAM_SIZE;
++    mc->minimum_page_bits = 12;
++
++    object_class_property_add(oc, "soc-revision", "uint8",
++                              z63_prop_get_soc_revision,
++                              z63_prop_set_soc_revision, NULL, NULL);
++    object_class_property_set_description(oc, "soc-revision",
++        "Virtual silicon revision nibble (bits 28..31) reported by the TOP "
++        "identity word at 0x0d150000. Not measured from hardware.");
++    object_class_property_add(oc, "soc-chip-id", "uint8",
++                              z63_prop_get_soc_chip_id,
++                              z63_prop_set_soc_chip_id, NULL, NULL);
++    object_class_property_set_description(oc, "soc-chip-id",
++        "Virtual chip id (bits 0..4) reported by the TOP identity word at "
++        "0x0d150000. Not measured from hardware.");
++    object_class_property_add_str(oc, "li-image",
++                                  z63_prop_get_li_image,
++                                  z63_prop_set_li_image);
++    object_class_property_set_description(oc, "li-image",
++        "The li2010_*.bi container to place in the Linux window at reset. "
++        "Members are identified by content and the device tree is patched "
++        "with the initramfs range before it is written; no CPU is started. "
++        "Nothing is fabricated: an unrecognised container is a fatal error.");
++    object_class_property_add_bool(oc, "rom-page-stub",
++                                   z63_prop_get_rom_page_stub,
++                                   z63_prop_set_rom_page_stub);
++    object_class_property_set_description(oc, "rom-page-stub",
++        "Answer the boot ROM's service page at 0x08201000 with a labelled "
++        "stand-in: `ret` at the six entry points the image calls, logged on "
++        "every use, and a stop anywhere else in the page. The page is mask "
++        "ROM and is in no firmware package, so this substitutes for missing "
++        "code rather than modelling it. Off by default.");
++    object_class_property_add(oc, "cpu3-entry", "uint64",
++                              z63_prop_get_cpu3_entry,
++                              z63_prop_set_cpu3_entry, NULL, NULL);
++    object_class_property_set_description(oc, "cpu3-entry",
++        "Hand CPU3 to the LI payload at reset with this entry point, "
++        "instead of leaving it for the RTOS's release controller. The RTOS "
++        "never releases CPU3 on its own, so this is the only way it runs. "
++        "A labelled stand-in for the boot ROM's RTOS->Linux hand-off, not "
++        "a model of the ROM. Off (0) by default.");
++}
++
++static const TypeInfo z63_machine_info = {
++    .name          = TYPE_NIKON_Z63,
++    .parent        = TYPE_MACHINE,
++    .instance_size = sizeof(NikonZ63State),
++    .instance_init = z63_machine_instance_init,
++    .class_init    = z63_machine_class_init,
++    .interfaces    = aarch64_machine_interfaces,
++};
++
++static void z63_machine_init(void)
++{
++    type_register_static(&z63_machine_info);
++}
++
++type_init(z63_machine_init);
+diff --git a/run-z63.sh b/run-z63.sh
+new file mode 100755
+index 0000000..ded672a
+--- /dev/null
++++ b/run-z63.sh
+@@ -0,0 +1,30 @@
++#!/bin/sh
++# Run the Z 6III RTOS research machine.
++# Usage: ./run-z63.sh [-d] [-g] [extra qemu args...]
++#   -d  single-step debug logging (guest_errors + unmapped)
++#   -g  wait for GDB on :1234
++set -e
++cd "$(dirname "$0")"
++
++EG=${EG:-/Users/libr/Desktop/life/nikon/out/z63/Z6_3_0200_modules/eg2010_0200i1.bi}
++QEMU=${QEMU:-./build/qemu-system-aarch64}
++EXTRA="-serial stdio -monitor none -display none"
++DEBUG=""
++
++while [ $# -gt 0 ]; do
++    case "$1" in
++        -d) DEBUG="-d guest_errors,unimp -D /tmp/z63-qemu.log" ;;
++        -g) EXTRA="$EXTRA -S -gdb tcp::1234" ;;
++        *)  EXTRA="$EXTRA $1" ;;
++    esac
++    shift
++done
++
++# shellcheck disable=SC2086
++exec "$QEMU" \
++    -machine nikon-z63 \
++    -cpu cortex-a53 \
++    -smp 4 \
++    -bios "$EG" \
++    $DEBUG \
++    $EXTRA
+-- 
+2.55.0
+

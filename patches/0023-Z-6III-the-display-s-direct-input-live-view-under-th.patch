@@ -1,0 +1,174 @@
+From eade6518bf82de646b7839b34f2d5c5c7924e11a Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 11:28:33 +0000
+Subject: [PATCH 23/47] Z 6III: the display's direct input -- live view under
+ the menus
+
+The live-view display path programs the display unit's direct source from
+each frame it posts (sub_40CD94B4 -> sub_40CD9A68 -> sub_402BCCB8): the
+direct-source record sub_402B172C (../z9-qemu's 402ab478 for the Z 9,
+same layout) writes +0x200 format (low 5 bits), +0x208 size (width low
+16, height bits 16..29), +0x250/+0x254 the Y and C strides; sub_402B14F8
+and sub_402B1588 the Y (+0x210/+0x214) and C (+0x230/+0x234) addresses;
++0x100 bits 0 and 1 enable it. In live view: format 4, 1024 x 682,
+strides 1024, Y and C in the RSZ output ring. The scanout composed only
+the slots, over black, so the shooting information showed and the picture
+under it did not.
+
+z63_scanout_video draws it first: format 4 read as NV12 -- a Y plane and
+an interleaved U, V plane at half height -- converted with ../z9-qemu's
+BT.601 integers (engine1548_scanout_fetch), placed at the top left and
+clipped, without scaling. Other formats are named once and not drawn. The
+YUVA slot then blends over what is already there instead of over black.
+
+Verified: live view shows the RAW pipeline's picture (the synthetic bars)
+under the shooting display, exposure scale and ISO readout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-scanout.h | 97 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 93 insertions(+), 4 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-scanout.h b/hw/arm/nikon-z63-scanout.h
+index 8e7cd4a..239a517 100644
+--- a/hw/arm/nikon-z63-scanout.h
++++ b/hw/arm/nikon-z63-scanout.h
+@@ -155,6 +155,9 @@ typedef struct Z63Scanout {
+     bool multi_slot_reported;
+     bool lut_reported;
+     bool first_frame_reported;
++    bool video_reported;        /* the direct input's first frame named */
++    char *video_refused;        /* why it is not drawn, named once */
++    uint64_t frames_video;      /* frames composed over the direct input */
+     unsigned unit;              /* the unit being shown */
+     char *dump;                 /* -machine scanout-dump: a PPM, host-side */
+     uint64_t frames;
+@@ -294,7 +297,8 @@ static hwaddr z63_scanout_phys(uint64_t bus, uint64_t len)
+ }
+ 
+ /* Format 6, one slot: 4:2:2 Y0 Y1 U V plus an A8 plane, through the
+- * matrix, over black. Returns false (after saying why) if it cannot. */
++ * matrix, over what is already in dst -- the direct input's picture, or
++ * black. Returns false (after saying why) if it cannot. */
+ static bool z63_scanout_yuva(Z63Scanout *s, unsigned slot, uint64_t base,
+                              unsigned sw, unsigned sh, unsigned stride,
+                              unsigned dx0, unsigned dy0, unsigned w,
+@@ -332,20 +336,104 @@ static bool z63_scanout_yuva(Z63Scanout *s, unsigned slot, uint64_t base,
+             const uint8_t *pair = crow + (x & ~1u) * 2;
+             int in[3] = { pair[x & 1], pair[2] - 128, pair[3] - 128 };
+             unsigned a = arow[x];
+-            uint32_t px = 0;
++            uint32_t *out = &dst[(dy0 + y) * w + dx0 + x];
++            uint32_t below = *out, px = 0;
+ 
+             for (unsigned r = 0; r < 3; r++) {
+                 int v = CLAMP((m[r * 3] * in[0] + m[r * 3 + 1] * in[1] +
+                                m[r * 3 + 2] * in[2] + 32) >> 6, 0, 255);
++                unsigned b = (below >> (16 - 8 * r)) & 0xff;
+ 
+-                px |= (uint32_t)((v * a + 127) / 255) << (16 - 8 * r);
++                px |= (uint32_t)((v * a + b * (255 - a) + 127) / 255)
++                      << (16 - 8 * r);
+             }
+-            dst[(dy0 + y) * w + dx0 + x] = px;
++            *out = px;
+         }
+     }
+     return true;
+ }
+ 
++/*
++ * The direct input: the picture under the slots -- live view. The display
++ * driver's direct-source record, sub_402B172C (this image; ../z9-qemu's
++ * 402ab478 for the Z 9, same layout), writes +0x200 format (low 5 bits),
++ * +0x204, +0x208 size (width low 16, height bits 16..29), +0x250/+0x254
++ * the Y and C strides, +0x800/+0x804, +0x268/+0x270/+0x274; sub_402B14F8
++ * and sub_402B1588 the Y (+0x210/+0x214) and C (+0x230/+0x234) addresses;
++ * +0x100 bits 0 and 1 enable it. The live-view display path programs it
++ * from the frame it posts (sub_40CD94B4 -> sub_40CD9A68 -> sub_402BCCB8):
++ * format 4, 1024 x 682, strides 1024, Y and C in the RSZ output ring.
++ *
++ * Format 4 is read as NV12 -- a Y plane and an interleaved U, V plane at
++ * half height -- converted with ../z9-qemu's BT.601 integers
++ * (engine1548_scanout_fetch), placed at the top left and clipped, without
++ * scaling. Other formats are named once and not drawn. The slots are then
++ * blended over it.
++ */
++static bool z63_scanout_video(Z63Scanout *s, unsigned w, unsigned h,
++                              uint32_t *dst)
++{
++    uint32_t fmt = z63_disp_reg(s, 0x200) & 31;
++    uint32_t size = z63_disp_reg(s, 0x208);
++    unsigned vw = size & 0xffff, vh = (size >> 16) & 0x3fff;
++    unsigned ys = z63_disp_reg(s, 0x250) & 0xffff;
++    unsigned cs = z63_disp_reg(s, 0x254) & 0xffff;
++    uint64_t ybus = z63_disp_reg(s, 0x210) |
++                    ((uint64_t)(z63_disp_reg(s, 0x214) & 0xf) << 32);
++    uint64_t cbus = z63_disp_reg(s, 0x230) |
++                    ((uint64_t)(z63_disp_reg(s, 0x234) & 0xf) << 32);
++    hwaddr yp, cp;
++    g_autofree uint8_t *yrow = NULL, *crow = NULL;
++    g_autofree char *why = NULL;
++
++    if ((z63_disp_reg(s, 0x100) & 3) != 3) {
++        return false;                           /* not enabled: black */
++    }
++    yp = z63_scanout_phys(ybus, (uint64_t)ys * vh);
++    cp = z63_scanout_phys(cbus, (uint64_t)cs * ((vh + 1) / 2));
++    if (fmt != 4) {
++        why = g_strdup_printf("format %u (+0x200), not 4", fmt);
++    } else if (!vw || !vh || (vw & 1) || ys < vw || cs < vw || !yp || !cp) {
++        why = g_strdup_printf("%ux%u, strides %u/%u, Y %#" PRIx64 " C %#"
++                              PRIx64 " -- not a pair of planes in DRAM",
++                              vw, vh, ys, cs, ybus, cbus);
++    }
++    if (why) {
++        if (!s->video_refused || strcmp(s->video_refused, why)) {
++            error_report("Z63_SCANOUT: direct input enabled but not drawn: "
++                         "%s", why);
++            g_free(s->video_refused);
++            s->video_refused = g_steal_pointer(&why);
++        }
++        return false;
++    }
++    yrow = g_malloc(ys);
++    crow = g_malloc(cs);
++    for (unsigned y = 0; y < vh && y < h; y++) {
++        cpu_physical_memory_read(yp + (uint64_t)y * ys, yrow, ys);
++        if (!(y & 1)) {
++            cpu_physical_memory_read(cp + (uint64_t)(y / 2) * cs, crow, cs);
++        }
++        for (unsigned x = 0; x < vw && x < w; x++) {
++            int vy = yrow[x];
++            int vu = crow[x & ~1u] - 128, vv = crow[(x & ~1u) + 1] - 128;
++            int r = CLAMP(vy + ((359 * vv + 128) >> 8), 0, 255);
++            int g = CLAMP(vy - ((88 * vu + 183 * vv + 128) >> 8), 0, 255);
++            int b = CLAMP(vy + ((454 * vu + 128) >> 8), 0, 255);
++
++            dst[y * w + x] = (uint32_t)r << 16 | (uint32_t)g << 8 | b;
++        }
++    }
++    if (!s->video_reported) {
++        s->video_reported = true;
++        error_report("Z63_SCANOUT: direct input (live view) under the slots "
++                     "-- %ux%u NV12, Y %#" PRIx64 " C %#" PRIx64 ", strides "
++                     "%u/%u", vw, vh, ybus, cbus, ys, cs);
++    }
++    s->frames_video++;
++    return true;
++}
++
+ static void z63_scanout_update(void *opaque)
+ {
+     Z63Scanout *s = opaque;
+@@ -415,6 +503,7 @@ static void z63_scanout_update(void *opaque)
+     }
+     dst = s->back;
+     memset(dst, 0, (size_t)w * h * 4);
++    z63_scanout_video(s, w, h, dst);
+ 
+     z63_disp_pair(z63_disp_reg(s, Z63_DISP_R_ORIGIN), &ox, &oy);
+ 
+-- 
+2.55.0
+

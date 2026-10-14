@@ -1,0 +1,109 @@
+/* The body's pictures (skin.ts), at their own pixel sizes, scaled to fit by
+ * app.ts. Hot spots are placed in those pixels: --x, --y the centre, --r
+ * the radius. */
+
+.body {
+  position: absolute; left: 50%; top: 50%;
+  transform-origin: center center;
+}
+.picture {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none; -webkit-user-drag: none;
+}
+.body .picture {
+  filter: drop-shadow(0 34px 40px rgba(0, 0, 0, .28)) drop-shadow(0 6px 10px rgba(0, 0, 0, .18));
+}
+
+/* The monitor: its own layer, so a new frame does not redraw the shadow. */
+.screen {
+  position: absolute; background: #000; border-radius: 2px; overflow: hidden;
+  will-change: transform;
+}
+.lcd { display: block; width: 100%; height: 100%; object-fit: contain; cursor: pointer; transition: opacity .6s; }
+.glare {
+  position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(118deg, rgba(255, 255, 255, .07) 0%, rgba(255, 255, 255, .02) 30%, transparent 44%);
+}
+.note {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 18px;
+  color: #8e8e95; font: 15px/1.4 var(--mono); pointer-events: none;
+}
+body.off .lcd { opacity: .16; }
+
+.touchdot {
+  position: absolute; width: 36px; height: 36px; margin: -18px 0 0 -18px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 255, 255, .5), rgba(255, 255, 255, .12) 62%, transparent 70%);
+  border: 2px solid rgba(255, 255, 255, .75); pointer-events: none;
+  transition: opacity .3s, transform .3s;
+}
+.touchdot.up { opacity: 0; transform: scale(1.5); }
+.zoom .touchdot { width: 48px; height: 48px; margin: -24px 0 0 -24px; }
+
+/* ---- hot spots ---- */
+
+.hot, .hring {
+  position: absolute;
+  left: calc((var(--x) - var(--r)) * 1px); top: calc((var(--y) - var(--r)) * 1px);
+  width: calc(var(--r) * 2px); height: calc(var(--r) * 2px);
+  border: 0; padding: 0; border-radius: 50%; background: transparent;
+  cursor: pointer; transition: box-shadow .08s, background .08s;
+}
+.hot:hover, .hring:hover { box-shadow: 0 0 0 3px rgba(241, 196, 0, .5); }
+.hot.held, .hot:active:not(.dead) {
+  background: radial-gradient(circle, rgba(0, 0, 0, .38) 0%, rgba(0, 0, 0, .14) 66%, transparent 71%);
+  box-shadow: 0 0 0 5px rgba(241, 196, 0, .95), 0 0 26px rgba(241, 196, 0, .6);
+}
+.hot.dead { cursor: help; }
+.hot.dead:hover { box-shadow: 0 0 0 2px rgba(150, 150, 158, .55); }
+.hring[data-dir="up"] { background: radial-gradient(circle at 50% 10%, rgba(241, 196, 0, .7), transparent 42%); }
+.hring[data-dir="down"] { background: radial-gradient(circle at 50% 90%, rgba(241, 196, 0, .7), transparent 42%); }
+.hring[data-dir="left"] { background: radial-gradient(circle at 10% 50%, rgba(241, 196, 0, .7), transparent 42%); }
+.hring[data-dir="right"] { background: radial-gradient(circle at 90% 50%, rgba(241, 196, 0, .7), transparent 42%); }
+.hring[data-dir="center"] { box-shadow: 0 0 0 5px rgba(241, 196, 0, .95), 0 0 26px rgba(241, 196, 0, .6); background: rgba(0, 0, 0, .25); }
+.hring:not([data-dir=""]):not([data-dir="center"]) { box-shadow: 0 0 0 3px rgba(241, 196, 0, .7); }
+
+/* ---- the top ---- */
+
+.shoulder { flex: none; }
+.topwrap { position: relative; padding: 8px 12px; }
+.topview { position: relative; transform-origin: top left; }
+.topview .picture { filter: drop-shadow(0 10px 14px rgba(0, 0, 0, .25)); }
+/* The small hot spots need a thinner ring at this scale. */
+.topview .hot:hover { box-shadow: 0 0 0 2px rgba(241, 196, 0, .6); }
+.topview .hot.held, .topview .hot:active:not(.dead) {
+  box-shadow: 0 0 0 3px rgba(241, 196, 0, .95), 0 0 14px rgba(241, 196, 0, .6);
+}
+.topview .shutter.half { background: rgba(0, 0, 0, .25); box-shadow: 0 0 0 3px rgba(241, 196, 0, .55); }
+.topview .shutter.full {
+  background: rgba(0, 0, 0, .4);
+  box-shadow: 0 0 0 4px rgba(241, 196, 0, .98), 0 0 18px rgba(241, 196, 0, .7);
+}
+
+/* The control panel: the body MCU's 128x128 memory LCD (runPanel), white on
+ * black as the body's; bigger when clicked. */
+.cpanel {
+  position: absolute; overflow: hidden; border-radius: 2px; cursor: zoom-in;
+  background: #0b0c0e; box-shadow: inset 0 0 0 1px #2a2a2e;
+  transition: transform .18s ease, box-shadow .18s ease;
+}
+.cpanel canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.cpanel.big {
+  z-index: 10; cursor: zoom-out; transform: scale(2.6);
+  box-shadow: 0 0 0 .5px #2a2a2e, 0 6px 18px rgba(0, 0, 0, .45);
+}
+.cpanel.big canvas { image-rendering: pixelated; }
+.cpanel-note {
+  position: absolute; inset: 0; display: grid; place-items: center; padding: 4px;
+  font: 700 5.5px var(--sans); letter-spacing: .08em; text-transform: uppercase; text-align: center;
+  color: rgba(255, 255, 255, .5); pointer-events: none;
+}
+.cpanel-note:empty { display: none; }
+
+.front { display: flex; align-items: center; gap: 8px; padding: 2px 14px 12px; }
+.fbtn {
+  height: 26px; padding: 0 13px; border-radius: 13px; border: 0; cursor: pointer;
+  background: linear-gradient(#3c3c40, #1b1b1e); color: #eee; font: 650 11.5px var(--sans);
+  box-shadow: 0 2px 0 #000, 0 4px 8px rgba(0, 0, 0, .25), inset 0 1px 0 rgba(255, 255, 255, .15);
+}
+.fbtn.held, .fbtn:active { transform: translateY(1px); box-shadow: 0 0 0 3px rgba(241, 196, 0, .92), 0 0 16px rgba(241, 196, 0, .5); }
+.keys-hint { margin-left: auto; color: var(--muted); font-size: 11.5px; text-align: right; }

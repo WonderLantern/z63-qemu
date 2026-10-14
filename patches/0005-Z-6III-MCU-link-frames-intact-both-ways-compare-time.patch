@@ -1,0 +1,715 @@
+From 1ffe25873ea6f49f0c8aee485f31612c1cea49c9 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Sun, 11 Oct 2026 15:14:08 +0000
+Subject: [PATCH 05/47] Z 6III MCU link: frames intact both ways, compare
+ timers, M4 debuggable
+
+With the body MCU's image on the M4 and SPI1/SPI4 bridged to serial
+instances 0/1, the version exchange crossed but everything the MCU sent
+after it arrived misaligned: the bridge took the MCU's bytes from its
+SPI4 DMA stream before asking whether the EXPEED's instance had a word
+queued to clock them, so whenever that instance's 64-word FIFO ran dry
+mid-frame the bytes were dropped and the EXPEED read the 128-word frame
+from wherever the stream had got to. The bridge now asks the instance
+first. With that, the whole start-up conversation runs with every frame
+passing both sides' checks: power status, battery (and the multi-frame
+battery information), keys, lens, mode, and families 7/15/16/17.
+
+- Z63_MCU_FRAME names each frame both ways by its header (family,
+  route, kind, length, count/index, checksum), first four of each kind
+  in full and then a count, instead of the first 32 raw words.
+- mcu-spi-peer= defaults to 1:0+4:1, the pairing the frame checks of
+  both firmwares now confirm.
+- TIM2-5 output compare on all four channels, as RM0386 has it: the
+  counter reaching CCRx sets CCxIF and, with CCxIE, interrupts. The MCU
+  firmware's one-shot delays are CCRx = CNT + n; its shutter service
+  powers the shutter's position sensors (PA11), waits 30 ticks on TIM3
+  channel 3, then reads them (PC6/PC7, active low; position 2 = both
+  low). Without the match the service never finished, the mechanism
+  manager left the EXPEED's family-9 mode command unanswered, and the
+  EXPEED posted camera error 0x34. Now the MCU reports the shutter ready
+  (family 9 kind 1, status 0) and no error is raised. This replaces the
+  channel-1-only periodic version, which for CCRx = CNT + n waited
+  CNT + n ticks. Matches are settled lazily, so polled PWM channels cost
+  nothing per period.
+- The A53s are CPU cluster 0 and the M4 cluster 1, so QEMU's gdbstub
+  shows them as two inferiors; z63-tools/mcu_probe.py attaches to the
+  M4 of a running machine (-gdb tcp:127.0.0.1:41234), breaks, prints
+  registers and a rough stack walk. Without the A53 cluster, adding the
+  M4's would have left the A53s in an unattached default process.
+- mcu-wires= parsing read %u into uint8_t fields; now %hhu.
+
+Where it stands: the GUI draws nothing, as it did with the synthetic
+peer and mcu-camctl-reply=on -- it waits on live view. The EXPEED has
+not raised the capture-sync request (GPIO port 3 bit 12) yet, and its
+family-10 pass-through request (opcode 5, target 0x12) still gets no
+reply from the MCU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-stm32.h           |  15 ++-
+ hw/arm/nikon-z63.c                 | 121 ++++++++++++++++++++----
+ hw/timer/stm32f2xx_timer.c         | 145 +++++++++++++++++++++++------
+ include/hw/timer/stm32f2xx_timer.h |  11 ++-
+ z63-tools/gui.sh                   |   8 +-
+ z63-tools/mcu_probe.py             | 129 +++++++++++++++++++++++++
+ 6 files changed, 371 insertions(+), 58 deletions(-)
+ create mode 100755 z63-tools/mcu_probe.py
+
+diff --git a/hw/arm/nikon-z63-stm32.h b/hw/arm/nikon-z63-stm32.h
+index acd60a6..964f710 100644
+--- a/hw/arm/nikon-z63-stm32.h
++++ b/hw/arm/nikon-z63-stm32.h
+@@ -51,6 +51,7 @@
+ #define HW_ARM_NIKON_Z63_STM32_H
+ 
+ #include "hw/arm/armv7m.h"
++#include "hw/cpu/cluster.h"
+ #include "hw/qdev-clock.h"
+ #include "migration/vmstate.h"
+ #include "hw/timer/stm32f2xx_timer.h"
+@@ -117,6 +118,11 @@ struct Z63Stm32 {
+     MemoryRegion flash, flash_alias, sram, ccm, bkpsram;
+     MemoryRegion rcc_mr, pwr_mr, flashif_mr, trap;
+     qemu_irq flash_irq;
++    /* The M4 is a cluster of its own (cluster-id 1), as zynqmp does for its
++     * R5s: QEMU's gdbstub then shows it as a second inferior (process 2)
++     * beside the A53s, so it can be stopped, stepped and walked by itself,
++     * and TCG never shares a translation between the two. */
++    CPUClusterState cluster;
+     ARMv7MState armv7m;
+     Clock *sysclk, *refclk;
+     QEMUTimer *dbg_timer;           /* TEMPORARY PROBE (remove) */
+@@ -2408,7 +2414,11 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+     clock_set_mul_div(m->refclk, 8, 1);             /* HCLK / 8 */
+     clock_set_source(m->refclk, m->sysclk);
+ 
+-    object_initialize_child(owner, "z63-mcu-armv7m", &m->armv7m, TYPE_ARMV7M);
++    object_initialize_child(owner, "z63-mcu-cluster", &m->cluster,
++                            TYPE_CPU_CLUSTER);
++    qdev_prop_set_uint32(DEVICE(&m->cluster), "cluster-id", 1);
++    object_initialize_child(OBJECT(&m->cluster), "z63-mcu-armv7m", &m->armv7m,
++                            TYPE_ARMV7M);
+     armv7m = DEVICE(&m->armv7m);
+     qdev_prop_set_uint32(armv7m, "num-irq", Z63_STM32_NUM_IRQ);
+     qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
+@@ -2418,7 +2428,8 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+     qdev_connect_clock_in(armv7m, "refclk", m->refclk);
+     object_property_set_link(OBJECT(armv7m), "memory", OBJECT(&m->mem),
+                              &error_abort);
+-    if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
++    if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp) ||
++        !qdev_realize(DEVICE(&m->cluster), NULL, errp)) {
+         return;
+     }
+ 
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 12e421e..615d17e 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -692,6 +692,7 @@ typedef struct NikonZ63State {
+      * 0x0D154340 + 4*i. See the comment above z63_reset_masks. */
+     uint32_t reset_word[6];
+     ARMCPU *cpu[Z63_NUM_CPU];
++    CPUClusterState a53_cluster;     /* cluster 0; the body MCU is 1 */
+ 
+     MemoryRegion gpio_top;
+     uint16_t gpio_config[Z63_GPIO_BANKS][Z63_GPIO_WORDS];
+@@ -1855,7 +1856,7 @@ static void z63_wires_parse(NikonZ63State *s)
+         if (sscanf(*it, "%7[^=]=%7s", mcu, wire) != 2 ||
+             sscanf(mcu, "%c%u", &port, &pin) != 2 ||
+             (port = g_ascii_toupper(port)) < 'A' || port > 'K' || pin > 15 ||
+-            sscanf(wire, "a%u:%u", &w.a53_bank, &w.a53_bit) != 2 ||
++            sscanf(wire, "a%hhu:%hhu", &w.a53_bank, &w.a53_bit) != 2 ||
+             w.a53_bank >= Z63_GPIO_BANKS || w.a53_bit > 15) {
+             error_report("mcu-wires: '%s' is not <port><pin>=a<port>:<bit> "
+                          "(e.g. B12=a3:2); ignoring it", *it);
+@@ -3567,11 +3568,14 @@ static const QemuInputHandler z63_kbd_handler = {
+  * exchange is what the MCU's next DR read returns. Both directions are
+  * one call to z63_sio_clock() -- full duplex, exactly as SPI is.
+  *
+- * WHICH SPI IS WHICH INSTANCE IS A DECLARED CHOICE, not a measurement.
+- * mcu-spi-peer= names it ("1:0+4:1" = SPI1 on serial 0, SPI4 on serial 1),
+- * and the pairing is logged at init and every word after it, so a wrong
+- * guess shows up on the first transfer instead of being inferred from a
+- * hang. Nothing is bridged unless the property is set.
++ * mcu-spi-peer= names which SPI is on which instance. The default,
++ * "1:0+4:1" (SPI1 on serial 0, SPI4 on serial 1), started as a declared
++ * choice and is now borne out by both firmwares: every frame the EXPEED
++ * clocks out on serial 0 passes the MCU's own frame check (count, index,
++ * checksum; sub_8038F08 in the MCU image) when it arrives on SPI1, and the
++ * frames the MCU queues on SPI4 (DMA2 stream 1) pass the EXPEED's check on
++ * serial 1 and get answered. Each frame both ways is named on stderr as
++ * Z63_MCU_FRAME (z63_mcu_link_frame).
+  */
+ typedef struct Z63McuSpiLink {
+     Z63Stm32 *mcu;                  /* the real MCU, nikon-z63-stm32.h */
+@@ -3581,6 +3585,10 @@ typedef struct Z63McuSpiLink {
+     uint64_t words;
+     bool pumping;                   /* re-entrancy guard */
+     uint32_t why;                   /* which guard reported */
++    /* The current 128-word frame each way, for z63_mcu_link_frame(). */
++    uint8_t frame[2][256];
++    unsigned at;                    /* words of the current frame so far */
++    GHashTable *kinds;              /* (dir, family, route, kind) -> count */
+ } Z63McuSpiLink;
+ 
+ /* One exchange's two words. `tx` is what the MCU puts on the wire and `rx`
+@@ -3598,13 +3606,61 @@ static uint16_t z63_mcu_spi_shift(void *opaque, unsigned inst, uint16_t out)
+     return x->tx;
+ }
+ 
++/* One direction's frame is complete: name it by the transport's header
++ * (nikon-z63-mcu.h: [0] family, [1] route, [2..3] body length, body from
++ * [8] with its kind at [8], [0xff] = ~sum of the rest). An all-zero frame
++ * is the idle side of a full-duplex exchange and is not named. Each
++ * (direction, family, route, kind) is shown in full the first 4 times and
++ * then counted, every 256th, so a retry loop reads as a count and not as
++ * a flood. */
++static void z63_mcu_link_frame(Z63McuSpiLink *l, unsigned dir)
++{
++    const uint8_t *f = l->frame[dir];
++    unsigned len = f[2] | f[3] << 8, sum = 0;
++    uintptr_t key;
++    unsigned n;
++    char body[3 * 48 + 1];
++
++    if (!f[0]) {
++        return;
++    }
++    for (unsigned i = 0; i < 0xff; i++) {
++        sum += f[i];
++    }
++    if (!l->kinds) {
++        l->kinds = g_hash_table_new(NULL, NULL);
++    }
++    key = (uintptr_t)dir << 24 | f[0] << 16 | f[1] << 8 | f[8];
++    n = GPOINTER_TO_UINT(g_hash_table_lookup(l->kinds, (void *)key)) + 1;
++    g_hash_table_insert(l->kinds, (void *)key, GUINT_TO_POINTER(n));
++    if (n > 4 && n % 256) {
++        return;
++    }
++    for (unsigned i = 0; i < MIN(len, 48u); i++) {
++        snprintf(body + 3 * i, 4, "%02x ", f[8 + i]);
++    }
++    body[3 * MIN(len, 48u)] = 0;
++    error_report("Z63_MCU_FRAME: %s #%u family %u route %u kind %u len %u "
++                 "count %u index %u sum %s (SPI%u/serial %u): %s%s",
++                 dir ? "MCU->EXPEED" : "EXPEED->MCU", n, f[0], f[1], f[8],
++                 len, f[0xfc], f[0xfd],
++                 (uint8_t)~sum == f[0xff] ? "ok" : "BAD",
++                 l->spi_inst + 1, l->sio_inst, body, len > 48 ? "..." : "");
++}
++
++/* `out` is the MCU's word, `in` the EXPEED's. 128 words a frame, low
++ * byte first. */
+ static void z63_mcu_link_note(Z63McuSpiLink *l, uint16_t out, uint16_t in)
+ {
+     l->words++;
+-    if (l->words <= 32) {
+-        error_report("Z63_MCU_LINK: SPI%u/serial %u word %" PRIu64
+-                     ": MCU out 0x%04x, MCU in 0x%04x",
+-                     l->spi_inst + 1, l->sio_inst, l->words, out, in);
++    l->frame[0][2 * l->at] = in;
++    l->frame[0][2 * l->at + 1] = in >> 8;
++    l->frame[1][2 * l->at] = out;
++    l->frame[1][2 * l->at + 1] = out >> 8;
++    if (++l->at == 128) {
++        l->at = 0;
++        z63_mcu_link_frame(l, 0);
++        z63_mcu_link_frame(l, 1);
+     }
+ }
+ 
+@@ -3615,8 +3671,9 @@ static uint16_t z63_real_mcu_spi_peer(void *opaque, unsigned inst,
+     Z63McuSpiLink *l = opaque;
+     Z63McuSpiXfer x = { .tx = out, .rx = 0 };
+ 
+-    z63_sio_clock(l->sio, l->sio_inst, 1, z63_mcu_spi_shift, &x);
+-    z63_mcu_link_note(l, out, x.rx);
++    if (z63_sio_clock(l->sio, l->sio_inst, 1, z63_mcu_spi_shift, &x)) {
++        z63_mcu_link_note(l, out, x.rx);
++    }
+     return x.rx;
+ }
+ 
+@@ -3675,6 +3732,16 @@ static void z63_mcu_link_pump(Z63McuSpiLink *l)
+ 
+         unsigned items = z63_stm32_dma_item_bytes(l->mcu, par, true);
+ 
++        /* The EXPEED's instance is the side whose queued words clock the
++         * wire (z63_sio_clock moves nothing without one), so ask it first.
++         * Taking the MCU's bytes from its stream before that dropped them
++         * whenever the instance's 64-word FIFO ran dry mid-frame -- the
++         * EXPEED then read the MCU's 128-word frame from wherever the
++         * stream had got to, misaligned, and threw it away. */
++        if (!pio->active || !pio->tx_queued ||
++            pio->rx_queued >= Z63_SIO_FIFO) {
++            break;
++        }
+         if (items) {
+             if (!z63_stm32_dma_tx(l->mcu, par, &v)) {
+                 break;
+@@ -3690,10 +3757,10 @@ static void z63_mcu_link_pump(Z63McuSpiLink *l)
+                 v |= (hi & 0xff) << 8;
+             }
+             x.tx = v;
+-        } else if (!pio->tx_queued) {
+-            break;                  /* nothing to send, nothing waiting */
+         }
+-        z63_sio_clock(l->sio, l->sio_inst, 1, z63_mcu_spi_shift, &x);
++        if (!z63_sio_clock(l->sio, l->sio_inst, 1, z63_mcu_spi_shift, &x)) {
++            break;                  /* checked above; cannot happen */
++        }
+         z63_mcu_link_note(l, x.tx, x.rx);
+         items = z63_stm32_dma_item_bytes(l->mcu, par, false);
+         if (items == 1) {
+@@ -3772,17 +3839,31 @@ static void z63_init(MachineState *machine)
+      * how it gets its own entry address per core. All of them share the
+      * image entry as rvbar, and the counter runs at 24 MHz (the image writes
+      * exactly that to CNTFRQ_EL0 early on). */
++    /* They are CPU cluster 0, as the body MCU's M4 is cluster 1
++     * (nikon-z63-stm32.h): once any cluster exists QEMU's gdbstub makes one
++     * inferior per cluster and puts unclustered CPUs in a last, unattached
++     * one -- so without this a debugger attaching to the board would get the
++     * M4 and not the A53s. The cluster is realized before the CPUs, as
++     * zynqmp does for its APUs, so their translations are tagged with it. */
++    object_initialize_child(OBJECT(machine), "a53-cluster", &s->a53_cluster,
++                            TYPE_CPU_CLUSTER);
++    qdev_prop_set_uint32(DEVICE(&s->a53_cluster), "cluster-id", 0);
+     for (int i = 0; i < num_cpu; i++) {
+         Object *cpuobj = object_new(machine->cpu_type);
+         CPUState *cs = CPU(cpuobj);
+ 
++        object_property_add_child(OBJECT(&s->a53_cluster), "cpu[*]", cpuobj);
++        object_unref(cpuobj);
+         cs->start_powered_off = (i != 0);
+         object_property_set_uint(cpuobj, "rvbar", Z63_IMAGE_ENTRY, &error_fatal);
+         object_property_set_int(cpuobj, "mp-affinity", i, &error_fatal);
+         object_property_set_int(cpuobj, "cntfrq", 24000000, &error_fatal);
+-        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+         s->cpu[i] = ARM_CPU(cpuobj);
+     }
++    qdev_realize(DEVICE(&s->a53_cluster), NULL, &error_fatal);
++    for (int i = 0; i < num_cpu; i++) {
++        qdev_realize(DEVICE(s->cpu[i]), NULL, &error_fatal);
++    }
+ 
+     z63_create_gic(s, num_cpu);
+ 
+@@ -4448,6 +4529,7 @@ static void z63_machine_instance_init(Object *obj)
+      * for ever. Only meaningful with mcu-image=; the synthetic peer answers
+      * those ports itself. Overridable with mcu-wires=. */
+     s->mcu_wires = g_strdup("B12=a3:2+E3=a3:3+D12=a4:3+G6=a4:7");
++    s->mcu_spi_peer = g_strdup("1:0+4:1");    /* see Z63McuSpiLink */
+     s->sio_sink = g_strdup("9"); /* the rear panel; nikon-z63-sio.h */
+     s->storage_caps_stub = true; /* nikon-z63-storage.h, declared values */
+     s->soc_chip_id = Z63_SOC_CHIP_ID_DEFAULT;
+@@ -5062,9 +5144,10 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+                                   z63_prop_set_mcu_spi_peer);
+     object_class_property_set_description(oc, "mcu-spi-peer",
+         "\"1:0+4:1\": bridge SPI<n> of the real MCU (mcu-image=) to this "
+-        "board's serial instance <m>. The pairing is a declared choice, not a "
+-        "measurement; every word both ways is logged. Empty (the default) "
+-        "bridges nothing. See nikon-z63-stm32.h and nikon-z63-sio.h.");
++        "board's serial instance <m>. The default, \"1:0+4:1\", is the pairing "
++        "both firmwares' frame checks agree with; every frame both ways is "
++        "logged. Empty bridges nothing. See nikon-z63-stm32.h and "
++        "nikon-z63-sio.h.");
+     object_class_property_add_str(oc, "mcu-pins", z63_prop_get_mcu_pins,
+                                   z63_prop_set_mcu_pins);
+     object_class_property_set_description(oc, "mcu-pins",
+diff --git a/hw/timer/stm32f2xx_timer.c b/hw/timer/stm32f2xx_timer.c
+index 6b8de50..65bb120 100644
+--- a/hw/timer/stm32f2xx_timer.c
++++ b/hw/timer/stm32f2xx_timer.c
+@@ -44,44 +44,123 @@
+ 
+ static void stm32f2xx_timer_set_alarm(STM32F2XXTimerState *s, int64_t now);
+ 
+-/* Output compare 1, as RM0386 18.3.3 and 18.4.5 have it: the counter
+- * reaching CCR1 sets CC1IF, and with DIER.CC1IE that pends the interrupt.
+- * The firmware on the Z 6III's body MCU uses this as a plain periodic time
+- * base (fixed CCR1, no pin output), so scheduling it as its own periodic
+- * timer of CCR1*(PSC+1) counter ticks is enough -- and letting it re-arm
+- * itself avoids the tick_offset arithmetic the update path uses.
++/*
++ * Output compare, channels 1-4 (RM0386 18.3.8 and 18.4.5): whenever the
++ * counter reaches CCRx on a channel in output mode (CCMRx.CCxS = 00), CCxIF
++ * is set, and with DIER.CCxIE that pends the timer's interrupt. The counter
++ * runs from 0 to ARR and wraps, so a channel matches once every ARR + 1
++ * ticks, the first time (CCRx - CNT) mod (ARR + 1) ticks from now.
++ *
++ * The firmware on the Z 6III's body MCU uses this as its one-shot delay:
++ * it writes CCRx = CNT + n and sets CCxIE -- TIM3 channel 3 is the shutter
++ * service's 30-tick settle delay before it reads the shutter's position
++ * sensors -- so the match has to come n ticks after the write. (The
++ * channel-1-only version this replaces fired every CCR1 * (PSC + 1) ticks
++ * from the write, which for CCRx = CNT + n is a delay of CNT + n.)
++ *
++ * Matches are settled lazily: cc_seen_ns is the time up to which they have
++ * been accounted, and stm32f2xx_timer_cc_sync() settles (cc_seen_ns, now]
++ * before SR is read and before any register is written, with the settings
++ * that were in force. Only channels whose interrupt is enabled get a host
++ * timer (cc_timer, at the next match); a flag that is only polled is set
++ * when SR is read, so free-running PWM channels cost nothing per period.
+  */
+-static void stm32f2xx_timer_set_cc_alarm(STM32F2XXTimerState *s)
++static uint32_t stm32f2xx_timer_ccr(STM32F2XXTimerState *s, unsigned ch)
+ {
+-    int64_t period_ns;
++    switch (ch) {
++    case 0:
++        return s->tim_ccr1;
++    case 1:
++        return s->tim_ccr2;
++    case 2:
++        return s->tim_ccr3;
++    default:
++        return s->tim_ccr4;
++    }
++}
+ 
+-    timer_del(s->cc_timer);
++/* A channel that can match: output mode, and a CCRx the counter reaches. */
++static bool stm32f2xx_timer_oc(STM32F2XXTimerState *s, unsigned ch)
++{
++    uint32_t ccmr = ch < 2 ? s->tim_ccmr1 : s->tim_ccmr2;
+ 
+-    if (!(s->tim_cr1 & TIM_CR1_CEN) || s->tim_ccr1 == 0) {
+-        return;
++    return !((ccmr >> (8 * (ch & 1))) & 3) &&
++           stm32f2xx_timer_ccr(s, ch) <= s->tim_arr;
++}
++
++static inline int64_t stm32f2xx_ns_to_ticks(STM32F2XXTimerState *s, int64_t t);
++
++/* The earliest virtual time at which stm32f2xx_ns_to_ticks() reaches the
++ * absolute tick count `ticks`. */
++static int64_t stm32f2xx_ticks_to_ns(STM32F2XXTimerState *s, uint64_t ticks)
++{
++    return muldiv64(ticks * (s->tim_psc + 1), 1000000000ULL, s->freq_hz) + 1;
++}
++
++/* Ticks from absolute tick `t` to channel ch's next match (1..ARR + 1). */
++static uint64_t stm32f2xx_timer_cc_due(STM32F2XXTimerState *s, unsigned ch,
++                                       int64_t t)
++{
++    int64_t period = (int64_t)s->tim_arr + 1;
++    int64_t pos = (t - s->tick_offset) % period;
++    int64_t d;
++
++    if (pos < 0) {
++        pos += period;
+     }
++    d = ((int64_t)stm32f2xx_timer_ccr(s, ch) - pos + period) % period;
++    return d ? d : period;
++}
++
++static void stm32f2xx_timer_cc_sync(STM32F2XXTimerState *s, int64_t now)
++{
++    int64_t from = stm32f2xx_ns_to_ticks(s, s->cc_seen_ns);
++    int64_t to = stm32f2xx_ns_to_ticks(s, now);
++    bool irq = false;
+ 
+-    period_ns = muldiv64((uint64_t)s->tim_ccr1 * (s->tim_psc + 1),
+-                         1000000000ULL, s->freq_hz);
+-    if (period_ns <= 0) {
+-        period_ns = 1;
++    s->cc_seen_ns = now;
++    if (to <= from || !(s->tim_cr1 & TIM_CR1_CEN) || !s->tim_arr) {
++        return;
++    }
++    for (unsigned ch = 0; ch < 4; ch++) {
++        if (stm32f2xx_timer_oc(s, ch) &&
++            stm32f2xx_timer_cc_due(s, ch, from) <= (uint64_t)(to - from)) {
++            s->tim_sr |= 2u << ch;                      /* CCxIF */
++            irq |= s->tim_dier & (2u << ch);            /* CCxIE */
++        }
++    }
++    if (irq) {
++        qemu_irq_pulse(s->irq);
+     }
+-    timer_mod(s->cc_timer,
+-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
+ }
+ 
+-static void stm32f2xx_timer_cc_interrupt(void *opaque)
++static void stm32f2xx_timer_set_cc_alarm(STM32F2XXTimerState *s)
+ {
+-    STM32F2XXTimerState *s = opaque;
++    int64_t now_t;
++    uint64_t best = 0;
+ 
+-    if (!(s->tim_cr1 & TIM_CR1_CEN)) {
++    timer_del(s->cc_timer);
++    if (!(s->tim_cr1 & TIM_CR1_CEN) || !s->tim_arr) {
+         return;
+     }
++    now_t = stm32f2xx_ns_to_ticks(s, s->cc_seen_ns);
++    for (unsigned ch = 0; ch < 4; ch++) {
++        if (s->tim_dier & (2u << ch) && stm32f2xx_timer_oc(s, ch)) {
++            uint64_t d = stm32f2xx_timer_cc_due(s, ch, now_t);
+ 
+-    s->tim_sr |= TIM_SR_CC1IF;
+-    if (s->tim_dier & TIM_DIER_CC1IE) {
+-        qemu_irq_pulse(s->irq);
++            best = best && best < d ? best : d;
++        }
++    }
++    if (best) {
++        timer_mod(s->cc_timer, stm32f2xx_ticks_to_ns(s, now_t + best));
+     }
++}
++
++static void stm32f2xx_timer_cc_interrupt(void *opaque)
++{
++    STM32F2XXTimerState *s = opaque;
++
++    stm32f2xx_timer_cc_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+     stm32f2xx_timer_set_cc_alarm(s);
+ }
+ 
+@@ -141,6 +220,7 @@ static void stm32f2xx_timer_reset(DeviceState *dev)
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ 
+     timer_del(s->cc_timer);
++    s->cc_seen_ns = now;
+     s->tim_cr1 = 0;
+     s->tim_cr2 = 0;
+     s->tim_smcr = 0;
+@@ -180,6 +260,7 @@ static uint64_t stm32f2xx_timer_read(void *opaque, hwaddr offset,
+     case TIM_DIER:
+         return s->tim_dier;
+     case TIM_SR:
++        stm32f2xx_timer_cc_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+         return s->tim_sr;
+     case TIM_EGR:
+         return s->tim_egr;
+@@ -218,10 +299,9 @@ static uint64_t stm32f2xx_timer_read(void *opaque, hwaddr offset,
+     return 0;
+ }
+ 
+-static void stm32f2xx_timer_write(void *opaque, hwaddr offset,
+-                        uint64_t val64, unsigned size)
++static void stm32f2xx_timer_write_reg(STM32F2XXTimerState *s, hwaddr offset,
++                                      uint64_t val64, unsigned size)
+ {
+-    STM32F2XXTimerState *s = opaque;
+     uint32_t value = val64;
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+     uint32_t timer_val = 0;
+@@ -231,7 +311,6 @@ static void stm32f2xx_timer_write(void *opaque, hwaddr offset,
+     switch (offset) {
+     case TIM_CR1:
+         s->tim_cr1 = value;
+-        stm32f2xx_timer_set_cc_alarm(s);
+         return;
+     case TIM_CR2:
+         s->tim_cr2 = value;
+@@ -275,7 +354,6 @@ static void stm32f2xx_timer_write(void *opaque, hwaddr offset,
+         return;
+     case TIM_CCR1:
+         s->tim_ccr1 = value;
+-        stm32f2xx_timer_set_cc_alarm(s);
+         return;
+     case TIM_CCR2:
+         s->tim_ccr2 = value;
+@@ -306,6 +384,17 @@ static void stm32f2xx_timer_write(void *opaque, hwaddr offset,
+      */
+     s->tick_offset = stm32f2xx_ns_to_ticks(s, now) - timer_val;
+     stm32f2xx_timer_set_alarm(s, now);
++}
++
++/* Every register write: settle the compare matches the old settings made,
++ * then let the new ones decide the next. */
++static void stm32f2xx_timer_write(void *opaque, hwaddr offset,
++                        uint64_t val64, unsigned size)
++{
++    STM32F2XXTimerState *s = opaque;
++
++    stm32f2xx_timer_cc_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++    stm32f2xx_timer_write_reg(s, offset, val64, size);
+     stm32f2xx_timer_set_cc_alarm(s);
+ }
+ 
+diff --git a/include/hw/timer/stm32f2xx_timer.h b/include/hw/timer/stm32f2xx_timer.h
+index f6b319e..c28a8e9 100644
+--- a/include/hw/timer/stm32f2xx_timer.h
++++ b/include/hw/timer/stm32f2xx_timer.h
+@@ -76,12 +76,13 @@ struct STM32F2XXTimerState {
+     /* <public> */
+     MemoryRegion iomem;
+     QEMUTimer *timer;
+-    /* Compare-match timer for channel 1. The update event above is not the
+-     * only source on the part: a channel that reaches CCR1 raises CC1IF and,
+-     * with DIER.CC1IE, the same interrupt line. The Z 6III body MCU runs its
+-     * serial link to the EXPEED off exactly that, so without it the link
+-     * never steps. See hw/arm/nikon-z63-stm32.h. */
++    /* Output compare on channels 1-4: the next match of a channel whose
++     * interrupt is enabled, and the time up to which matches have been
++     * settled (see stm32f2xx_timer_cc_sync). The update event above is not
++     * the only source on the part; the Z 6III body MCU's one-shot delays
++     * are all compare matches. */
+     QEMUTimer *cc_timer;
++    int64_t cc_seen_ns;
+     qemu_irq irq;
+ 
+     int64_t tick_offset;
+diff --git a/z63-tools/gui.sh b/z63-tools/gui.sh
+index 7ca80cb..522411d 100755
+--- a/z63-tools/gui.sh
++++ b/z63-tools/gui.sh
+@@ -16,10 +16,10 @@
+ # input pins, standing in for the wires the EXPEED holds; the separator is
+ # ":" because "," separates -machine properties.
+ #
+-# MCU_SPI_PEER=1:0+4:1 bridges the MCU's SPI<n> to this board's serial
+-# instance <m>, which is the link between the two chips (nikon-z63-sio.h).
+-# The pairing is a declared choice, not a measurement: every word both ways
+-# is logged as Z63_MCU_LINK, so a wrong guess shows on the first transfer.
++# MCU_SPI_PEER bridges the MCU's SPI<n> to this board's serial instance
++# <m>, which is the link between the two chips (nikon-z63-sio.h). The
++# default, 1:0+4:1, is the pairing both firmwares' frame checks agree with;
++# every frame both ways is logged as Z63_MCU_FRAME.
+ # MCU_WIRES=B12=a3:2+E3=a3:3+D12=a4:3 wires the MCU's own handshake pins to
+ # the EXPEED's GPIO_TOP port bits, which is what the two firmwares poll and
+ # drive. Declared, and each wire is logged as Z63_MCU_WIRE.
+diff --git a/z63-tools/mcu_probe.py b/z63-tools/mcu_probe.py
+new file mode 100755
+index 0000000..6a1e21c
+--- /dev/null
++++ b/z63-tools/mcu_probe.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Stop the body MCU (the Cortex-M4 of mcu-image=) at breakpoints in a
++running machine and report each hit.
++
++    mcu_probe.py <seconds> <addr>[,<addr>...] [maxhits]
++
++The machine must have been started with -gdb tcp:127.0.0.1:41234 (never the
++shared 1234). The M4 is its own CPU cluster (nikon-z63-stm32.h), so QEMU's
++gdbstub shows it as process 2 beside the A53s' process 1; this attaches to
++process 2 only. Breakpoints are set on every CPU by QEMU, which is harmless:
++the A53s never execute at the MCU's flash addresses.
++
++Each hit prints pc, r0..r3, lr and sp, and a rough walk of the stack: the
++words in the first 0x200 bytes that look like Thumb return addresses into
++the application (odd, 0x08020000..0x08060000). The machine is paused while
++the script is attached, and resumes when it exits. Environment:
++
++  MEM=a:n[,a:n]  also dump n bytes at each address a, per hit
++  LIGHT=1        one line per hit (pc, r0..r3, lr)
++"""
++
++import os, socket, struct, sys, time
++
++secs, addrs = sys.argv[1:3]
++maxhits = int(sys.argv[3]) if len(sys.argv) > 3 else 4
++addrs = [int(a, 16) for a in addrs.split(",") if a]
++CODE_LO, CODE_HI = 0x08020000, 0x08060000
++
++
++class Rsp:
++    def __init__(self, port=41234):
++        self.s = socket.create_connection(("127.0.0.1", port))
++        self.buf = b""
++
++    def send(self, c):
++        self.s.sendall(b"$" + c + b"#%02x" % (sum(c) & 0xff))
++        while self.s.recv(1) != b"+":
++            pass
++
++    def recv(self, timeout=None):
++        self.s.settimeout(timeout)
++        while True:
++            i = self.buf.find(b"#")
++            if i >= 0 and len(self.buf) >= i + 3:
++                body = self.buf[self.buf.find(b"$") + 1:i]
++                self.buf = self.buf[i + 3:]
++                self.s.sendall(b"+")
++                return body.decode()
++            self.buf += self.s.recv(65536)
++
++    def cmd(self, c):
++        self.send(c.encode())
++        return self.recv()
++
++    def mem(self, a, n):
++        out = b""
++        while n > 0:
++            k = min(n, 0x100)
++            m = self.cmd("m%x,%x" % (a, k))
++            if m.startswith("E"):
++                break
++            out += bytes.fromhex(m)
++            a += k
++            n -= k
++        return out
++
++
++r = Rsp()
++r.cmd("qSupported:multiprocess+;swbreak+;hwbreak+")
++stop = r.cmd("vAttach;2")
++tid = stop.split("thread:")[1].split(";")[0] if "thread:" in stop else "p02.05"
++print("attached:", stop[:40], "thread", tid, flush=True)
++r.cmd("Hg" + tid)
++for a in addrs:
++    print("Z1", hex(a), r.cmd("Z1,%x,2" % a), flush=True)
++
++
++def resume():
++    for a in addrs:
++        r.cmd("z1,%x,2" % a)
++    r.cmd("Hc" + tid)
++    r.cmd("vCont;s:" + tid)
++    for a in addrs:
++        r.cmd("Z1,%x,2" % a)
++    r.send(b"vCont;c")
++
++
++r.send(b"vCont;c")
++deadline = time.time() + float(secs)
++hits = 0
++while time.time() < deadline and hits < maxhits:
++    try:
++        stop = r.recv(timeout=max(1, deadline - time.time()))
++    except socket.timeout:
++        break
++    if "thread:" in stop:
++        t = stop.split("thread:")[1].split(";")[0]
++        if int(t[1:].split(".")[0], 16) != 2:
++            r.send(b"vCont;c")          # not the M4
++            continue
++        tid = t
++    r.cmd("Hg" + tid)
++    g = r.cmd("g")
++    regs = struct.unpack("<16I", bytes.fromhex(g[:128]))
++    pc, lr, sp = regs[15], regs[14], regs[13]
++    hits += 1
++    if os.environ.get("LIGHT"):
++        print("T %08x r0=%x r1=%x r2=%x r3=%x lr=%x" %
++              (pc, regs[0], regs[1], regs[2], regs[3], lr), flush=True)
++    else:
++        print("hit pc=%08x lr=%08x sp=%08x" % (pc, lr, sp))
++        print("  " + " ".join("r%d=%x" % (i, regs[i]) for i in range(13)))
++        raw = r.mem(sp, 0x200)
++        words = struct.unpack("<%dI" % (len(raw) // 4), raw)
++        walk = ["%x@+%x" % (w - 1, 4 * i) for i, w in enumerate(words)
++                if w & 1 and CODE_LO <= w < CODE_HI]
++        print("  stack code words:", " ".join(walk[:24]), flush=True)
++        for spec in filter(None, os.environ.get("MEM", "").split(",")):
++            a, n = spec.split(":")
++            print("  mem@%s:" % a, r.mem(int(a, 16), int(n, 0)).hex(),
++                  flush=True)
++    resume()
++
++r.s.sendall(b"\x03")                    # running: stop it before talking
++r.recv(timeout=10)
++for a in addrs:
++    r.cmd("z1,%x,2" % a)
++r.cmd("D;2")
++r.cmd("D;1")                            # the last detach resumes the machine
+-- 
+2.55.0
+

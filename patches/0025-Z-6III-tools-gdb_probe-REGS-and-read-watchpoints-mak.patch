@@ -1,0 +1,127 @@
+From b451b71ab8760eb7c3dde012e12e32568f582016 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 11:29:02 +0000
+Subject: [PATCH 25/47] Z 6III tools: gdb_probe REGS= and read watchpoints,
+ make_raw bit depth
+
+gdb_probe.py: REGS=19,20 adds registers to LIGHT mode's one-line hits
+(the exposure module keeps its frame entry in x19 at its sends), and
+WTYPE=3/4 makes WATCH= a read or access watchpoint (Z3/Z4) -- how the
+statistics buffer at 0xa255b7600 was shown not to be read by the CPU.
+
+make_raw.py: an optional fourth argument, the bit depth (12..16; 12, the
+default, writes the same bytes as before). Used to show that the
+exposure does not follow the statistics' scale.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ z63-tools/gdb_probe.py | 15 ++++++++++-----
+ z63-tools/make_raw.py  | 14 +++++++++-----
+ 2 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/z63-tools/gdb_probe.py b/z63-tools/gdb_probe.py
+index 2499281..5659845 100755
+--- a/z63-tools/gdb_probe.py
++++ b/z63-tools/gdb_probe.py
+@@ -12,10 +12,12 @@ on /tmp/bt-qmp.sock while it runs. Environment:
+                lr -- for tracing a function's
+                every call, e.g. the capture modules' trace sub_40FD183C
+                (x0 category, x1 code, x2/x3 arguments)
++  REGS=19,20   with LIGHT, also print these registers (x19=.. x20=..)
+   MEMREG=r:n   also dump n bytes at the address in x<r>
+   DUMP=n       also dump n bytes of the stack as u32
+   KEYS="t:keys;t:keys"  set -machine mcu-keys at t seconds (host time)
+   WATCH=a:n    write watchpoint (unreliable in this setup -- see plan.md)
++  WTYPE=3      with WATCH: 3 for a read watchpoint, 4 for any access
+   ATTACH=1     do not start QEMU: attach to a machine already running with
+                -gdb tcp:127.0.0.1:41234 (<qemu> <machine opts> <eg> are
+                ignored; pass "-"), and detach at the end, which resumes it.
+@@ -80,7 +82,8 @@ for a in addrs:
+ WATCH = os.environ.get("WATCH")        # "addr:len" write watchpoint
+ if WATCH:
+     wa, wl = WATCH.split(":")
+-    print("Z2", wa, r.cmd("Z2,%s,%s" % (wa, wl)))
++    wt = os.environ.get("WTYPE", "2")
++    print("Z" + wt, wa, r.cmd("Z%s,%s,%s" % (wt, wa, wl)))
+ r.send(b"c")
+ KEYS = os.environ.get("KEYS")          # "delay:keys;delay:keys" via qom-set
+ if KEYS:
+@@ -120,8 +123,10 @@ while time.time() < deadline and hits < maxhits:
+         r.send(b"c")
+         continue
+     if os.environ.get("LIGHT"):
+-        print("T %.3f %x %x %x %x %x lr=%x" % (time.time() - t_start, pc, regs[0],
+-              regs[1], regs[2], regs[3], regs[30]), flush=True)
++        extra = "".join(" x%s=%x" % (n, regs[int(n)])
++                        for n in os.environ.get("REGS", "").split(",") if n)
++        print("T %.3f %x %x %x %x %x lr=%x%s" % (time.time() - t_start, pc, regs[0],
++              regs[1], regs[2], regs[3], regs[30], extra), flush=True)
+         hits += 1
+         for a in addrs:
+             r.cmd("z1,%x,4" % a)
+@@ -154,12 +159,12 @@ while time.time() < deadline and hits < maxhits:
+     for a in addrs:
+         r.cmd("z1,%x,4" % a)
+     if WATCH:
+-        r.cmd("z2,%s,%s" % (wa, wl))
++        r.cmd("z%s,%s,%s" % (wt, wa, wl))
+     r.cmd("s")
+     for a in addrs:
+         r.cmd("Z1,%x,4" % a)
+     if WATCH:
+-        r.cmd("Z2,%s,%s" % (wa, wl))
++        r.cmd("Z%s,%s,%s" % (wt, wa, wl))
+     r.send(b"c")
+ if q:
+     q.kill()
+diff --git a/z63-tools/make_raw.py b/z63-tools/make_raw.py
+index 50bc593..7fc5f1f 100644
+--- a/z63-tools/make_raw.py
++++ b/z63-tools/make_raw.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """Write a synthetic NZ9RAW1 Bayer file for -machine z9-capture-raw=.
+ 
+-    make_raw.py <out.raw> [width height]          (default 640 480)
++    make_raw.py <out.raw> [width height [bits]]   (default 640 480 12)
+ 
+ The format is ../z9-qemu's (tools/make_cmos.py, whose statistics model and
+ RAW pipeline read it, see hw/arm/nikon-z63-z9lab.c statistics_load): the
+@@ -9,7 +9,7 @@ RAW pipeline read it, see hw/arm/nikon-z63-z9lab.c statistics_load): the
+ cfa (0 = RGGB), black, white, then width*height little-endian u16 samples.
+ 
+ The picture is that tool's default -- eight colour bars, darkening towards
+-the top -- made linear and laid out RGGB at 12 bits. It is an input chosen
++the top -- made linear and laid out RGGB at 12 bits (or the bits given, 12..16). It is an input chosen
+ for the run so a frame has something recognisable in it; nothing about it
+ describes the Z 6III's sensor or its readout.
+ """
+@@ -18,8 +18,12 @@ import sys
+ 
+ out = sys.argv[1]
+ w, h = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) > 3 else (640, 480)
++bits = int(sys.argv[4]) if len(sys.argv) > 4 else 12
++white = (1 << bits) - 1
+ if w % 2 or h % 2 or w < 60 or h < 24:
+     sys.exit("even dimensions, at least 60x24")
++if not 12 <= bits <= 16:
++    sys.exit("bits 12..16")
+ bars = [(1, 1, 1), (1, 1, 0), (0, 1, 1), (0, 1, 0),
+         (1, 0, 1), (1, 0, 0), (0, 0, 1), (0, 0, 0)]
+ 
+@@ -35,9 +39,9 @@ for y in range(h):
+     for x in range(w):
+         rgb = bars[x * 8 // w]
+         ch = (0, 1)[x & 1] if not y & 1 else (1, 2)[x & 1]   # RGGB
+-        row += struct.pack("<H", round(linear(rgb[ch] * gain) * 4095))
++        row += struct.pack("<H", round(linear(rgb[ch] * gain) * white))
+     rows.append(bytes(row))
+ with open(out, "wb") as f:
+-    f.write(struct.pack("<8s6I", b"NZ9RAW1\0", w, h, 12, 0, 0, 4095))
++    f.write(struct.pack("<8s6I", b"NZ9RAW1\0", w, h, bits, 0, 0, white))
+     f.write(b"".join(rows))
+-print("wrote %s (%dx%d RGGB, 12-bit, synthetic bars)" % (out, w, h))
++print("wrote %s (%dx%d RGGB, %d-bit, synthetic bars)" % (out, w, h, bits))
+-- 
+2.55.0
+

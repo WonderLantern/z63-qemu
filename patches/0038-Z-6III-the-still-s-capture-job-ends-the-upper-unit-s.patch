@@ -1,0 +1,160 @@
+From 9f6e4f23bec0cb76817622628c24b47739835af7 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 19:21:45 +0000
+Subject: [PATCH 38/47] Z 6III: the still's capture job ends -- the upper
+ unit's +0x14 at the still's frame end
+
+With z63-still-capture, a release now completes the front end's capture
+job: 0x422D0001 (units 0x401e, posted by sub_4102C770) ends, the front
+end gets 0x41D0001 (sub_410B05A8) as its flag 0x4000, and the capture
+service gets the RAW-done event 0x40F0009 (DC08 bit 1).
+
+The job ends only on job flag 1, which the 0x106 ISR's callback
+sub_40CAE2EC raises for +0x204 bit 6 when the upper unit's +0x10 or
++0x14 bit 0 is set (sub_40CAD5F0 -> sub_40C1F1B0, base 0x150c8000 via
+the handle at 0xA03051458). The image sets those two bits in exactly one
+place, the upper's configuration slot +40 (sub_40C1DF50 from
+sub_40CAD020/278). For live view that slot comes from a per-mode table at
+0x47e80000 + 0x66f0 (sub_411712C8, index map at +0x58f0): resource 0x5f
+of SNOR_USER, which this image's SNOR_USER holds only in part -- the
+table and its index map are zeros, so both bits are always written 0.
+The capture job's own upper configuration is empty. So the still's frame
+end now also sets +0x14 bit 0; the next configuration of the upper
+writes it again. DECLARED: that the still's frame end marks a capture's
+frame, in place of the missing parameter.
+
+Where the still stops now. After 0x40F0009 the capture service waits for
+the image-available event 0x40F0004, which the front end sends only when
+its still job 0x422D0003 ends with live view stopped (sub_41020C74, case
+0x41D0004). That job is posted only on the development path: the ready
+combination 0x34C04 (sub_40F749EC -> sub_40F7A058 -> 0x40F7B930 ->
+sub_4102DE1C), entered from the release controller's stage 32
+(sub_40FBB958 -> sub_40F5EB4C, CFEC state 1), or the 0x206E path
+(sub_4102E1B0, sub_40F68510). Both need at least one image output:
+sub_40F79248 asks sub_40EAE230 for outputs 0..5 of the capture's image
+configuration (the 62 items of 0xA02B5BB10, copied to 0xA03D7C62C), and
+every output is refused. Output 0 needs item 0x2750 == 3 (sub_40EADE38),
+0x2750 being the shooting-condition mirror of item 0x2A01 (index 69 of
+0xA0293C218, field 0xA03D53264); the others need the 18-byte maps
+0x2B01/0x2B03 (all 0xff). Item 0x274F, the output gate of sub_40EAE42C,
+is status 0x4000040D: byte 0 of the sensor module's frame record
+(0xA03625F18, from 0xA03625E30 = live-view object +0x35C == 1, i.e. the
+capture parameter +6976 < 2). Here +6976 = 2 because the readout type
+(+2380, sub_410B4580) is 2: it needs 0x2A01 == 3, or 0x2038 in {2, 3}
+with 0x3607 == 1. 0x2A01 is written by nothing in this run but the
+settings defaults (sub_410074E4); the release mask 0xA03D82254 (item
+0x274E) follows the outputs and is 0, so stage 32 is skipped. Changing
+image quality, or resetting the photo shooting menu, from the menu
+changes none of these.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c    | 22 +++++++++++++++++-----
+ hw/arm/nikon-z9-d980.h      |  4 +++-
+ z63-tools/import_z9lab.py   |  4 +++-
+ z63-tools/z9lab_attach.c.in | 22 +++++++++++++++++-----
+ 4 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index ca7358a..01668ce 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -18682,12 +18682,24 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+  *     and the periodic D980 path stays quiet, so the still's data is
+  *     written once, at that request. Each still re-arms the writer's done
+  *     status (group1 bit 26), which this image never acknowledges.
+- *     With the frame, the upper unit's frame ends: +0x204 bit 6, which the
+- *     0x106 ISR's callback sub_40CAE2EC passes to the front end as
+- *     0x41D0005 (the upper unit's +0x14 bit 0 is clear for this job).
++ *     With the frame, the upper unit's frame ends: +0x204 bit 6;
++ *   - the capture job (0x422D0001, posted by sub_4102C770 with the units
++ *     0x401e) ends only on job flag 1, which the 0x106 ISR's callback
++ *     sub_40CAE2EC raises for bit 6 when the upper's +0x10 or +0x14 bit 0
++ *     is set (sub_40CAD5F0 -> sub_40C1F1B0). Nothing else in the image
++ *     sets them but the upper's configuration (slot +40, sub_40C1DF50),
++ *     and for live view that comes from a per-mode parameter table at
++ *     0x47e80000 + 0x66f0 (sub_411712C8), in resource 0x5f of SNOR_USER,
++ *     which this image's SNOR_USER holds only in part: the table is zeros.
++ *     The capture job's own upper configuration is empty. So the still's
++ *     frame end also sets +0x14 bit 0, until the next configuration of
++ *     the upper writes it again; bit 6 then ends the capture job, whose
++ *     completion (0x41D0001, sub_410B05A8) is the front end's flag 0x4000.
+  *
+- * DECLARED: when the still frame arrives and that its frame end comes with
+- * it. The edits are in import_z9lab.py (section 8) and nikon-z9-d980.h.
++ * DECLARED: when the still frame arrives, that its frame end comes with
++ * it, and that it marks a capture's frame (+0x14 bit 0) in place of the
++ * missing parameter. The edits are in import_z9lab.py (section 8) and
++ * nikon-z9-d980.h.
+  */
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+diff --git a/hw/arm/nikon-z9-d980.h b/hw/arm/nikon-z9-d980.h
+index 159a24a..8733410 100644
+--- a/hw/arm/nikon-z9-d980.h
++++ b/hw/arm/nikon-z9-d980.h
+@@ -183,8 +183,10 @@ static void primary_d980_single_tick(void *opaque)
+         s->primary_d980_single_frames++;
+         if (s->z63_still) {
+             /* z63-still-capture: the upper unit's frame ends with the
+-             * still's data, +0x204 bit 6 (z9lab_attach.c.in). */
++             * still's data, +0x204 bit 6, and its +0x14 bit 0 says it
++             * was a capture's frame (z9lab_attach.c.in). */
+             s->engine150c_bit6_pending |= 0x40;
++            s->engine_150c_primary[0x14 / 4] |= 1;
+             s->z63_still_ends++;
+             engine150c_stop_irq_update(s);
+         }
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index 0d0c9b0..7f566ff 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -462,8 +462,10 @@ dedit("""        s->primary_d980_single_frames++;
+ """, """        s->primary_d980_single_frames++;
+         if (s->z63_still) {
+             /* z63-still-capture: the upper unit's frame ends with the
+-             * still's data, +0x204 bit 6 (z9lab_attach.c.in). */
++             * still's data, +0x204 bit 6, and its +0x14 bit 0 says it
++             * was a capture's frame (z9lab_attach.c.in). */
+             s->engine150c_bit6_pending |= 0x40;
++            s->engine_150c_primary[0x14 / 4] |= 1;
+             s->z63_still_ends++;
+             engine150c_stop_irq_update(s);
+         }
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 4558af2..ddad830 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -480,12 +480,24 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+  *     and the periodic D980 path stays quiet, so the still's data is
+  *     written once, at that request. Each still re-arms the writer's done
+  *     status (group1 bit 26), which this image never acknowledges.
+- *     With the frame, the upper unit's frame ends: +0x204 bit 6, which the
+- *     0x106 ISR's callback sub_40CAE2EC passes to the front end as
+- *     0x41D0005 (the upper unit's +0x14 bit 0 is clear for this job).
++ *     With the frame, the upper unit's frame ends: +0x204 bit 6;
++ *   - the capture job (0x422D0001, posted by sub_4102C770 with the units
++ *     0x401e) ends only on job flag 1, which the 0x106 ISR's callback
++ *     sub_40CAE2EC raises for bit 6 when the upper's +0x10 or +0x14 bit 0
++ *     is set (sub_40CAD5F0 -> sub_40C1F1B0). Nothing else in the image
++ *     sets them but the upper's configuration (slot +40, sub_40C1DF50),
++ *     and for live view that comes from a per-mode parameter table at
++ *     0x47e80000 + 0x66f0 (sub_411712C8), in resource 0x5f of SNOR_USER,
++ *     which this image's SNOR_USER holds only in part: the table is zeros.
++ *     The capture job's own upper configuration is empty. So the still's
++ *     frame end also sets +0x14 bit 0, until the next configuration of
++ *     the upper writes it again; bit 6 then ends the capture job, whose
++ *     completion (0x41D0001, sub_410B05A8) is the front end's flag 0x4000.
+  *
+- * DECLARED: when the still frame arrives and that its frame end comes with
+- * it. The edits are in import_z9lab.py (section 8) and nikon-z9-d980.h.
++ * DECLARED: when the still frame arrives, that its frame end comes with
++ * it, and that it marks a capture's frame (+0x14 bit 0) in place of the
++ * missing parameter. The edits are in import_z9lab.py (section 8) and
++ * nikon-z9-d980.h.
+  */
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+-- 
+2.55.0
+

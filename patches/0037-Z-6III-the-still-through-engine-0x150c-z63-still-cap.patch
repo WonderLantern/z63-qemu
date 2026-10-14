@@ -1,0 +1,1021 @@
+From 185fb661ad197d4cb3084ddcb91d4932e7b48d66 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 17:49:43 +0000
+Subject: [PATCH 37/47] Z 6III: the still through engine 0x150c --
+ z63-still-capture, and the capture models' timers
+
+A release now runs engine 0x150c through a still: the units reset, stop
+and start in this image's order, and the D980 writer puts the still's
+Bayer frame in memory at the front's request. No file is written yet;
+where the capture stops is below.
+
+The z9 attachment never created two timers ../z9-qemu's machine init
+does, the secondary-source timing and the D980 single-frame input, nor
+wired the still engines' interrupts. With the capture recipe on (the
+event1508-secondary-timing and primary-d980-single-frame models), the
+first still that armed one dereferenced a null timer: QEMU took SIGSEGV
+in timer_mod from a 0x1508 front write. Both timers are now created where
+the Z 9 init creates them, and engines 0x1540 (INTID 0x131), 0x1544
+(0xfd), 0x153 (251/252) and 0x15e2 (121) are wired. Each INTID is this
+image's own name for the block -- RAW1, RAWRS, SFLT0/SFLT1, JPEG_0 in
+hw/arm/nikon-z63-spi.h -- and nothing else on the board drives them.
+
+z63-still-capture (off by default; z9lab_attach.c.in has the whole
+story). ../z9-qemu's 0x150c rules, written for the Z 9, refused this
+image's still in one of two ways depending on timing:
+  - the bounded reset (0x150c0014 = 0xc7ff7f ... 0x4f04f) comes while live
+    view still runs; the model wanted the source timing stopped. Admitted
+    live: a reset needs no quiescence;
+  - the live-view units' stop (0x304f, kick 0x787d) and the direct stops
+    then find the units idle; idle stops complete at once;
+  - the commit/enable of the still units 0x401e comes with 19BC's
+    direct-stop cause still pending -- this image never acknowledges it
+    (not in its +0x200 mask); the unit may start again.
+The front then asks for the still frame (channel 0 mode 2 -> 3, source
+bitmap 0x200) with the frame timing still running, where the Z 9 had
+stopped it; the single-frame input now makes its one frame there, the
+periodic D980 path stays quiet, each still re-arms the writer's done
+status (group1 bit 26, never acknowledged here), and the upper unit's
+frame end, +0x204 bit 6, comes with the frame (sub_40CAE2EC passes it to
+the front end as 0x41D0005; the upper's +0x14 bit 0 is clear for this
+job). DECLARED: when the still frame arrives, and its frame end with it.
+The edits are import_z9lab.py section 8 and its new nikon-z9-d980.h pass.
+
+z63-miss-log=on names the writes the models decline (and, for 0x150c's
+control words, the model's admission state). z63-tools/plugins/z63ftrace.c
+lists the first call of each of a set of functions after a trigger (here
+the release), with a "new" mark for those never run before it: the tool
+that found the frontier below.
+
+Where the still stops. The release controller (0xA03D81940, steps through
+stage bits 32 -> 1024 -> 0x8000 -> 0x10000 -> ...) builds the capture
+request (sub_40F5D9B4, release type 0 = single frame) and the capture
+service fills its parameters from settings: 0xA03D7C628 is shooting
+setting 0x206E (8302), stored at 0xA03F1D16C, range 0..2, 0 in this
+body. sub_40F5E708 returns 0 for it, so 0xA03D7C760 = 0 and the service
+takes its other path (state 0xA03D7CFEC 0 -> 4 -> 5 -> 6, release stage
+0x10000 waiting for 0x40C000E). That path completes only on the front
+end's image event 4 (sub_41020C74 after the still job 0x422D0003 ends)
+and the still job is never started on it. Set to 1 by hand (gdb stub,
+a test only), the service sets ready bit 1, the 0x4401 combination in
+sub_40F749EC starts the front end's still (sub_4102E1B0 ->
+sub_410ACE1C(2) -> job 0x422D0003, units 2 then 8), the capture job
+0x422D0001 starts 0x401e, the sensor exposes and reads out, and the
+service waits in state 0xe (0xA03D7CFEC = 6) for that image event. What
+0x206E is, and why its value decides, is the next question.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c      | 168 +++++++++++++++++++++++++--
+ hw/arm/nikon-z9-d980.h        |  15 ++-
+ z63-tools/import_z9lab.py     | 143 ++++++++++++++++++++++-
+ z63-tools/plugins/z63ftrace.c | 213 ++++++++++++++++++++++++++++++++++
+ z63-tools/z9lab_attach.c.in   | 134 +++++++++++++++++++++
+ 5 files changed, 660 insertions(+), 13 deletions(-)
+ create mode 100644 z63-tools/plugins/z63ftrace.c
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index 334c09a..ca7358a 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -418,6 +418,8 @@ struct NikonZ9State {
+     unsigned z63_raw_owed;             /* capture ticks without their frame */
+     bool z63_path2_end;                /* z63-150c-path2-end: +0x210 bit 31 */
+     bool z63_sensor_vd;                /* z63-sensor-vd */
++    bool z63_still;                    /* z63-still-capture */
++    uint64_t z63_still_ends;           /* still frames ended with their data */
+     bool z63_sensor_started;           /* capture timing has run */
+     uint64_t z63_sensor_frames;
+     uint8_t *raw_pipeline_cache[3];
+@@ -9792,6 +9794,7 @@ static bool primary_bounded_reset_write(NikonZ9State *s, hwaddr addr,
+      * IMPRSZ pending causes and RAM intact. No native state is patched. */
+     raw_quiescent |= s->primary_stopped_source_reset_model &&
+                      !s->event_timing_active;
++    raw_quiescent |= s->z63_still;      /* z63-still-capture */
+     uint32_t allowed = raw_quiescent ? (0x73f7f | (s->primary_d980_stream_model ? 0x4000 : 0) | (s->config150d_model ? 0x8000 : 0)) : 14;
+     uint32_t live = s->engine150c_active | s->engine150c_latched |
+                     s->engine150c_stop_requested | s->engine150c_stop_done |
+@@ -9935,14 +9938,15 @@ static bool engine150c_stop_write(NikonZ9State *s, hwaddr addr,
+                 !(s->event_pending_1508 & 1);
+             uint32_t command_engines = direct_engines | (capture_command ? 0xe : 0);
+             uint32_t inactive = value & ~s->engine150c_active;
+-            bool idle_ok = s->primary_reset_idle_stop_model && s->primary_reset_count &&
++            bool idle_ok = s->z63_still ||    /* z63-still-capture */
++                (s->primary_reset_idle_stop_model && s->primary_reset_count &&
+                 !s->primary_reset_stage && !s->event_timing_active &&
+-                !(inactive & ~s->primary_reset_previous_units);
++                !(inactive & ~s->primary_reset_previous_units));
+             if (size != 4 || (value & ~command_engines) ||
+-                (capture_command && !capture_drained) ||
++                (capture_command && !capture_drained && !s->z63_still) ||
+                 (inactive && !idle_ok) ||
+-                (value & (s->engine150c_direct_stop_done &
+-                    ~(capture_drained ? s->primary_idle_direct_done : 0)))) {
++                (!s->z63_still && (value & (s->engine150c_direct_stop_done &
++                    ~(capture_drained ? s->primary_idle_direct_done : 0))))) {
+                 goto invalid;
+             }
+             if (inactive) {
+@@ -9983,9 +9987,10 @@ static bool engine150c_stop_write(NikonZ9State *s, hwaddr addr,
+             return true;
+         }
+         uint32_t inactive = value & ~s->engine150c_active;
+-        bool idle_ok = s->primary_reset_idle_stop_model && s->primary_reset_count &&
++        bool idle_ok = s->z63_still ||        /* z63-still-capture */
++            (s->primary_reset_idle_stop_model && s->primary_reset_count &&
+             !s->primary_reset_stage && !s->event_timing_active &&
+-            !(inactive & ~s->primary_reset_previous_units);
++            !(inactive & ~s->primary_reset_previous_units));
+         if (size != 4 || !value || (value & ~allowed_engines) ||
+             (inactive && !idle_ok) ||
+             (value & (s->engine150c_stop_requested | s->engine150c_stop_done))) {
+@@ -10022,7 +10027,7 @@ static bool engine150c_stop_write(NikonZ9State *s, hwaddr addr,
+         uint32_t allowed = addr == 0x150c021c ? engine150c_stop_causes(allowed_engines) :
+                            addr == 0x150c0204 ? (primary_direct_map(direct_engines, 0, false) | (s->primary_empty_end_model ? 0x108000 : 0) |
+                                                 (s->engine150c_bit2_model ? 4 : 0) |
+-                                                (s->engine150c_bit6_model ? 0x40 : 0)) :
++                                                ((s->engine150c_bit6_model || s->z63_still) ? 0x40 : 0)) :
+                            (primary_direct_map(direct_engines, 1, false) | (s->statistics_model ? 0x20 : 0) |
+                             (s->raw_pipeline_model ? 0x60000000 : 0) |
+                              (s->primary_d980_stream_model ? 0x4000000 : 0) |
+@@ -10210,16 +10215,21 @@ static bool engine150c_control_write(NikonZ9State *s, hwaddr addr,
+     }
+     if (s->primary_d980_stream_model) { allowed |= 0x4000; }
+     if (s->config150d_model) { allowed |= 0x8000; }
++    /* z63-still-capture: a unit whose direct stop is unacknowledged may
++     * be committed and enabled again; its old cause owns no new latch. */
++    uint32_t z63_redone = s->z63_still ? (value & s->engine150c_direct_stop_done) : 0;
+     if (size != 4 || !value || (value & ~allowed) ||
+         s->primary_reset_stage ||
+         (primary_empty_end_causes(value) & s->primary_empty_end_pending) ||
+         (addr == 0x150c0008 && (value & s->engine150c_active)) ||
+         (s->engine150c_stop_model &&
+          (value & (s->engine150c_stop_requested | s->engine150c_stop_done |
+-                   (s->engine150c_direct_stop_done & ~s->primary_idle_direct_done))))) {
++                   (s->engine150c_direct_stop_done & ~s->primary_idle_direct_done &
++                    ~z63_redone))))) {
+         unknown_access(s, addr, value, size, true);
+         return true;
+     }
++    s->primary_idle_direct_done |= z63_redone;
+     if (addr == 0x150c0064) {
+         /* Native 40c1fb60 also submits shadow
+          * tables while the engine is active. Functional immediate latch;
+@@ -10390,6 +10400,12 @@ static bool engine150c_control_write(NikonZ9State *s, hwaddr addr,
+         }
+         s->primary_reset_previous_units &= ~value;
+         s->engine150c_active |= value;
++        if (s->z63_still && (value & 0x4000)) {
++            /* z63-still-capture: each still re-arms the writer's done
++             * status; this image never acknowledges group1 bit 26. */
++            s->primary_d980_pending = 0;
++            engine150c_stop_irq_update(s);
++        }
+         if (s->primary_d980_single_model && (value & 0x4000)) {
+             bool prepared = s->primary_d980_prepared;
+             s->primary_d980_prepared = false;
+@@ -18622,6 +18638,7 @@ static bool z63_z9lab_lv_frame_done_on = true;
+  * assumes; the content is the model's, as before.
+  */
+ static bool z63_z9lab_vd_statistics_on = true;
++static bool z63_z9lab_miss_log_on;        /* z63-miss-log, below */
+ 
+ 
+ 
+@@ -18639,6 +18656,40 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+     }
+ }
+ 
++/*
++ * z63-still-capture (off by default; for use with ../z9-qemu's capture
++ * models, the D980 writer among them). A release on this image drives
++ * engine 0x150c in an order ../z9-qemu's admission rules, written for the
++ * Z 9, refuse:
++ *
++ *   - it resets the units (0x150c0014 = 0xc7ff7f, 0x150c0000/04 =
++ *     0x17ff7f, 0x150c0014 = 0x4f04f; sub_40C1FD70..) while live view is
++ *     still running. The model admitted that only with the source timing
++ *     stopped. A reset needs no quiescence: here it is admitted live;
++ *   - it then stops the live-view units (0x150c000c = 0x304f, kick 0x787d)
++ *     and the direct units (0x10, 0x100 .. 0x800), now idle. Stopping an
++ *     idle unit completes at once (the model's idle-stop rule, without its
++ *     timing conditions);
++ *   - it commits and enables the still units 0x401e (upper 2, E 4, 0x150d
++ *     8, 19BC 0x10, D980 0x4000) while 19BC's direct-stop cause is still
++ *     pending: this image never acknowledges that cause (it is not in its
++ *     +0x200 mask). The unit may start again; its old cause keeps no claim
++ *     on the new latch;
++ *   - the front then asks for the still frame -- channel 0 mode 2 -> 3,
++ *     source bitmap 0x200 -- with the frame timing still running, where the
++ *     Z 9 had stopped it. ../z9-qemu's single-frame input
++ *     (primary-d980-single-frame-model) makes its one frame there anyway,
++ *     and the periodic D980 path stays quiet, so the still's data is
++ *     written once, at that request. Each still re-arms the writer's done
++ *     status (group1 bit 26), which this image never acknowledges.
++ *     With the frame, the upper unit's frame ends: +0x204 bit 6, which the
++ *     0x106 ISR's callback sub_40CAE2EC passes to the front end as
++ *     0x41D0005 (the upper unit's +0x14 bit 0 is clear for this job).
++ *
++ * DECLARED: when the still frame arrives and that its frame end comes with
++ * it. The edits are in import_z9lab.py (section 8) and nikon-z9-d980.h.
++ */
++
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                       MemoryRegion *dram, MemoryRegion *buffer_ext,
+                       const char *props, Error **errp);
+@@ -18660,6 +18711,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     bool path2_end = false;
+     bool sensor_vd = false;
+     bool lane0_ack = false;
++    bool still = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -18683,6 +18735,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-miss-log")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-miss-log wants on or off");
++                goto fail;
++            }
++            z63_z9lab_miss_log_on = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-vd-statistics")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-vd-statistics wants on "
+@@ -18701,6 +18761,15 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             z63_z9lab_lv_frame_done_on = !strcmp(kv[1], "on");
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-still-capture")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-still-capture wants on "
++                           "or off");
++                goto fail;
++            }
++            still = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-sensor-vd")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-sensor-vd wants on or off");
+@@ -18788,6 +18857,31 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     }
+     s->event_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_timing_expire, s);
++    /*
++     * The still pipeline's engines and timers, created where ../z9-qemu's
++     * machine init creates them. Each INTID is this image's own name for
++     * the block (hw/arm/nikon-z63-spi.h), and none is driven by anything
++     * else on the board: 0x131 RAW1 (engine 0x1540's frame cause), 0xfd
++     * RAWRS (engine 0x1544's copy), 251/252 SFLT0/SFLT1 (engine 0x153),
++     * 121 JPEG_0 (engine 0x15e2). The timers are the secondary-source timing
++     * and the D980 single-frame input: without them the first still that
++     * armed one dereferenced a null timer (timer_mod from a front write).
++     */
++    s->engine1540_frame_irq = qdev_get_gpio_in(gic, 0x131 - 32);
++    s->engine1544_copy_irq = qdev_get_gpio_in(gic, 0xfd - 32);
++    if (s->engine153_frame_pass_model || s->engine153_inplace_identity_model) {
++        s->engine153_irq[0] = qdev_get_gpio_in(gic, 251 - 32);
++        s->engine153_irq[1] = qdev_get_gpio_in(gic, 252 - 32);
++    }
++    if (s->engine15e2_jpeg_model) {
++        s->engine15e2_jpeg_irq = qdev_get_gpio_in(gic, 121 - 32);
++    }
++    s->event_secondary_timing_timer =
++        timer_new_ns(QEMU_CLOCK_VIRTUAL, event_secondary_timing_expire, s);
++    if (s->primary_d980_single_model) {
++        s->primary_d980_single_timer =
++            timer_new_ns(QEMU_CLOCK_VIRTUAL, primary_d980_single_tick, s);
++    }
+     /* The multi-IO timer block (0x0e000000/0x0e001000), wired as
+      * ../z9-qemu's machine init wires it: channel n on INTID 0x9b + n. This
+      * image's own driver init (sub_40C19A7C) enables exactly 155..167, and
+@@ -18832,6 +18926,12 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         goto fail;
+     }
+     s->z63_sensor_vd = sensor_vd;
++    if (still && (!boundary_ms || !s->engine150c_stop_model)) {
++        error_setg(errp, "z9-capture: z63-still-capture needs "
++                   "z63-boundary-ms and engine150c-stop-model");
++        goto fail;
++    }
++    s->z63_still = still;
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+@@ -18867,6 +18967,39 @@ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size, uint64_t *value)
+     return !s->compat_miss;
+ }
+ 
++/*
++ * z63-miss-log=on: name the writes the models decline. A declined write
++ * falls through to the board's own window, which stores it and says
++ * nothing -- so a model refusing a start (its admission rules) and a
++ * register no model covers look the same from outside. Each address is
++ * named for its first four distinct values, the PC with it; a declined
++ * write to engine 0x150c's control words also prints the model's admission
++ * state (active/latched/stop/reset), which is what decides. A debugging
++ * aid; off by default.
++ */
++static GHashTable *z63_z9lab_missed;
++
++static void z63_z9lab_log_miss(hwaddr addr, uint64_t value, unsigned size)
++{
++    uint64_t key = addr ^ (value << 32);
++    unsigned n;
++
++    if (!z63_z9lab_missed) {
++        z63_z9lab_missed = g_hash_table_new(g_int64_hash, g_int64_equal);
++    }
++    n = GPOINTER_TO_UINT(g_hash_table_lookup(z63_z9lab_missed, &addr));
++    if (n >= 4 || g_hash_table_contains(z63_z9lab_missed, &key)) {
++        return;
++    }
++    g_hash_table_insert(z63_z9lab_missed, g_memdup2(&addr, sizeof(addr)),
++                        GUINT_TO_POINTER(n + 1));
++    g_hash_table_insert(z63_z9lab_missed, g_memdup2(&key, sizeof(key)),
++                        GUINT_TO_POINTER(1));
++    fprintf(stderr, "Z63_Z9LAB_MISS write 0x%" HWADDR_PRIx " = 0x%" PRIx64
++            " (%u) pc=0x%" PRIx64 "\n", addr, value, size,
++            current_cpu ? ARM_CPU(current_cpu)->env.pc : 0);
++}
++
+ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+ {
+     NikonZ9State *s = NIKON_Z9_LAB(obj);
+@@ -18874,6 +19007,23 @@ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+ 
+     s->compat_miss = false;
+     unknown_write(s, addr, value, size);
++    if (s->compat_miss && z63_z9lab_miss_log_on) {
++        z63_z9lab_log_miss(addr, value, size);
++        if ((addr & ~0x7cull) == 0x150c0000 || addr == 0x150c0064) {
++            fprintf(stderr, "Z63_Z9LAB_MISS 150c state: active=%x latched=%x "
++                    "configured=%x req=%x done=%x dstop_done=%x idle_done=%x "
++                    "empty_end=%x reset_stage=%u resets=%" PRIu64
++                    " prev=%x timing=%d d980_submits=%" PRIu64 " d980_ready=%d\n",
++                    s->engine150c_active, s->engine150c_latched,
++                    s->engine150c_configured,
++                    s->engine150c_stop_requested, s->engine150c_stop_done,
++                    s->engine150c_direct_stop_done, s->primary_idle_direct_done,
++                    s->primary_empty_end_pending, s->primary_reset_stage,
++                    (uint64_t)s->primary_reset_count,
++                    s->primary_reset_previous_units, s->event_timing_active,
++                    (uint64_t)s->primary_d980_submits, primary_d980_ready(s));
++        }
++    }
+     if (addr == 0x150c0008 && s->zr_primary_bank1_model &&
+         (s->engine150c_active & ~was & 2)) {
+         z63_z9lab_150c_started(s);
+diff --git a/hw/arm/nikon-z9-d980.h b/hw/arm/nikon-z9-d980.h
+index d176d30..159a24a 100644
+--- a/hw/arm/nikon-z9-d980.h
++++ b/hw/arm/nikon-z9-d980.h
+@@ -146,6 +146,9 @@ static bool primary_d980_receive(NikonZ9State *s, bool single_input)
+ 
+ static void primary_d980_tick(NikonZ9State *s)
+ {
++    if (s->z63_still) {
++        return;     /* z63-still-capture: the still's frame comes at readout */
++    }
+     primary_d980_receive(s, false);
+ }
+ 
+@@ -163,7 +166,8 @@ static void primary_d980_single_tick(void *opaque)
+     NikonZ9State *s = opaque;
+     if (!s->primary_d980_single_armed) { return; }
+     if (s->primary_reset_stage || !(s->engine150c_active & 0x4000) ||
+-        s->event_timing_active || ++s->primary_d980_single_attempts > 64) {
++        (s->event_timing_active && !s->z63_still) ||
++        ++s->primary_d980_single_attempts > 64) {
+         primary_d980_single_cancel(s);
+         return;
+     }
+@@ -177,6 +181,13 @@ static void primary_d980_single_tick(void *opaque)
+         s->primary_d980_single_armed = false;
+         s->primary_d980_single_epoch = s->primary_d980_input_epoch;
+         s->primary_d980_single_frames++;
++        if (s->z63_still) {
++            /* z63-still-capture: the upper unit's frame ends with the
++             * still's data, +0x204 bit 6 (z9lab_attach.c.in). */
++            s->engine150c_bit6_pending |= 0x40;
++            s->z63_still_ends++;
++            engine150c_stop_irq_update(s);
++        }
+         if (s->primary_d980_source_notify_model) {
+             /* Notify the existing source wait only after the complete DMA.
+              * Both original callbacks map group1 bit29 to wait400000;
+@@ -214,7 +225,7 @@ static void primary_d980_single_mode(NikonZ9State *s, unsigned channel,
+                                     uint32_t previous, uint32_t value)
+ {
+     if (!s->primary_d980_single_model || channel || previous != 2 || value != 3 ||
+-        s->primary_reset_stage || s->event_timing_active) {
++        s->primary_reset_stage || (s->event_timing_active && !s->z63_still)) {
+         return;
+     }
+     if (!(s->engine150c_active & 0x4000)) {
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index 7c549ed..0d0c9b0 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -36,7 +36,14 @@ The edits, each asserted to match exactly once (or the stated count):
+      frame on the frame clock's capture tick, +0x210 bit 31 admitted to
+      engine 0x150c's W1C, FRECT_LV's frame count reset when its gate opens,
+      the RSZ E unit's arming -- and in nikon-z9-pixels.h the frame's other
+-     completions. With every switch off the models behave as ../z9-qemu's.
++     completions. With every switch off the models behave as ../z9-qemu's;
++  8. the Z 6III's still-capture edits, behind z63-still-capture (documented
++     in the attachment): engine 0x150c's bounded reset, idle stops and the
++     restart of a unit whose direct-stop cause is unacknowledged admitted
++     in the order this image issues them, +0x204 bit 6 admitted to the W1C,
++     and in nikon-z9-d980.h the single still frame made at the front's
++     request while the frame timing runs, the periodic path held off, and
++     the upper unit's frame end with it. Off, the models behave as before.
+ 
+ Nothing else in the files is changed. Re-run after updating ../z9-qemu and
+ review the diff; a failed assertion means the source moved under an edit.
+@@ -279,6 +286,90 @@ edit("""    s->engine1542_config[i][off / 4] = value;
+     if (s->engine1542_ram_input_model && i == 2) {
+ """)
+ 
++# 8. The Z 6III's still capture (z63-still-capture, documented in
++# z9lab_attach.c.in): engine 0x150c's bounded reset, its stops and its
++# restart admitted in the order this image issues them.
++edit("    bool z63_sensor_vd;                /* z63-sensor-vd */\n",
++     "    bool z63_sensor_vd;                /* z63-sensor-vd */\n"
++     "    bool z63_still;                    /* z63-still-capture */\n"
++     "    uint64_t z63_still_ends;           /* still frames ended with their data */\n")
++edit("""    raw_quiescent |= s->primary_stopped_source_reset_model &&
++                     !s->event_timing_active;
++""", """    raw_quiescent |= s->primary_stopped_source_reset_model &&
++                     !s->event_timing_active;
++    raw_quiescent |= s->z63_still;      /* z63-still-capture */
++""")
++edit("""            bool idle_ok = s->primary_reset_idle_stop_model && s->primary_reset_count &&
++                !s->primary_reset_stage && !s->event_timing_active &&
++                !(inactive & ~s->primary_reset_previous_units);
++            if (size != 4 || (value & ~command_engines) ||
++                (capture_command && !capture_drained) ||
++                (inactive && !idle_ok) ||
++                (value & (s->engine150c_direct_stop_done &
++                    ~(capture_drained ? s->primary_idle_direct_done : 0)))) {
++""", """            bool idle_ok = s->z63_still ||    /* z63-still-capture */
++                (s->primary_reset_idle_stop_model && s->primary_reset_count &&
++                !s->primary_reset_stage && !s->event_timing_active &&
++                !(inactive & ~s->primary_reset_previous_units));
++            if (size != 4 || (value & ~command_engines) ||
++                (capture_command && !capture_drained && !s->z63_still) ||
++                (inactive && !idle_ok) ||
++                (!s->z63_still && (value & (s->engine150c_direct_stop_done &
++                    ~(capture_drained ? s->primary_idle_direct_done : 0))))) {
++""")
++edit("""        bool idle_ok = s->primary_reset_idle_stop_model && s->primary_reset_count &&
++            !s->primary_reset_stage && !s->event_timing_active &&
++            !(inactive & ~s->primary_reset_previous_units);
++        if (size != 4 || !value || (value & ~allowed_engines) ||
++""", """        bool idle_ok = s->z63_still ||        /* z63-still-capture */
++            (s->primary_reset_idle_stop_model && s->primary_reset_count &&
++            !s->primary_reset_stage && !s->event_timing_active &&
++            !(inactive & ~s->primary_reset_previous_units));
++        if (size != 4 || !value || (value & ~allowed_engines) ||
++""")
++edit("""                                                (s->engine150c_bit6_model ? 0x40 : 0)) :
++""", """                                                ((s->engine150c_bit6_model || s->z63_still) ? 0x40 : 0)) :
++""")
++edit("""    if (size != 4 || !value || (value & ~allowed) ||
++        s->primary_reset_stage ||
++        (primary_empty_end_causes(value) & s->primary_empty_end_pending) ||
++        (addr == 0x150c0008 && (value & s->engine150c_active)) ||
++        (s->engine150c_stop_model &&
++         (value & (s->engine150c_stop_requested | s->engine150c_stop_done |
++                   (s->engine150c_direct_stop_done & ~s->primary_idle_direct_done))))) {
++        unknown_access(s, addr, value, size, true);
++        return true;
++    }
++""", """    /* z63-still-capture: a unit whose direct stop is unacknowledged may
++     * be committed and enabled again; its old cause owns no new latch. */
++    uint32_t z63_redone = s->z63_still ? (value & s->engine150c_direct_stop_done) : 0;
++    if (size != 4 || !value || (value & ~allowed) ||
++        s->primary_reset_stage ||
++        (primary_empty_end_causes(value) & s->primary_empty_end_pending) ||
++        (addr == 0x150c0008 && (value & s->engine150c_active)) ||
++        (s->engine150c_stop_model &&
++         (value & (s->engine150c_stop_requested | s->engine150c_stop_done |
++                   (s->engine150c_direct_stop_done & ~s->primary_idle_direct_done &
++                    ~z63_redone))))) {
++        unknown_access(s, addr, value, size, true);
++        return true;
++    }
++    s->primary_idle_direct_done |= z63_redone;
++""")
++edit("""        s->primary_reset_previous_units &= ~value;
++        s->engine150c_active |= value;
++        if (s->primary_d980_single_model && (value & 0x4000)) {
++""", """        s->primary_reset_previous_units &= ~value;
++        s->engine150c_active |= value;
++        if (s->z63_still && (value & 0x4000)) {
++            /* z63-still-capture: each still re-arms the writer's done
++             * status; this image never acknowledges group1 bit 26. */
++            s->primary_d980_pending = 0;
++            engine150c_stop_irq_update(s);
++        }
++        if (s->primary_d980_single_model && (value & 0x4000)) {
++""")
++
+ # nikon-z9-pixels.h, with its own z63 edits (7).
+ pixels = (src / "nikon-z9-pixels.h").read_text()
+ 
+@@ -337,9 +428,56 @@ pedit("""    s->raw_pipeline_frames++;
+     s->raw_pipeline_bytes += total;
+ """)
+ 
++# nikon-z9-d980.h, with the still capture's edits (8).
++d980 = (src / "nikon-z9-d980.h").read_text()
++
++
++def dedit(old, new):
++    global d980
++    n = d980.count(old)
++    if n != 1:
++        sys.exit("nikon-z9-d980.h: expected 1 match, found %d:\n%s" % (n, old))
++    d980 = d980.replace(old, new)
++
++
++dedit("""static void primary_d980_tick(NikonZ9State *s)
++{
++    primary_d980_receive(s, false);
++}
++""", """static void primary_d980_tick(NikonZ9State *s)
++{
++    if (s->z63_still) {
++        return;     /* z63-still-capture: the still's frame comes at readout */
++    }
++    primary_d980_receive(s, false);
++}
++""")
++dedit("""    if (s->primary_reset_stage || !(s->engine150c_active & 0x4000) ||
++        s->event_timing_active || ++s->primary_d980_single_attempts > 64) {
++""", """    if (s->primary_reset_stage || !(s->engine150c_active & 0x4000) ||
++        (s->event_timing_active && !s->z63_still) ||
++        ++s->primary_d980_single_attempts > 64) {
++""")
++dedit("""        s->primary_d980_single_frames++;
++""", """        s->primary_d980_single_frames++;
++        if (s->z63_still) {
++            /* z63-still-capture: the upper unit's frame ends with the
++             * still's data, +0x204 bit 6 (z9lab_attach.c.in). */
++            s->engine150c_bit6_pending |= 0x40;
++            s->z63_still_ends++;
++            engine150c_stop_irq_update(s);
++        }
++""")
++dedit("""    if (!s->primary_d980_single_model || channel || previous != 2 || value != 3 ||
++        s->primary_reset_stage || s->event_timing_active) {
++""", """    if (!s->primary_d980_single_model || channel || previous != 2 || value != 3 ||
++        s->primary_reset_stage || (s->event_timing_active && !s->z63_still)) {
++""")
++
+ attach = (here / "z9lab_attach.c.in").read_text()
+ (tree / "hw/arm/nikon-z63-z9lab.c").write_text(head + lab + attach)
+ (tree / "hw/arm/nikon-z9-pixels.h").write_text(pixels)
++(tree / "hw/arm/nikon-z9-d980.h").write_text(d980)
+ # 2, in nikon-z9-pcie.h: the board's DRAM, not the machine's.
+ pcie = (src / "nikon-z9-pcie.h").read_text()
+ for old, new, n in (("MACHINE(s)->ram_size", "s->ram_size", 2),
+@@ -350,7 +488,8 @@ for old, new, n in (("MACHINE(s)->ram_size", "s->ram_size", 2),
+     pcie = pcie.replace(old, new)
+ (tree / "hw/arm/nikon-z9-pcie.h").write_text(pcie)
+ for header in sorted(src.glob("nikon-*.h")):
+-    if header.name not in ("nikon-z9-pixels.h", "nikon-z9-pcie.h"):
++    if header.name not in ("nikon-z9-pixels.h", "nikon-z9-pcie.h",
++                           "nikon-z9-d980.h"):
+         (tree / "hw/arm" / header.name).write_bytes(header.read_bytes())
+ print("wrote hw/arm/nikon-z63-z9lab.c (source sha256 %s) and the model "
+       "headers" % sha)
+diff --git a/z63-tools/plugins/z63ftrace.c b/z63-tools/plugins/z63ftrace.c
+new file mode 100644
+index 0000000..0a5ad22
+--- /dev/null
++++ b/z63-tools/plugins/z63ftrace.c
+@@ -0,0 +1,213 @@
++/*
++ * z63ftrace -- which functions run, for the first time, after a moment.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * A capture that stops part-way leaves every task idle in its message loop:
++ * nothing is blocked, the next step was simply never asked for. To see how
++ * far a sequence got, this plugin takes a list of A53 function entries
++ * (funcs=<file>, one address per line, as IDA lists them) and a trigger
++ * (after=<pc>, optionally afterx0=<value> for the first argument): every
++ * listed function's first call after the trigger is written as one line,
++ *
++ *   <us> cpu<n> first pc=0x40f62720 x0=0x5 x1=0x0 x2=0x0 from=0x40f7d078
++ *
++ * in order, with its first three arguments and return address; cap=<n>
++ * (default 1) allows more calls per function. At exit each listed function
++ * that ran after the trigger gets a summary line with its count and whether
++ * it had run before the trigger ("new" when not). <us> is host time since
++ * load, as in z63log.
++ *
++ *   use: -plugin z63-tools/plugins/libz63ftrace.dylib,funcs=f.txt,
++ *        after=0x40fc4140,afterx0=1,out=trace.txt
++ */
++#include <glib.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++#include <qemu-plugin.h>
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
++
++#define MAX_VCPUS 16
++
++typedef struct Func {
++    uint64_t pc;
++    uint64_t before, after;
++} Func;
++
++static struct qemu_plugin_register *arg[MAX_VCPUS][3], *lr_reg[MAX_VCPUS];
++static GHashTable *funcs;               /* pc -> Func */
++static FILE *out;
++static GMutex lock;
++static int64_t t0;
++static uint64_t trigger_pc, trigger_x0, cap = 1;
++static bool trigger_x0_set, triggered;
++
++static uint64_t reg_u64(struct qemu_plugin_register *r)
++{
++    g_autoptr(GByteArray) buf = g_byte_array_new();
++    uint64_t v = 0;
++
++    if (!r) {
++        return 0;
++    }
++    qemu_plugin_read_register(r, buf);
++    memcpy(&v, buf->data, MIN(buf->len, sizeof(v)));
++    return v;
++}
++
++static void vcpu_init(qemu_plugin_id_t id, unsigned int idx)
++{
++    g_autoptr(GArray) regs = qemu_plugin_get_registers();
++
++    if (idx >= MAX_VCPUS) {
++        return;
++    }
++    for (guint i = 0; i < regs->len; i++) {
++        qemu_plugin_reg_descriptor *d =
++            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
++
++        for (int a = 0; a < 3; a++) {
++            char x[4];
++
++            snprintf(x, sizeof(x), "x%d", a);
++            if (!strcmp(d->name, x)) {
++                arg[idx][a] = d->handle;
++            }
++        }
++        if (!strcmp(d->name, "x30")) {
++            lr_reg[idx] = d->handle;
++        }
++    }
++}
++
++static void trigger_hit(unsigned int idx, void *udata)
++{
++    if (triggered || idx >= MAX_VCPUS || !arg[idx][0]) {
++        return;
++    }
++    if (trigger_x0_set && reg_u64(arg[idx][0]) != trigger_x0) {
++        return;
++    }
++    g_mutex_lock(&lock);
++    if (!triggered) {
++        triggered = true;
++        fprintf(out, "%" PRId64 " cpu%u trigger pc=0x%" PRIx64 "\n",
++                g_get_monotonic_time() - t0, idx, trigger_pc);
++    }
++    g_mutex_unlock(&lock);
++}
++
++static void func_hit(unsigned int idx, void *udata)
++{
++    Func *f = udata;
++
++    if (idx >= MAX_VCPUS || !arg[idx][0]) {
++        return;
++    }
++    if (!triggered) {
++        f->before++;
++        return;
++    }
++    if (f->after++ >= cap) {
++        return;
++    }
++    g_mutex_lock(&lock);
++    fprintf(out, "%" PRId64 " cpu%u first pc=0x%" PRIx64 " x0=0x%" PRIx64
++            " x1=0x%" PRIx64 " x2=0x%" PRIx64 " from=0x%" PRIx64 "%s\n",
++            g_get_monotonic_time() - t0, idx, f->pc, reg_u64(arg[idx][0]),
++            reg_u64(arg[idx][1]), reg_u64(arg[idx][2]),
++            reg_u64(lr_reg[idx]), f->before ? "" : " new");
++    g_mutex_unlock(&lock);
++}
++
++static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
++{
++    size_t n = qemu_plugin_tb_n_insns(tb);
++
++    for (size_t i = 0; i < n; i++) {
++        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
++        uint64_t pc = qemu_plugin_insn_vaddr(insn);
++        Func *f = g_hash_table_lookup(funcs, &pc);
++
++        if (pc == trigger_pc) {
++            qemu_plugin_register_vcpu_insn_exec_cb(
++                insn, trigger_hit, QEMU_PLUGIN_CB_R_REGS, NULL);
++        }
++        if (f) {
++            qemu_plugin_register_vcpu_insn_exec_cb(
++                insn, func_hit, QEMU_PLUGIN_CB_R_REGS, f);
++        }
++    }
++}
++
++static void summary(gpointer key, gpointer value, gpointer data)
++{
++    Func *f = value;
++
++    if (f->after) {
++        fprintf(out, "summary pc=0x%" PRIx64 " after=%" PRIu64
++                " before=%" PRIu64 "%s\n", f->pc, f->after, f->before,
++                f->before ? "" : " new");
++    }
++}
++
++static void at_exit(qemu_plugin_id_t id, void *p)
++{
++    g_hash_table_foreach(funcs, summary, NULL);
++    if (out && out != stderr) {
++        fclose(out);
++    }
++}
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
++                                           const qemu_info_t *info,
++                                           int argc, char **argv)
++{
++    const char *path = NULL, *list = NULL;
++    g_autofree char *text = NULL;
++
++    for (int i = 0; i < argc; i++) {
++        if (g_str_has_prefix(argv[i], "out=")) {
++            path = argv[i] + 4;
++        } else if (g_str_has_prefix(argv[i], "funcs=")) {
++            list = argv[i] + 6;
++        } else if (g_str_has_prefix(argv[i], "after=")) {
++            trigger_pc = g_ascii_strtoull(argv[i] + 6, NULL, 0);
++        } else if (g_str_has_prefix(argv[i], "afterx0=")) {
++            trigger_x0 = g_ascii_strtoull(argv[i] + 8, NULL, 0);
++            trigger_x0_set = true;
++        } else if (g_str_has_prefix(argv[i], "cap=")) {
++            cap = g_ascii_strtoull(argv[i] + 4, NULL, 0);
++        }
++    }
++    if (!list || !g_file_get_contents(list, &text, NULL, NULL)) {
++        fprintf(stderr, "z63ftrace: funcs=<file> is required\n");
++        return -1;
++    }
++    funcs = g_hash_table_new(g_int64_hash, g_int64_equal);
++    for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n")) {
++        Func *f = g_new0(Func, 1);
++
++        f->pc = g_ascii_strtoull(line, NULL, 0);
++        if (f->pc) {
++            g_hash_table_insert(funcs, &f->pc, f);
++        } else {
++            g_free(f);
++        }
++    }
++    triggered = !trigger_pc;
++    out = path ? fopen(path, "w") : stderr;
++    if (!out) {
++        return -1;
++    }
++    setvbuf(out, NULL, _IOLBF, 0);
++    t0 = g_get_monotonic_time();
++    fprintf(out, "# %u functions, trigger 0x%" PRIx64 "\n",
++            g_hash_table_size(funcs), trigger_pc);
++    qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
++    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
++    qemu_plugin_register_atexit_cb(id, at_exit, NULL);
++    return 0;
++}
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 1a39b7a..4558af2 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -436,6 +436,7 @@ static bool z63_z9lab_lv_frame_done_on = true;
+  * assumes; the content is the model's, as before.
+  */
+ static bool z63_z9lab_vd_statistics_on = true;
++static bool z63_z9lab_miss_log_on;        /* z63-miss-log, below */
+ 
+ 
+ 
+@@ -453,6 +454,40 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+     }
+ }
+ 
++/*
++ * z63-still-capture (off by default; for use with ../z9-qemu's capture
++ * models, the D980 writer among them). A release on this image drives
++ * engine 0x150c in an order ../z9-qemu's admission rules, written for the
++ * Z 9, refuse:
++ *
++ *   - it resets the units (0x150c0014 = 0xc7ff7f, 0x150c0000/04 =
++ *     0x17ff7f, 0x150c0014 = 0x4f04f; sub_40C1FD70..) while live view is
++ *     still running. The model admitted that only with the source timing
++ *     stopped. A reset needs no quiescence: here it is admitted live;
++ *   - it then stops the live-view units (0x150c000c = 0x304f, kick 0x787d)
++ *     and the direct units (0x10, 0x100 .. 0x800), now idle. Stopping an
++ *     idle unit completes at once (the model's idle-stop rule, without its
++ *     timing conditions);
++ *   - it commits and enables the still units 0x401e (upper 2, E 4, 0x150d
++ *     8, 19BC 0x10, D980 0x4000) while 19BC's direct-stop cause is still
++ *     pending: this image never acknowledges that cause (it is not in its
++ *     +0x200 mask). The unit may start again; its old cause keeps no claim
++ *     on the new latch;
++ *   - the front then asks for the still frame -- channel 0 mode 2 -> 3,
++ *     source bitmap 0x200 -- with the frame timing still running, where the
++ *     Z 9 had stopped it. ../z9-qemu's single-frame input
++ *     (primary-d980-single-frame-model) makes its one frame there anyway,
++ *     and the periodic D980 path stays quiet, so the still's data is
++ *     written once, at that request. Each still re-arms the writer's done
++ *     status (group1 bit 26), which this image never acknowledges.
++ *     With the frame, the upper unit's frame ends: +0x204 bit 6, which the
++ *     0x106 ISR's callback sub_40CAE2EC passes to the front end as
++ *     0x41D0005 (the upper unit's +0x14 bit 0 is clear for this job).
++ *
++ * DECLARED: when the still frame arrives and that its frame end comes with
++ * it. The edits are in import_z9lab.py (section 8) and nikon-z9-d980.h.
++ */
++
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                       MemoryRegion *dram, MemoryRegion *buffer_ext,
+                       const char *props, Error **errp);
+@@ -474,6 +509,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     bool path2_end = false;
+     bool sensor_vd = false;
+     bool lane0_ack = false;
++    bool still = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -497,6 +533,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-miss-log")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-miss-log wants on or off");
++                goto fail;
++            }
++            z63_z9lab_miss_log_on = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-vd-statistics")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-vd-statistics wants on "
+@@ -515,6 +559,15 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             z63_z9lab_lv_frame_done_on = !strcmp(kv[1], "on");
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-still-capture")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-still-capture wants on "
++                           "or off");
++                goto fail;
++            }
++            still = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-sensor-vd")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-sensor-vd wants on or off");
+@@ -602,6 +655,31 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     }
+     s->event_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_timing_expire, s);
++    /*
++     * The still pipeline's engines and timers, created where ../z9-qemu's
++     * machine init creates them. Each INTID is this image's own name for
++     * the block (hw/arm/nikon-z63-spi.h), and none is driven by anything
++     * else on the board: 0x131 RAW1 (engine 0x1540's frame cause), 0xfd
++     * RAWRS (engine 0x1544's copy), 251/252 SFLT0/SFLT1 (engine 0x153),
++     * 121 JPEG_0 (engine 0x15e2). The timers are the secondary-source timing
++     * and the D980 single-frame input: without them the first still that
++     * armed one dereferenced a null timer (timer_mod from a front write).
++     */
++    s->engine1540_frame_irq = qdev_get_gpio_in(gic, 0x131 - 32);
++    s->engine1544_copy_irq = qdev_get_gpio_in(gic, 0xfd - 32);
++    if (s->engine153_frame_pass_model || s->engine153_inplace_identity_model) {
++        s->engine153_irq[0] = qdev_get_gpio_in(gic, 251 - 32);
++        s->engine153_irq[1] = qdev_get_gpio_in(gic, 252 - 32);
++    }
++    if (s->engine15e2_jpeg_model) {
++        s->engine15e2_jpeg_irq = qdev_get_gpio_in(gic, 121 - 32);
++    }
++    s->event_secondary_timing_timer =
++        timer_new_ns(QEMU_CLOCK_VIRTUAL, event_secondary_timing_expire, s);
++    if (s->primary_d980_single_model) {
++        s->primary_d980_single_timer =
++            timer_new_ns(QEMU_CLOCK_VIRTUAL, primary_d980_single_tick, s);
++    }
+     /* The multi-IO timer block (0x0e000000/0x0e001000), wired as
+      * ../z9-qemu's machine init wires it: channel n on INTID 0x9b + n. This
+      * image's own driver init (sub_40C19A7C) enables exactly 155..167, and
+@@ -646,6 +724,12 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         goto fail;
+     }
+     s->z63_sensor_vd = sensor_vd;
++    if (still && (!boundary_ms || !s->engine150c_stop_model)) {
++        error_setg(errp, "z9-capture: z63-still-capture needs "
++                   "z63-boundary-ms and engine150c-stop-model");
++        goto fail;
++    }
++    s->z63_still = still;
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+@@ -681,6 +765,39 @@ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size, uint64_t *value)
+     return !s->compat_miss;
+ }
+ 
++/*
++ * z63-miss-log=on: name the writes the models decline. A declined write
++ * falls through to the board's own window, which stores it and says
++ * nothing -- so a model refusing a start (its admission rules) and a
++ * register no model covers look the same from outside. Each address is
++ * named for its first four distinct values, the PC with it; a declined
++ * write to engine 0x150c's control words also prints the model's admission
++ * state (active/latched/stop/reset), which is what decides. A debugging
++ * aid; off by default.
++ */
++static GHashTable *z63_z9lab_missed;
++
++static void z63_z9lab_log_miss(hwaddr addr, uint64_t value, unsigned size)
++{
++    uint64_t key = addr ^ (value << 32);
++    unsigned n;
++
++    if (!z63_z9lab_missed) {
++        z63_z9lab_missed = g_hash_table_new(g_int64_hash, g_int64_equal);
++    }
++    n = GPOINTER_TO_UINT(g_hash_table_lookup(z63_z9lab_missed, &addr));
++    if (n >= 4 || g_hash_table_contains(z63_z9lab_missed, &key)) {
++        return;
++    }
++    g_hash_table_insert(z63_z9lab_missed, g_memdup2(&addr, sizeof(addr)),
++                        GUINT_TO_POINTER(n + 1));
++    g_hash_table_insert(z63_z9lab_missed, g_memdup2(&key, sizeof(key)),
++                        GUINT_TO_POINTER(1));
++    fprintf(stderr, "Z63_Z9LAB_MISS write 0x%" HWADDR_PRIx " = 0x%" PRIx64
++            " (%u) pc=0x%" PRIx64 "\n", addr, value, size,
++            current_cpu ? ARM_CPU(current_cpu)->env.pc : 0);
++}
++
+ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+ {
+     NikonZ9State *s = NIKON_Z9_LAB(obj);
+@@ -688,6 +805,23 @@ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+ 
+     s->compat_miss = false;
+     unknown_write(s, addr, value, size);
++    if (s->compat_miss && z63_z9lab_miss_log_on) {
++        z63_z9lab_log_miss(addr, value, size);
++        if ((addr & ~0x7cull) == 0x150c0000 || addr == 0x150c0064) {
++            fprintf(stderr, "Z63_Z9LAB_MISS 150c state: active=%x latched=%x "
++                    "configured=%x req=%x done=%x dstop_done=%x idle_done=%x "
++                    "empty_end=%x reset_stage=%u resets=%" PRIu64
++                    " prev=%x timing=%d d980_submits=%" PRIu64 " d980_ready=%d\n",
++                    s->engine150c_active, s->engine150c_latched,
++                    s->engine150c_configured,
++                    s->engine150c_stop_requested, s->engine150c_stop_done,
++                    s->engine150c_direct_stop_done, s->primary_idle_direct_done,
++                    s->primary_empty_end_pending, s->primary_reset_stage,
++                    (uint64_t)s->primary_reset_count,
++                    s->primary_reset_previous_units, s->event_timing_active,
++                    (uint64_t)s->primary_d980_submits, primary_d980_ready(s));
++        }
++    }
+     if (addr == 0x150c0008 && s->zr_primary_bank1_model &&
+         (s->engine150c_active & ~was & 2)) {
+         z63_z9lab_150c_started(s);
+-- 
+2.55.0
+

@@ -1,0 +1,114 @@
+From 053c57c959214e373d21d30c5e74d4b48cc48538 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 06:08:12 +0000
+Subject: [PATCH 18/47] Z 6III: the power-down register dump reads through
+
+Left alone in a menu, the camera powered down after its standby timer and
+the run ended on SENSOR-IF reads of +0x4c, +0x58, +0x60 from 0x40c07914.
+That load is the RAM-dump copy loop. Every power-down saves the settings
+in sub_41003440, whose last call is sub_40C079A0 -> sub_40C077EC: a copy
+of every region registered with sub_40C076A8 into NOR record 83, which
+sub_40C07A2C later writes to the card as A:\RAMDMP_E.BIN. Device regions
+are read a word at a time, and drivers register whole pages, not the
+registers they use: the sensor module (sub_4115B74C) device 0x1508 at
+0x15080000 (0x3c4 bytes), +0x1000, +0x3000, +0x4000, +0x5000, +0x5400 and
+device 0x150c at 0x150c8000, 0x150cb000, 0x150ce000, 0x150ce400;
+sub_40FD1ABC device 0x1528 at 0x15280000 (0xfd0).
+
+Nothing reads the record back but that copy to the card, so the words
+decide nothing, and stopping there would end every run at its first
+power-down. z63_stop_read and the unmapped trap now let that one load
+through, answering 0, and say once per region that they did. DECLARED:
+an unmodelled word reads 0 into the dump. Every other instruction still
+stops.
+
+Verified: an idle run with a menu open powered down ~10 min in; both
+dump passes read all ten regions without a stop.
+
+Where it stands: the power-down goes on into suspend -- Linux prints "PM:
+suspend entry (s2idle)" -- and stops at 0x0c86a010, read from code the
+RTOS runs in on-chip RAM (pc 0x082010a0). ../z9-qemu answers that word
+only from a supplied low-service status (low-service-status-input);
+suspend and wake are not modelled here yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63.c | 48 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index b35d5b7..5348ea4 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -1198,6 +1198,48 @@ static void z63_create_dma(NikonZ63State *s)
+ /* Unmodeled-access trap: log and stop, never invent a response.       */
+ /* ------------------------------------------------------------------ */
+ 
++/*
++ * The one reader that may read anything: the power-down register dump.
++ * Every power-down -- the standby timer running out after a menu was left
++ * open is enough -- saves the settings in sub_41003440, whose last call is
++ * sub_40C079A0 -> sub_40C077EC: a copy of every region registered with
++ * sub_40C076A8 into NOR record 83, which sub_40C07A2C later writes to the
++ * card as A:\RAMDMP_E.BIN. Device regions are copied a word at a time by
++ * the one load at 0x40c07914, and drivers register whole pages, not the
++ * registers they use: the sensor module (sub_4115B74C) device 0x1508 at
++ * 0x15080000 (0x3c4 bytes), +0x1000 (0x490), +0x3000 (0x554), +0x4000
++ * (0x148), +0x5000 and +0x5400 (0x300 each) and device 0x150c at
++ * 0x150c8000 and 0x150cb000 (0x3000 each), 0x150ce000 and 0x150ce400
++ * (0x400 each); sub_40FD1ABC device 0x1528 at 0x15280000 (0xfd0).
++ *
++ * Nothing reads the record back but that copy to the card, so a word the
++ * dump reads decides nothing, and stopping there would end every run at
++ * its first power-down. That load, and no other, is let through where a
++ * window or the unmapped trap would stop, and gets 0. DECLARED: an
++ * unmodelled word reads 0 into the dump. The tripwire stays armed for
++ * every other instruction. One line per region the dump enters.
++ */
++#define Z63_RAMDMP_LOAD_PC 0x40c07914ULL
++
++static bool z63_ramdmp_load(const char *block, hwaddr addr)
++{
++    static const char *last_block;
++    static hwaddr last;
++    ARMCPU *cpu = ARM_CPU(current_cpu);
++
++    if (!cpu || cpu->env.pc != Z63_RAMDMP_LOAD_PC) {
++        return false;
++    }
++    if (block != last_block || addr < last || addr - last >= 0x1000) {
++        error_report("Z63_RAMDMP: the power-down register dump reads %s "
++                     "from 0x%09" HWADDR_PRIx " -- unmodelled words read 0",
++                     block, addr);
++    }
++    last_block = block;
++    last = addr;
++    return true;
++}
++
+ static uint64_t z63_unmapped_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     ARMCPU *cpu = ARM_CPU(current_cpu);
+@@ -1206,6 +1248,9 @@ static uint64_t z63_unmapped_read(void *opaque, hwaddr addr, unsigned size)
+     if (z63_front_read(addr, size, &value)) {
+         return value;
+     }
++    if (z63_ramdmp_load("unmapped space", addr)) {
++        return 0;
++    }
+     error_report("Z63_UNMAPPED read  addr=0x%09" HWADDR_PRIx " size=%u pc=0x%09" PRIx64
+                  " -- stopping (unmodeled device?)", addr, size,
+                  cpu ? cpu->env.pc : 0);
+@@ -1242,6 +1287,9 @@ static void z63_stop_read(const char *block, hwaddr addr, unsigned size)
+ {
+     ARMCPU *cpu = ARM_CPU(current_cpu);
+ 
++    if (z63_ramdmp_load(block, addr)) {
++        return;
++    }
+     error_report("Z63 %s unmodeled read  addr=0x%09" HWADDR_PRIx
+                  " size=%u pc=0x%09" PRIx64 " -- stopping",
+                  block, addr, size, cpu ? cpu->env.pc : 0);
+-- 
+2.55.0
+

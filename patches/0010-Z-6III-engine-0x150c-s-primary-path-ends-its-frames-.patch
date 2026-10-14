@@ -1,0 +1,278 @@
+From 23436d504ea056e70be2f5d66c3384142263c2d7 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 02:05:49 +0000
+Subject: [PATCH 10/47] Z 6III: engine 0x150c's primary path ends its frames on
+ its own
+
+The engine reports a finished frame on its upper paths as +0x210 bit 29
+(engine bit 1) and bit 30 (engine bit 16); this image subscribes exactly
+those, and each channel's next job waits up to 3 s for the previous one's
+end. ../z9-qemu raises the same bits only from its combined RAW -> output
+ISP, after the output writes, which needs engines 0x1543/0x151/0x1518
+configured. This image runs the primary path alone first: the sensor
+module submits a channel-0 job at live-view start and waits for it to end
+before its next. New attachment switch z63-150c-frame-end (default on):
+at each frame boundary, while the combined ISP is not engaged, an active
+primary path that is not being stopped ends its frame -- the same bits,
+mask (+0x20c) and W1C as ../z9-qemu's. Once the combined ISP is engaged
+it owns the completion. No pixels move.
+
+Verified: the 0x150c module's handler now receives the frame ends every
+frame (282 in 25 s under gdb).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c    | 61 +++++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63-z9lab.h    | 10 ++++--
+ z63-tools/z9lab_attach.c.in | 61 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 129 insertions(+), 3 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index 7b18cfa..bc468ae 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -14198,8 +14198,52 @@ typedef struct Z63Z9Boundary {
+     QEMUTimer *timer;
+     int64_t period_ns;
+     uint64_t deliveries, aux_deliveries;
++    bool frame_end;                     /* z63-150c-frame-end */
++    uint64_t frame_ends;
+ } Z63Z9Boundary;
+ 
++/*
++ * Engine 0x150c's primary-path frame end, on its own. The engine reports a
++ * finished frame on its upper paths as +0x210 bit 29 (engine bit 1) and
++ * bit 30 (engine bit 16), INTID 0x106; this image subscribes exactly those
++ * two (0xA03052C9C = 0x60000000), and the 0x150c module (sub_410AB2F8)
++ * turns them into flags 0x400000 / 0x800000 of 0xA04AEA658, which each
++ * channel's next job waits for, up to 3 s (sub_410AC18C / sub_410AC2EC,
++ * error 0x12/0x13 on timeout). ../z9-qemu raises the same two bits, but
++ * only from its combined RAW -> output ISP (nikon-z9-pixels.h,
++ * raw_pipeline_tick), after the output writes, which needs engines 0x1543,
++ * 0x151 and 0x1518 configured. This image runs the primary path alone
++ * first: the sensor module submits a channel-0 job at live-view start
++ * (sub_4116C0xx -> sub_410AC18C) long before anything downstream exists,
++ * and waits for it to end before its next one. So, at each frame boundary
++ * while the combined ISP is not engaged, an active primary path (and not
++ * one being stopped) ends its frame: the same bits, the same mask (+0x20c)
++ * and the same W1C as ../z9-qemu's. Once the combined ISP is engaged it
++ * owns the completion, as written there. No pixels move here; the period
++ * is the boundary's (z63-boundary-ms), not a measured readout time.
++ */
++static void z63_z9lab_150c_frame_end(Z63Z9Boundary *b)
++{
++    NikonZ9State *s = b->s;
++    uint32_t live = s->engine150c_active & ~s->engine150c_stop_requested;
++    uint32_t bits = ((live & 2) ? 0x20000000 : 0) |
++                    ((live & 0x10000) ? 0x40000000 : 0);
++    bool combined = s->raw_pipeline_model && s->engine1543_active[0] &&
++                    s->engine151_active[1] && s->engine1518[2].config[0x30 / 4];
++
++    bits &= s->engine_150c_init[0x20c / 4] & ~s->raw_primary_pending;
++    if (!b->frame_end || combined || !bits) {
++        return;
++    }
++    s->raw_primary_pending |= bits;
++    s->raw_primary_events++;
++    engine150c_stop_irq_update(s);
++    if (b->frame_ends++ == 0) {
++        fprintf(stderr, "Z63_150C: primary path frame end (+0x210 0x%x) at the "
++                "frame boundary -- see z9lab_attach.c.in\n", bits);
++    }
++}
++
+ static void z63_z9lab_boundary_tick(void *opaque)
+ {
+     Z63Z9Boundary *b = opaque;
+@@ -14215,6 +14259,7 @@ static void z63_z9lab_boundary_tick(void *opaque)
+         event_aux0_update_irq(s);
+         b->aux_deliveries++;
+     }
++    z63_z9lab_150c_frame_end(b);
+     b->deliveries++;
+     timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + b->period_ns);
+ }
+@@ -14274,6 +14319,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     NikonZ9State *s = NIKON_Z9_LAB(object_new(TYPE_NIKON_Z9_LAB));
+     g_auto(GStrv) items = g_strsplit(props ? props : "", ";", -1);
+     uint64_t boundary_ms = 0;
++    bool frame_end = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -14296,6 +14342,15 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-150c-frame-end")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-150c-frame-end wants on "
++                           "or off");
++                goto fail;
++            }
++            frame_end = !strcmp(kv[1], "on");
++            continue;
++        }
+         for (unsigned i = 0; i < ARRAY_SIZE(z63_z9lab_refused); i++) {
+             if (!strcmp(kv[0], z63_z9lab_refused[i])) {
+                 error_setg(errp, "z9-capture: '%s' belongs to a block the "
+@@ -14361,6 +14416,11 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                                     c);
+         }
+     }
++    if (frame_end && !boundary_ms) {
++        error_setg(errp, "z9-capture: z63-150c-frame-end needs "
++                   "z63-boundary-ms");
++        goto fail;
++    }
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+@@ -14371,6 +14431,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             goto fail;
+         }
+         b->s = s;
++        b->frame_end = frame_end;
+         b->period_ns = boundary_ms * 1000000;
+         b->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_z9lab_boundary_tick, b);
+         timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index a180783..b658634 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -48,8 +48,11 @@
+  * with eight zero words, which makes the SDES error-status words (+0x24,
+  * +0x110, +0x118, +0x11c of both banks; W1C) readable as "no error" --
+  * the link to the virtual sensor is healthy -- instead of not answering;
+- * live-view start reads bank 1 +0x24 (sub_40C2B218). -machine
+- * z9-capture-props= replaces the list (items separated by ';'). The statistics and RAW models need an
++ * live-view start reads bank 1 +0x24 (sub_40C2B218). Also this board's
++ * z63-150c-frame-end: engine 0x150c's primary path ending its frame at the
++ * boundary on its own while the combined RAW pipeline is not engaged (see
++ * the attachment section). -machine z9-capture-props= replaces the list
++ * (items separated by ';'). The statistics and RAW models need an
+  * NZ9RAW1 Bayer file: -machine z9-capture-raw=<path>; z63-tools/make_raw.py
+  * writes a synthetic one. That picture is an input chosen for the run, not
+  * anything the camera's sensor produces.
+@@ -112,7 +115,8 @@ static const char z63_z9lab_default_props[] =
+     "event1508-stop-model=on;"
+     "engine150d-readback-input=0:0:0:0:0;"
+     "multi-io-counter-model=on;"
+-    "z63-boundary-ms=33";
++    "z63-boundary-ms=33;"
++    "z63-150c-frame-end=on";
+ 
+ #define Z63_Z9LAB_LO 0x15000000ULL
+ #define Z63_Z9LAB_HI 0x16100000ULL
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index bcc38b6..f7ef0f1 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -54,8 +54,52 @@ typedef struct Z63Z9Boundary {
+     QEMUTimer *timer;
+     int64_t period_ns;
+     uint64_t deliveries, aux_deliveries;
++    bool frame_end;                     /* z63-150c-frame-end */
++    uint64_t frame_ends;
+ } Z63Z9Boundary;
+ 
++/*
++ * Engine 0x150c's primary-path frame end, on its own. The engine reports a
++ * finished frame on its upper paths as +0x210 bit 29 (engine bit 1) and
++ * bit 30 (engine bit 16), INTID 0x106; this image subscribes exactly those
++ * two (0xA03052C9C = 0x60000000), and the 0x150c module (sub_410AB2F8)
++ * turns them into flags 0x400000 / 0x800000 of 0xA04AEA658, which each
++ * channel's next job waits for, up to 3 s (sub_410AC18C / sub_410AC2EC,
++ * error 0x12/0x13 on timeout). ../z9-qemu raises the same two bits, but
++ * only from its combined RAW -> output ISP (nikon-z9-pixels.h,
++ * raw_pipeline_tick), after the output writes, which needs engines 0x1543,
++ * 0x151 and 0x1518 configured. This image runs the primary path alone
++ * first: the sensor module submits a channel-0 job at live-view start
++ * (sub_4116C0xx -> sub_410AC18C) long before anything downstream exists,
++ * and waits for it to end before its next one. So, at each frame boundary
++ * while the combined ISP is not engaged, an active primary path (and not
++ * one being stopped) ends its frame: the same bits, the same mask (+0x20c)
++ * and the same W1C as ../z9-qemu's. Once the combined ISP is engaged it
++ * owns the completion, as written there. No pixels move here; the period
++ * is the boundary's (z63-boundary-ms), not a measured readout time.
++ */
++static void z63_z9lab_150c_frame_end(Z63Z9Boundary *b)
++{
++    NikonZ9State *s = b->s;
++    uint32_t live = s->engine150c_active & ~s->engine150c_stop_requested;
++    uint32_t bits = ((live & 2) ? 0x20000000 : 0) |
++                    ((live & 0x10000) ? 0x40000000 : 0);
++    bool combined = s->raw_pipeline_model && s->engine1543_active[0] &&
++                    s->engine151_active[1] && s->engine1518[2].config[0x30 / 4];
++
++    bits &= s->engine_150c_init[0x20c / 4] & ~s->raw_primary_pending;
++    if (!b->frame_end || combined || !bits) {
++        return;
++    }
++    s->raw_primary_pending |= bits;
++    s->raw_primary_events++;
++    engine150c_stop_irq_update(s);
++    if (b->frame_ends++ == 0) {
++        fprintf(stderr, "Z63_150C: primary path frame end (+0x210 0x%x) at the "
++                "frame boundary -- see z9lab_attach.c.in\n", bits);
++    }
++}
++
+ static void z63_z9lab_boundary_tick(void *opaque)
+ {
+     Z63Z9Boundary *b = opaque;
+@@ -71,6 +115,7 @@ static void z63_z9lab_boundary_tick(void *opaque)
+         event_aux0_update_irq(s);
+         b->aux_deliveries++;
+     }
++    z63_z9lab_150c_frame_end(b);
+     b->deliveries++;
+     timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + b->period_ns);
+ }
+@@ -130,6 +175,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     NikonZ9State *s = NIKON_Z9_LAB(object_new(TYPE_NIKON_Z9_LAB));
+     g_auto(GStrv) items = g_strsplit(props ? props : "", ";", -1);
+     uint64_t boundary_ms = 0;
++    bool frame_end = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -152,6 +198,15 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-150c-frame-end")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-150c-frame-end wants on "
++                           "or off");
++                goto fail;
++            }
++            frame_end = !strcmp(kv[1], "on");
++            continue;
++        }
+         for (unsigned i = 0; i < ARRAY_SIZE(z63_z9lab_refused); i++) {
+             if (!strcmp(kv[0], z63_z9lab_refused[i])) {
+                 error_setg(errp, "z9-capture: '%s' belongs to a block the "
+@@ -217,6 +272,11 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                                     c);
+         }
+     }
++    if (frame_end && !boundary_ms) {
++        error_setg(errp, "z9-capture: z63-150c-frame-end needs "
++                   "z63-boundary-ms");
++        goto fail;
++    }
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+@@ -227,6 +287,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             goto fail;
+         }
+         b->s = s;
++        b->frame_end = frame_end;
+         b->period_ns = boundary_ms * 1000000;
+         b->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_z9lab_boundary_tick, b);
+         timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+-- 
+2.55.0
+

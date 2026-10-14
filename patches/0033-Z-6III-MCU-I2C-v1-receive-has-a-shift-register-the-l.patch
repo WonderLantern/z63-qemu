@@ -1,0 +1,138 @@
+From 4b20732c81c23beba521640dfd5fa460a7710702 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 14:43:47 +0000
+Subject: [PATCH 33/47] Z 6III MCU: I2C v1 receive has a shift register -- the
+ last bytes of a read
+
+The model received one byte per DR read and NACKed the byte it fetched
+while ACK was clear. HAL's I2C v1 ending for reads of three or more bytes
+is built on the part's two-stage pipeline (DR plus the shift register,
+BTF when both are full): wait for BTF, clear ACK, read N-2 (byte N then
+arrives, NACKed), set STOP, read N-1, read N. With one stage, N-1 was
+NACKed and read twice and N never arrived. It showed on the first 7-byte
+read the MCU makes, the clock chip at I2C1 0x32: the month register came
+back where the year belongs.
+
+DR and the shift register are now modelled (RM0402 24.3.3): the
+peripheral fills both while ACK is set, NACKs the byte received with ACK
+clear (with POS, the byte after the first), and a DR read moves the shift
+register's byte up before the next is received. The DMA pump and SWRST
+follow.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-stm32.h | 58 ++++++++++++++++++++++++++++++++--------
+ 1 file changed, 47 insertions(+), 11 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-stm32.h b/hw/arm/nikon-z63-stm32.h
+index f1be7f4..6a93d0c 100644
+--- a/hw/arm/nikon-z63-stm32.h
++++ b/hw/arm/nikon-z63-stm32.h
+@@ -179,7 +179,9 @@ struct Z63Stm32 {
+         Z63Stm32 *mcu;
+         unsigned bus;
+         struct Z63Stm32I2cDev *dev;
+-        bool last_sent;
++        bool last_sent;                 /* the NACKed byte has come */
++        uint8_t sh;                     /* the shift register's byte */
++        bool sh_full;
+         MemoryRegion mr;
+         qemu_irq ev_irq, er_irq;
+         uint32_t cr1, cr2, oar1, oar2, ccr, trise, fltr;
+@@ -1177,19 +1179,51 @@ static uint8_t z63_stm32_i2c_dev_read(Z63Stm32I2cDev *d)
+     return d->regs[d->ptr++];
+ }
+ 
+-/* I2C v1: put the next received byte in DR. The byte received while ACK
+- * is clear (or, with POS, the one after it) is the last one. */
++/*
++ * I2C v1 receive: DR and, behind it, the shift register (RM0402 24.3.3).
++ * The peripheral receives while there is room -- into DR, then into the
++ * shift register, where it stalls with BTF set -- and a byte received
++ * while ACK is clear (with POS, the byte after the first) is NACKed and is
++ * the last. Reading DR moves the shift register's byte up and lets the
++ * next one in. HAL's endings depend on that pipeline: for the last three
++ * bytes it waits for BTF, clears ACK, reads N-2 (byte N then arrives
++ * NACKed), sets STOP and reads N-1 and N -- with one stage the model
++ * NACKed N-1 and handed it out twice (a 7-byte read of the clock chip at
++ * I2C1 0x32 returned its month register in place of its year).
++ */
+ static void z63_stm32_i2c_rx(Z63Stm32I2c *c, bool first)
+ {
+     bool ack = c->cr1 & (1u << 10), pos = c->cr1 & (1u << 11);
+ 
+-    if (!c->dev || c->last_sent) {
+-        return;
++    while (c->dev && !c->last_sent &&
++           (!(c->sr1 & Z63_I2C_SR1_RXNE) || !c->sh_full)) {
++        uint8_t b = z63_stm32_i2c_dev_read(c->dev);
++
++        if (!(c->sr1 & Z63_I2C_SR1_RXNE)) {
++            c->dr = b;
++            c->sr1 |= Z63_I2C_SR1_RXNE;
++        } else {
++            c->sh = b;
++            c->sh_full = true;
++        }
++        if (!ack && !(first && pos) && !(c->cr2 & (1u << 11))) {
++            c->last_sent = true;
++        }
++        first = false;
++    }
++    if (c->sh_full) {
++        c->sr1 |= Z63_I2C_SR1_BTF;
+     }
+-    c->dr = z63_stm32_i2c_dev_read(c->dev);
+-    c->sr1 |= Z63_I2C_SR1_RXNE | Z63_I2C_SR1_BTF;
+-    if (!ack && !(first && pos) && !(c->cr2 & (1u << 11))) {
+-        c->last_sent = true;
++}
++
++/* The ARM side took DR: the shift register's byte moves up. */
++static void z63_stm32_i2c_pop(Z63Stm32I2c *c)
++{
++    c->sr1 &= ~(Z63_I2C_SR1_RXNE | Z63_I2C_SR1_BTF);
++    if (c->sh_full) {
++        c->dr = c->sh;
++        c->sh_full = false;
++        c->sr1 |= Z63_I2C_SR1_RXNE;
+     }
+ }
+ 
+@@ -1211,7 +1245,7 @@ static void z63_stm32_i2c_pump(Z63Stm32I2c *c)
+     } else {
+         while ((c->sr1 & Z63_I2C_SR1_RXNE) &&
+                z63_stm32_dma_rx(c->mcu, par, c->dr)) {
+-            c->sr1 &= ~(Z63_I2C_SR1_RXNE | Z63_I2C_SR1_BTF);
++            z63_stm32_i2c_pop(c);
+             z63_stm32_i2c_rx(c, false);
+         }
+     }
+@@ -1233,7 +1267,7 @@ static uint64_t z63_stm32_i2c_read(void *opaque, hwaddr off, unsigned size)
+     case 0x0c: return c->oar2;
+     case 0x10:
+         v = c->dr;
+-        c->sr1 &= ~(Z63_I2C_SR1_RXNE | Z63_I2C_SR1_BTF);
++        z63_stm32_i2c_pop(c);
+         if (c->reading && c->dev) {
+             z63_stm32_i2c_rx(c, false);
+         }
+@@ -1252,6 +1286,7 @@ static uint64_t z63_stm32_i2c_read(void *opaque, hwaddr off, unsigned size)
+                 c->sr1 |= Z63_I2C_SR1_TXE;
+             } else {
+                 c->last_sent = false;
++                c->sh_full = false;
+                 z63_stm32_i2c_rx(c, true);
+             }
+             z63_stm32_i2c_pump(c);
+@@ -1282,6 +1317,7 @@ static void z63_stm32_i2c_write(void *opaque, hwaddr off, uint64_t value,
+             c->sr1 = c->sr2 = 0;
+             c->selected = false;
+             c->dev = NULL;
++            c->sh_full = false;
+             break;
+         }
+         c->cr1 = value & ~((1u << 8) | (1u << 9));
+-- 
+2.55.0
+

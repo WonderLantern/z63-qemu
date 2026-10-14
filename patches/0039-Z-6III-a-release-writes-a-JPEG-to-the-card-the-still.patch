@@ -1,0 +1,592 @@
+From 6155a25b4663f81eb4e64b722dfd7a772a01bbd2 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 21:06:06 +0000
+Subject: [PATCH 39/47] Z 6III: a release writes a JPEG to the card -- the
+ still's capture models on by default
+
+With the shutter type (custom setting d6) at "electronic shutter", a
+release now goes all the way: capture, development, JPEG encode and the
+camera's own record path, which writes DCIM/xxxNZ6_3/DSC_nnnn.JPG to the
+CFexpress card -- 6048x4032 baseline JPEG, Exif "NIKON Z6_3", "Ver.02.00",
+the picture the run's Bayer input holds (z9-capture-raw) -- and live view
+resumes, showing that input. Release after release (three in a row tested,
+plus two more with the defaults below). Under that shutter type the front
+end raises image-available (sub_40F7102C) for the still, the capture
+service's DC08 combinations start development (sub_4102D98C), and the
+capture job (0x422D0001) ends as of a9df88f. At "auto", "mechanical" and
+"electronic front-curtain" the image still takes the path a9df88f
+describes, which waits for image outputs and does not complete here.
+
+Three of ../z9-qemu's capture-model rules, written for one Z 9 capture
+under instruction counting, refused this image's stills depending on
+timing or on the release count (each a declined write; the last two stop
+the machine). Under z63-still-capture:
+  - the still's units are submitted (0x150c0060) before or after the
+    bounded reset, depending on task timing, and committed after it with
+    no new submission. The model kept only units 2 and 4 across a reset
+    and refused the commit (0x150c0064 = 0x401e) otherwise; every
+    submitted unit now keeps its parameters;
+  - the still's 0x1543 output instance (0x15432000) ends each capture
+    held (0x102) and is never stopped; the next still's mode 3 (0x103)
+    found it active. Held, it has stopped at its frame boundary, and mode
+    3 re-arms it;
+  - this image encodes alternate stills on the second JPEG core
+    (0x15e21000, JPEG_1, INTID 122, now wired); the model ran its one job
+    on core 0. The job state stays single -- overlapping jobs are still
+    refused -- and belongs to the core whose start (+4 = 1) claimed it,
+    with that core's registers and line (also in nikon-z9-capture-nv16.h,
+    now an edited header).
+DECLARED, as the attachment's z63-still-capture block lists.
+
+The board's default capture props (nikon-z63-z9lab.h) now add the
+capture profile's models of ../z9-qemu and z63-still-capture, so
+-machine z9-capture=on takes stills without a props list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c       | 102 +++++++++++++++++++++++----------
+ hw/arm/nikon-z63-z9lab.h       |  53 ++++++++++++++++-
+ hw/arm/nikon-z9-capture-nv16.h |   2 +-
+ z63-tools/import_z9lab.py      |  94 +++++++++++++++++++++++++++++-
+ z63-tools/z9lab_attach.c.in    |  27 ++++++++-
+ 5 files changed, 239 insertions(+), 39 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index 01668ce..d3e4436 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -501,6 +501,8 @@ struct NikonZ9State {
+     bool engine15e2_deferred_input_model, engine15e2_deferred_failed;
+     uint64_t engine15e2_deferred_waits, engine15e2_deferred_notifications;
+     qemu_irq engine15e2_jpeg_irq;
++    qemu_irq engine15e2_jpeg_irq1;          /* z63-still-capture: JPEG_1 */
++    unsigned engine15e2_jpeg_bank;          /* the core that owns the job */
+     uint32_t engine15e2_jpeg_pending, engine15e2_jpeg_core;
+     uint64_t engine15e2_jpeg_requests, engine15e2_jpeg_jobs, engine15e2_jpeg_bytes;
+     uint64_t engine15e2_jpeg_input_bytes, engine15e2_jpeg_acks, engine15e2_jpeg_core_acks;
+@@ -9821,8 +9823,11 @@ static bool primary_bounded_reset_write(NikonZ9State *s, hwaddr addr,
+         }
+         s->engine150c_idle_stop_requested = 0;
+         s->primary_idle_direct_done = 0;
++        /* z63-still-capture: every submitted unit keeps its parameters
++         * across the reset; this image may submit the still's units before
++         * its bounded reset and commit them after it. */
+         s->primary_reset_parameter_retained = s->primary_reset_parameter_retention_model ?
+-            (s->engine150c_configured & 6) : 0;
++            (s->engine150c_configured & (s->z63_still ? ~0u : 6)) : 0;
+         if (s->primary_reset_parameter_retained) { s->primary_reset_parameter_retention_events++; }
+         s->engine150c_active = s->engine150c_latched = 0;
+         s->engine150c_configured = s->primary_reset_parameter_retained;
+@@ -12311,12 +12316,19 @@ static bool engine1543_control_write(NikonZ9State *s, unsigned i,
+                                     hwaddr addr, uint64_t value)
+ {
+     unsigned j = i - 10, mode = value & 3;
++    /* z63-still-capture: the still's instance ends each capture held (2)
++     * and is never stopped (0); held, it has stopped at its frame boundary,
++     * and the next still's mode 3 re-arms it. */
++    bool z63_rearm = s->z63_still && mode == 3 && s->engine1543_held[j];
+     if (value & ~0x103u ||
+         (mode == 1 && (!engine1543_ready(s, j) || s->engine1543_active[j])) ||
+-        (mode == 3 && s->engine1543_active[j])) {
++        (mode == 3 && s->engine1543_active[j] && !z63_rearm)) {
+         unknown_access(s, addr, value, 4, true);
+         return true;
+     }
++    if (z63_rearm) {
++        s->engine1543_active[j] = s->engine1543_held[j] = false;
++    }
+     if (s->capture_nv16_model && j == 1 && mode == 1 && !capture_nv16_prepare(s)) {
+         unknown_access(s, addr, value, 4, true); return true;
+     }
+@@ -13264,9 +13276,12 @@ static char *get_engine153_config_state(Object *obj, Error **errp)
+ 
+ static void engine15e2_jpeg_irq_update(NikonZ9State *s)
+ {
+-    if (s->engine15e2_jpeg_irq) {
+-        qemu_set_irq(s->engine15e2_jpeg_irq,
+-            !!(s->engine15e2_jpeg_pending & s->engine15e2_config[0][0x484 / 4]));
++    /* z63-still-capture: the job's core raises its own line. */
++    qemu_irq line = s->engine15e2_jpeg_bank ? s->engine15e2_jpeg_irq1 :
++                                              s->engine15e2_jpeg_irq;
++    if (line) {
++        qemu_set_irq(line,
++            !!(s->engine15e2_jpeg_pending & s->engine15e2_config[s->engine15e2_jpeg_bank][0x484 / 4]));
+     }
+ }
+ 
+@@ -13282,7 +13297,7 @@ static int engine15e2_owned_source(NikonZ9State *s)
+     /* Original517 reads the same retained small RAM after its first commit.
+      * This is another actual codec job, not another sensor generation. */
+     if (s->engine15e2_preflight_model && s->capture_nv16_model && s->capture_nv16_jobs) {
+-        const uint32_t *p = s->engine15e2_config[0];
++        const uint32_t *p = s->engine15e2_config[s->engine15e2_jpeg_bank];
+         for (unsigned j = 0; j < 3; j++) {
+             if (p[0x418 / 4] == s->capture_nv16_w[j] && p[0x41c / 4] == s->capture_nv16_h[j] &&
+                 p[0x410 / 4] == s->capture_nv16_stride[j] &&
+@@ -13292,7 +13307,7 @@ static int engine15e2_owned_source(NikonZ9State *s)
+     }
+     if (!s->engine15e2_preflight_model || !s->capture_thumbnail_model ||
+         !s->capture_thumbnail_jobs || s->capture_thumbnail_failed) { return -1; }
+-    const uint32_t *c = s->engine15e2_config[0];
++    const uint32_t *c = s->engine15e2_config[s->engine15e2_jpeg_bank];
+     unsigned w = c[0x418 / 4], h = c[0x41c / 4], stride = c[0x410 / 4];
+     unsigned active_h = s->capture_thumbnail_h;
+     if (w != s->capture_thumbnail_w || h < active_h || h - active_h > 32 ||
+@@ -13327,7 +13342,7 @@ static uint64_t engine15e2_source_generation(NikonZ9State *s, int owner)
+ 
+ static bool engine15e2_jpeg_source_ready(NikonZ9State *s)
+ {
+-    const uint32_t *c = s->engine15e2_config[0];
++    const uint32_t *c = s->engine15e2_config[s->engine15e2_jpeg_bank];
+     return engine15e2_owned_source(s) >= 0 || (s->engine151_capture_jobs &&
+         s->engine15e2_jpeg_consumed_job != s->engine151_capture_jobs &&
+         c[0x418 / 4] == s->engine151_capture_width &&
+@@ -13342,7 +13357,7 @@ static bool engine15e2_jpeg_source_ready(NikonZ9State *s)
+  * No allocator/firmware addresses or host-injected completion are used. */
+ static bool engine15e2_limit_disabled_request(NikonZ9State *s)
+ {
+-    const uint32_t *c = s->engine15e2_config[0];
++    const uint32_t *c = s->engine15e2_config[s->engine15e2_jpeg_bank];
+     int owner = engine15e2_owned_source(s);
+     return s->engine15e2_limit_disabled_model &&
+         c[0x404 / 4] == 2 && c[0x458 / 4] == 0 && (owner == 1 || owner == 2 || owner == 3);
+@@ -13350,7 +13365,7 @@ static bool engine15e2_limit_disabled_request(NikonZ9State *s)
+ 
+ static bool engine15e2_jpeg_request(NikonZ9State *s)
+ {
+-    const uint32_t *c = s->engine15e2_config[0];
++    const uint32_t *c = s->engine15e2_config[s->engine15e2_jpeg_bank];
+     unsigned w = c[0x418 / 4], h = c[0x41c / 4], stride = c[0x410 / 4];
+     uint64_t y = (uint64_t)c[0x430 / 4] << 4;
+     uint64_t uv = (uint64_t)c[0x434 / 4] << 4;
+@@ -13396,7 +13411,7 @@ static bool engine15e2_jpeg_request(NikonZ9State *s)
+ 
+ static bool engine15e2_jpeg_pixels(NikonZ9State *s)
+ {
+-    const uint32_t *c = s->engine15e2_config[0];
++    const uint32_t *c = s->engine15e2_config[s->engine15e2_jpeg_bank];
+     unsigned w = c[0x418 / 4], h = c[0x41c / 4], stride = c[0x410 / 4];
+     uint64_t y = (uint64_t)c[0x430 / 4] << 4;
+     uint64_t uv = (uint64_t)c[0x434 / 4] << 4;
+@@ -13457,7 +13472,7 @@ static bool engine15e2_jpeg_pixels(NikonZ9State *s)
+     s->engine15e2_jpeg_capacity = capacity; s->engine15e2_jpeg_width = w;
+     s->engine15e2_jpeg_height = h; s->engine15e2_jpeg_stride = stride;
+     s->engine15e2_jpeg_requested = false; s->engine15e2_jpeg_result_valid = true;
+-    s->engine15e2_config[0][4 / 4] = 0;
++    s->engine15e2_config[s->engine15e2_jpeg_bank][4 / 4] = 0;
+     /* Original ISR maps raw bit27/core2c bit31 to flag1, bit15 to flag20000,
+      * bit14 to flag40000. Its combined60001 subscription is a functional
+      * completion convention, asserted only after real encoded RAM output.
+@@ -13474,8 +13489,8 @@ static bool engine15e2_jpeg_pixels(NikonZ9State *s)
+ static void engine15e2_deferred_input_notify(NikonZ9State *s)
+ {
+     if (!s->engine15e2_deferred_input_model || !s->engine15e2_jpeg_requested ||
+-        s->engine15e2_deferred_failed || s->engine15e2_config[0][0x400 / 4] != 0x4000 ||
+-        s->engine15e2_config[0][0x404 / 4] != 0x4000) { return; }
++        s->engine15e2_deferred_failed || s->engine15e2_config[s->engine15e2_jpeg_bank][0x400 / 4] != 0x4000 ||
++        s->engine15e2_config[s->engine15e2_jpeg_bank][0x404 / 4] != 0x4000) { return; }
+     s->engine15e2_deferred_notifications++;
+     if (!engine15e2_jpeg_source_ready(s)) { return; }
+     if (!engine15e2_jpeg_pixels(s)) {
+@@ -13504,8 +13519,8 @@ static char *get_engine15e2_deferred_input_state(Object *obj, Error **errp)
+ {
+     NikonZ9State *s = NIKON_Z9_LAB(obj);
+     bool waiting = s->engine15e2_deferred_input_model && s->engine15e2_jpeg_requested &&
+-        s->engine15e2_config[0][0x400 / 4] == 0x4000 &&
+-        s->engine15e2_config[0][0x404 / 4] == 0x4000 && !engine15e2_jpeg_source_ready(s);
++        s->engine15e2_config[s->engine15e2_jpeg_bank][0x400 / 4] == 0x4000 &&
++        s->engine15e2_config[s->engine15e2_jpeg_bank][0x404 / 4] == 0x4000 && !engine15e2_jpeg_source_ready(s);
+     return g_strdup_printf("{\"enabled\":%s,\"waiting_for_source\":%s,\"failed\":%s,"
+         "\"waits\":%" PRIu64 ",\"producer_notifications\":%" PRIu64 ","
+         "\"physical_timing_verified\":false,\"native_file_saved\":false,"
+@@ -13521,7 +13536,7 @@ static bool engine15e2_jpeg_read(NikonZ9State *s, unsigned b, unsigned off,
+     /* Original encode ISR copies474 into opaque packet84 when packet+c/d
+      * is nonzero. Opt-in functional units: real completed stream bytes;
+      * physical counter units are unproved. Not a guessed success constant. */
+-    if (off == 0x474 && s->engine15e2_result474_model && b == 0) {
++    if (off == 0x474 && s->engine15e2_result474_model && b == s->engine15e2_jpeg_bank) {
+         if (size != 4 || !s->engine15e2_jpeg_result_valid ||
+             s->engine15e2_jpeg_capacity != 0) {
+             unknown_access(s, 0x15e20000 + off, 0, size, false);
+@@ -13529,7 +13544,7 @@ static bool engine15e2_jpeg_read(NikonZ9State *s, unsigned b, unsigned off,
+         }
+         *value = s->engine15e2_jpeg_last_bytes; return true;
+     }
+-    if (!s->engine15e2_jpeg_model || b != 0 ||
++    if (!s->engine15e2_jpeg_model || b != s->engine15e2_jpeg_bank ||
+         (off != 0x20 && off != 0x2c && off != 0x470 && off != 0x480)) { return false; }
+     if (size != 4 || ((off == 0x20 || off == 0x470) && !s->engine15e2_jpeg_result_valid)) {
+         unknown_access(s, 0x15e20000 + off, 0, size, false); *value = 0; return true;
+@@ -13543,7 +13558,11 @@ static bool engine15e2_jpeg_read(NikonZ9State *s, unsigned b, unsigned off,
+ static bool engine15e2_jpeg_write(NikonZ9State *s, unsigned b, unsigned off,
+                                  uint64_t value, unsigned size)
+ {
+-    if (!s->engine15e2_jpeg_model || b != 0) { return false; }
++    if (s->z63_still && b <= 1 && b != s->engine15e2_jpeg_bank && off == 4 && value == 1 &&
++        !s->engine15e2_jpeg_requested && !s->engine15e2_jpeg_pending && !s->engine15e2_jpeg_core) {
++        s->engine15e2_jpeg_bank = b;    /* z63-still-capture: this core takes the job */
++    }
++    if (!s->engine15e2_jpeg_model || b != s->engine15e2_jpeg_bank) { return false; }
+     if (off == 0x480 || off == 0x2c) {
+         if (size != 4) { goto invalid; }
+         if (off == 0x480) {
+@@ -13564,28 +13583,28 @@ static bool engine15e2_jpeg_write(NikonZ9State *s, unsigned b, unsigned off,
+         }
+         s->engine15e2_deferred_failed = false;
+         s->engine15e2_jpeg_requested = true; s->engine15e2_jpeg_result_valid = false;
+-        s->engine15e2_config[0][1] = 1; s->engine15e2_jpeg_requests++;
++        s->engine15e2_config[s->engine15e2_jpeg_bank][1] = 1; s->engine15e2_jpeg_requests++;
+         return true;
+     }
+     if (off == 4 && (value == 0x80000000 || value == 0x80000001)) {
+         if (size != 4 || s->engine15e2_jpeg_requested || s->engine15e2_jpeg_pending || s->engine15e2_jpeg_core) { goto invalid; }
+         s->engine15e2_jpeg_result_valid = false;
+-        s->engine15e2_config[0][1] = 0; s->engine15e2_idle_resets[0]++;
++        s->engine15e2_config[s->engine15e2_jpeg_bank][1] = 0; s->engine15e2_idle_resets[0]++;
+         return true;
+     }
+     if ((off == 0x400 || off == 0x404) &&
+         (value == 0x4000 || (engine15e2_limit_disabled_request(s) &&
+             ((off == 0x404 && value == 0x4002) || (off == 0x400 && value == 0x4020))))) {
+         bool no_limit = engine15e2_limit_disabled_request(s);
+-        uint32_t scale_bits = s->engine15e2_config[0][0x400 / 4] & 0x30;
++        uint32_t scale_bits = s->engine15e2_config[s->engine15e2_jpeg_bank][0x400 / 4] & 0x30;
+         uint32_t initial = no_limit ? (off == 0x404 ? 2 : scale_bits) : 0;
+         if (size != 4 || !s->engine15e2_jpeg_requested ||
+-            value != (initial | 0x4000) || s->engine15e2_config[0][off / 4] != initial ||
+-            (off == 0x404 && s->engine15e2_config[0][0x400 / 4] != (0x4000 | (no_limit ? scale_bits : 0)))) { goto invalid; }
++            value != (initial | 0x4000) || s->engine15e2_config[s->engine15e2_jpeg_bank][off / 4] != initial ||
++            (off == 0x404 && s->engine15e2_config[s->engine15e2_jpeg_bank][0x400 / 4] != (0x4000 | (no_limit ? scale_bits : 0)))) { goto invalid; }
+         if (off == 0x404 &&
+             !(s->engine15e2_deferred_input_model && !engine15e2_jpeg_source_ready(s)) &&
+             !engine15e2_jpeg_pixels(s)) { goto invalid; }
+-        s->engine15e2_config[0][off / 4] = value;
++        s->engine15e2_config[s->engine15e2_jpeg_bank][off / 4] = value;
+         engine15e2_jpeg_irq_update(s); return true;
+     }
+     return false;
+@@ -13728,7 +13747,7 @@ static bool engine15e2_config_read(NikonZ9State *s, hwaddr addr,
+     unsigned b, off; uint32_t mask; bool readable;
+     if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
+     if (engine15e2_jpeg_read(s, b, off, size, value)) { return true; }
+-    if (s->engine15e2_jpeg_model && b == 0 &&
++    if (s->engine15e2_jpeg_model && (b == 0 || (s->z63_still && b == 1)) &&
+         (off == 0x484 || off == 0x490 || off == 0x494)) {
+         if (size != 4) {
+             unknown_access(s, addr, 0, size, false); *value = 0;
+@@ -13753,7 +13772,7 @@ static bool engine15e2_config_write(NikonZ9State *s, hwaddr addr,
+     unsigned b, off; uint32_t mask; bool readable;
+     if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
+     if (engine15e2_jpeg_write(s, b, off, value, size)) { return true; }
+-    if (s->engine15e2_jpeg_model && b == 0 &&
++    if (s->engine15e2_jpeg_model && b == s->engine15e2_jpeg_bank &&
+         (s->engine15e2_jpeg_requested || s->engine15e2_jpeg_pending) && off != 0x484) {
+         unknown_access(s, addr, value, size, true); return true;
+     }
+@@ -13771,7 +13790,7 @@ static bool engine15e2_config_write(NikonZ9State *s, hwaddr addr,
+     }
+     s->engine15e2_config[b][off / 4] = value;
+     s->engine15e2_config_writes[b]++;
+-    if (s->engine15e2_jpeg_model && b == 0 && off == 0x484) { engine15e2_jpeg_irq_update(s); }
++    if (s->engine15e2_jpeg_model && b == s->engine15e2_jpeg_bank && off == 0x484) { engine15e2_jpeg_irq_update(s); }
+     fprintf(stderr, "Z9_15E2_CONFIG bank=%u offset=%x value=%" PRIx64
+         "; no codec processing/completion\n", b, off, value);
+     return true;
+@@ -18694,12 +18713,31 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+  *     The capture job's own upper configuration is empty. So the still's
+  *     frame end also sets +0x14 bit 0, until the next configuration of
+  *     the upper writes it again; bit 6 then ends the capture job, whose
+- *     completion (0x41D0001, sub_410B05A8) is the front end's flag 0x4000.
++ *     completion (0x41D0001, sub_410B05A8) is the front end's flag 0x4000;
++ *   - the still's units are submitted (0x150c0060) either before or after
++ *     the bounded reset, depending on task timing, and committed after it
++ *     with no new submission. The model kept only units 2 and 4 across a
++ *     reset (../z9-qemu's retention, observed there for those two) and
++ *     refused the commit otherwise; every submitted unit now keeps its
++ *     parameters;
++ *   - the still's 0x1543 output instance (0x15432000) ends each capture
++ *     held (0x102) and is never stopped (0x100); the next still's mode 3
++ *     (0x103) found it active and was refused, which stops the machine.
++ *     Held, it has stopped at its frame boundary; mode 3 re-arms it;
++ *   - the JPEG model runs one job on core 0 (0x15e20000, JPEG_0); this
++ *     image encodes alternate stills on core 1 (0x15e21000, JPEG_1, INTID
++ *     122). The job state stays single -- overlapping jobs are refused as
++ *     before -- and belongs to the core whose start (+4 = 1) claimed it,
++ *     with that core's registers and interrupt line.
++ * With these, and the shutter type at "electronic shutter" (custom setting
++ * d6), a release ends in DCIM/xxxNZ6_3/DSC_nnnn.JPG on the card, release
++ * after release, and live view resumes.
+  *
+  * DECLARED: when the still frame arrives, that its frame end comes with
+  * it, and that it marks a capture's frame (+0x14 bit 0) in place of the
+- * missing parameter. The edits are in import_z9lab.py (section 8) and
+- * nikon-z9-d980.h.
++ * missing parameter; that a reset keeps submitted parameters; that a held
++ * capture instance has stopped. The edits are in import_z9lab.py (section
++ * 8), nikon-z9-d980.h and nikon-z9-capture-nv16.h.
+  */
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+@@ -18887,6 +18925,8 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     }
+     if (s->engine15e2_jpeg_model) {
+         s->engine15e2_jpeg_irq = qdev_get_gpio_in(gic, 121 - 32);
++        /* z63-still-capture: the second core, JPEG_1 (SPI 90) */
++        s->engine15e2_jpeg_irq1 = qdev_get_gpio_in(gic, 122 - 32);
+     }
+     s->event_secondary_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_secondary_timing_expire, s);
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index 0dfe8d4..a6ef476 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -73,8 +73,16 @@
+  * event1508-global0-bit10-model for its W1C: the sensor interface's lane-0
+  * request (+0x38 = 1) acknowledged on global0 bit 10, which the sensor
+  * module's stop before a live-view restart waits 150 ticks for (camera
+- * error 0x40 on timeout; see the attachment section). -machine
+- * z9-capture-props= replaces the list
++ * error 0x40 on timeout; see the attachment section). After those come
++ * ../z9-qemu's capture models, its capture profile's list, and
++ * z63-still-capture: a release takes the still through engine 0x150c, the
++ * D980 writer, 0x153, 0x151, the 0x1543 NV16 outputs and the JPEG cores,
++ * and the camera's own record path writes DCIM/xxxNZ6_3/DSC_nnnn.JPG to
++ * the card (-machine cfexpress=on and an NVMe drive on dw-pcie). It does
++ * so with the shutter type (custom setting d6) at "electronic shutter";
++ * at "auto", "mechanical" and "electronic front-curtain" the image takes a
++ * path this board does not complete yet (git log, "the still's capture
++ * job ends"). -machine z9-capture-props= replaces the list
+  * (items separated by ';'). The statistics and RAW models need an
+  * NZ9RAW1 Bayer file: -machine z9-capture-raw=<path>; z63-tools/make_raw.py
+  * writes a synthetic one. That picture is an input chosen for the run, not
+@@ -147,7 +155,46 @@ static const char z63_z9lab_default_props[] =
+     "z63-150c-frame-end=on;"
+     "z63-150c-path2-end=on;"
+     "z63-sensor-vd=on;"
+-    "z63-1508-lane0-ack=on";
++    "z63-1508-lane0-ack=on;"
++    /* The still: ../z9-qemu's capture models (its capture profile's list)
++     * and z63-still-capture (attachment section). */
++    "event1508-secondary-timing-model=on;"
++    "primary-d980-config-model=on;"
++    "primary-d980-stream-model=on;"
++    "engine152c-config-model=on;"
++    "engine152c-request-model=on;"
++    "engine151-raw-output-model=on;"
++    "engine1544-config-model=on;"
++    "engine1544-neutral-copy-model=on;"
++    "engine1540-descriptors-model=on;"
++    "engine1540-parameters-model=on;"
++    "engine1540-control-model=on;"
++    "engine1540-frame-pass-model=on;"
++    "primary-stopped-source-reset-model=on;"
++    "primary-reset-parameter-retention-model=on;"
++    "primary20-empty-reset-model=on;"
++    "primary-d980-packed14-model=on;"
++    "primary-d980-single-frame-model=on;"
++    "primary-d980-source-notify-model=on;"
++    "raw-source-boundary-model=on;"
++    "primary-d980-prepared-start-model=on;"
++    "primary-d980-channel-boundary-model=on;"
++    "primary-capture-direct-stop-model=on;"
++    "engine1543-capture-control-model=on;"
++    "engine15e2-config-model=on;"
++    "engine153-config-model=on;"
++    "engine153-inplace-identity-model=on;"
++    "engine151-capture-pixels-model=on;"
++    "engine151-average-result-model=on;"
++    "engine15e2-jpeg-model=on;"
++    "engine15e2-deferred-input-model=on;"
++    "engine15e2-limit-disabled-model=on;"
++    "engine15e2-result474-model=on;"
++    "engine15e2-preflight-model=on;"
++    "capture-nv16-pipeline-model=on;"
++    "engine1542-ram-input-control-model=on;"
++    "capture-thumbnail-nv16-model=on;"
++    "z63-still-capture=on";
+ 
+ #define Z63_Z9LAB_LO 0x15000000ULL
+ #define Z63_Z9LAB_HI 0x16100000ULL
+diff --git a/hw/arm/nikon-z9-capture-nv16.h b/hw/arm/nikon-z9-capture-nv16.h
+index 3afca3a..b15f6a2 100644
+--- a/hw/arm/nikon-z9-capture-nv16.h
++++ b/hw/arm/nikon-z9-capture-nv16.h
+@@ -176,7 +176,7 @@ static void capture_nv16_try(NikonZ9State *s)
+ static int capture_nv16_jpeg_owner(NikonZ9State *s)
+ {
+     if (!s->capture_nv16_model || !s->capture_nv16_jobs) { return -1; }
+-    const uint32_t *c = s->engine15e2_config[0];
++    const uint32_t *c = s->engine15e2_config[s->engine15e2_jpeg_bank];
+     for (unsigned j = 0; j < 3; j++) {
+         if (s->capture_nv16_jpeg_consumed[j] != s->capture_nv16_jobs &&
+             c[0x418 / 4] == s->capture_nv16_w[j] && c[0x41c / 4] == s->capture_nv16_h[j] &&
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index 7f566ff..20e838d 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -299,6 +299,89 @@ edit("""    raw_quiescent |= s->primary_stopped_source_reset_model &&
+                      !s->event_timing_active;
+     raw_quiescent |= s->z63_still;      /* z63-still-capture */
+ """)
++edit("""        s->primary_reset_parameter_retained = s->primary_reset_parameter_retention_model ?
++            (s->engine150c_configured & 6) : 0;
++""", """        /* z63-still-capture: every submitted unit keeps its parameters
++         * across the reset; this image may submit the still's units before
++         * its bounded reset and commit them after it. */
++        s->primary_reset_parameter_retained = s->primary_reset_parameter_retention_model ?
++            (s->engine150c_configured & (s->z63_still ? ~0u : 6)) : 0;
++""")
++edit("""    unsigned j = i - 10, mode = value & 3;
++    if (value & ~0x103u ||
++        (mode == 1 && (!engine1543_ready(s, j) || s->engine1543_active[j])) ||
++        (mode == 3 && s->engine1543_active[j])) {
++        unknown_access(s, addr, value, 4, true);
++        return true;
++    }
++""", """    unsigned j = i - 10, mode = value & 3;
++    /* z63-still-capture: the still's instance ends each capture held (2)
++     * and is never stopped (0); held, it has stopped at its frame boundary,
++     * and the next still's mode 3 re-arms it. */
++    bool z63_rearm = s->z63_still && mode == 3 && s->engine1543_held[j];
++    if (value & ~0x103u ||
++        (mode == 1 && (!engine1543_ready(s, j) || s->engine1543_active[j])) ||
++        (mode == 3 && s->engine1543_active[j] && !z63_rearm)) {
++        unknown_access(s, addr, value, 4, true);
++        return true;
++    }
++    if (z63_rearm) {
++        s->engine1543_active[j] = s->engine1543_held[j] = false;
++    }
++""")
++# The JPEG model runs one job at a time on core 0 (0x15e20000); this image
++# starts its next still's main encode on core 1 (0x15e21000, JPEG_1). The job
++# state stays single -- overlapping jobs are still refused -- and belongs to
++# the core whose start claimed it.
++edit("    qemu_irq engine15e2_jpeg_irq;\n",
++     "    qemu_irq engine15e2_jpeg_irq;\n"
++     "    qemu_irq engine15e2_jpeg_irq1;          /* z63-still-capture: JPEG_1 */\n"
++     "    unsigned engine15e2_jpeg_bank;          /* the core that owns the job */\n")
++edit("s->engine15e2_config[0]", "s->engine15e2_config[s->engine15e2_jpeg_bank]", 18)
++edit("""static void engine15e2_jpeg_irq_update(NikonZ9State *s)
++{
++    if (s->engine15e2_jpeg_irq) {
++        qemu_set_irq(s->engine15e2_jpeg_irq,
++            !!(s->engine15e2_jpeg_pending & s->engine15e2_config[s->engine15e2_jpeg_bank][0x484 / 4]));
++    }
++}
++""", """static void engine15e2_jpeg_irq_update(NikonZ9State *s)
++{
++    /* z63-still-capture: the job's core raises its own line. */
++    qemu_irq line = s->engine15e2_jpeg_bank ? s->engine15e2_jpeg_irq1 :
++                                              s->engine15e2_jpeg_irq;
++    if (line) {
++        qemu_set_irq(line,
++            !!(s->engine15e2_jpeg_pending & s->engine15e2_config[s->engine15e2_jpeg_bank][0x484 / 4]));
++    }
++}
++""")
++edit("    if (off == 0x474 && s->engine15e2_result474_model && b == 0) {\n",
++     "    if (off == 0x474 && s->engine15e2_result474_model && b == s->engine15e2_jpeg_bank) {\n")
++edit("""    if (!s->engine15e2_jpeg_model || b != 0 ||
++        (off != 0x20 && off != 0x2c && off != 0x470 && off != 0x480)) { return false; }
++""", """    if (!s->engine15e2_jpeg_model || b != s->engine15e2_jpeg_bank ||
++        (off != 0x20 && off != 0x2c && off != 0x470 && off != 0x480)) { return false; }
++""")
++edit("""    if (!s->engine15e2_jpeg_model || b != 0) { return false; }
++""", """    if (s->z63_still && b <= 1 && b != s->engine15e2_jpeg_bank && off == 4 && value == 1 &&
++        !s->engine15e2_jpeg_requested && !s->engine15e2_jpeg_pending && !s->engine15e2_jpeg_core) {
++        s->engine15e2_jpeg_bank = b;    /* z63-still-capture: this core takes the job */
++    }
++    if (!s->engine15e2_jpeg_model || b != s->engine15e2_jpeg_bank) { return false; }
++""")
++edit("""    if (s->engine15e2_jpeg_model && b == 0 &&
++        (off == 0x484 || off == 0x490 || off == 0x494)) {
++""", """    if (s->engine15e2_jpeg_model && (b == 0 || (s->z63_still && b == 1)) &&
++        (off == 0x484 || off == 0x490 || off == 0x494)) {
++""")
++edit("""    if (s->engine15e2_jpeg_model && b == 0 &&
++        (s->engine15e2_jpeg_requested || s->engine15e2_jpeg_pending) && off != 0x484) {
++""", """    if (s->engine15e2_jpeg_model && b == s->engine15e2_jpeg_bank &&
++        (s->engine15e2_jpeg_requested || s->engine15e2_jpeg_pending) && off != 0x484) {
++""")
++edit("    if (s->engine15e2_jpeg_model && b == 0 && off == 0x484) { engine15e2_jpeg_irq_update(s); }\n",
++     "    if (s->engine15e2_jpeg_model && b == s->engine15e2_jpeg_bank && off == 0x484) { engine15e2_jpeg_irq_update(s); }\n")
+ edit("""            bool idle_ok = s->primary_reset_idle_stop_model && s->primary_reset_count &&
+                 !s->primary_reset_stage && !s->event_timing_active &&
+                 !(inactive & ~s->primary_reset_previous_units);
+@@ -476,6 +559,15 @@ dedit("""    if (!s->primary_d980_single_model || channel || previous != 2 || va
+         s->primary_reset_stage || (s->event_timing_active && !s->z63_still)) {
+ """)
+ 
++# nikon-z9-capture-nv16.h: the JPEG source check reads the core that owns
++# the job (8).
++nv16 = (src / "nikon-z9-capture-nv16.h").read_text()
++old = "    const uint32_t *c = s->engine15e2_config[0];\n"
++if nv16.count(old) != 1:
++    sys.exit("nikon-z9-capture-nv16.h: expected 1 match, found %d" % nv16.count(old))
++nv16 = nv16.replace(old, "    const uint32_t *c = s->engine15e2_config[s->engine15e2_jpeg_bank];\n")
++(tree / "hw/arm/nikon-z9-capture-nv16.h").write_text(nv16)
++
+ attach = (here / "z9lab_attach.c.in").read_text()
+ (tree / "hw/arm/nikon-z63-z9lab.c").write_text(head + lab + attach)
+ (tree / "hw/arm/nikon-z9-pixels.h").write_text(pixels)
+@@ -491,7 +583,7 @@ for old, new, n in (("MACHINE(s)->ram_size", "s->ram_size", 2),
+ (tree / "hw/arm/nikon-z9-pcie.h").write_text(pcie)
+ for header in sorted(src.glob("nikon-*.h")):
+     if header.name not in ("nikon-z9-pixels.h", "nikon-z9-pcie.h",
+-                           "nikon-z9-d980.h"):
++                           "nikon-z9-d980.h", "nikon-z9-capture-nv16.h"):
+         (tree / "hw/arm" / header.name).write_bytes(header.read_bytes())
+ print("wrote hw/arm/nikon-z63-z9lab.c (source sha256 %s) and the model "
+       "headers" % sha)
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index ddad830..047b842 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -492,12 +492,31 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+  *     The capture job's own upper configuration is empty. So the still's
+  *     frame end also sets +0x14 bit 0, until the next configuration of
+  *     the upper writes it again; bit 6 then ends the capture job, whose
+- *     completion (0x41D0001, sub_410B05A8) is the front end's flag 0x4000.
++ *     completion (0x41D0001, sub_410B05A8) is the front end's flag 0x4000;
++ *   - the still's units are submitted (0x150c0060) either before or after
++ *     the bounded reset, depending on task timing, and committed after it
++ *     with no new submission. The model kept only units 2 and 4 across a
++ *     reset (../z9-qemu's retention, observed there for those two) and
++ *     refused the commit otherwise; every submitted unit now keeps its
++ *     parameters;
++ *   - the still's 0x1543 output instance (0x15432000) ends each capture
++ *     held (0x102) and is never stopped (0x100); the next still's mode 3
++ *     (0x103) found it active and was refused, which stops the machine.
++ *     Held, it has stopped at its frame boundary; mode 3 re-arms it;
++ *   - the JPEG model runs one job on core 0 (0x15e20000, JPEG_0); this
++ *     image encodes alternate stills on core 1 (0x15e21000, JPEG_1, INTID
++ *     122). The job state stays single -- overlapping jobs are refused as
++ *     before -- and belongs to the core whose start (+4 = 1) claimed it,
++ *     with that core's registers and interrupt line.
++ * With these, and the shutter type at "electronic shutter" (custom setting
++ * d6), a release ends in DCIM/xxxNZ6_3/DSC_nnnn.JPG on the card, release
++ * after release, and live view resumes.
+  *
+  * DECLARED: when the still frame arrives, that its frame end comes with
+  * it, and that it marks a capture's frame (+0x14 bit 0) in place of the
+- * missing parameter. The edits are in import_z9lab.py (section 8) and
+- * nikon-z9-d980.h.
++ * missing parameter; that a reset keeps submitted parameters; that a held
++ * capture instance has stopped. The edits are in import_z9lab.py (section
++ * 8), nikon-z9-d980.h and nikon-z9-capture-nv16.h.
+  */
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+@@ -685,6 +704,8 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     }
+     if (s->engine15e2_jpeg_model) {
+         s->engine15e2_jpeg_irq = qdev_get_gpio_in(gic, 121 - 32);
++        /* z63-still-capture: the second core, JPEG_1 (SPI 90) */
++        s->engine15e2_jpeg_irq1 = qdev_get_gpio_in(gic, 122 - 32);
+     }
+     s->event_secondary_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_secondary_timing_expire, s);
+-- 
+2.55.0
+

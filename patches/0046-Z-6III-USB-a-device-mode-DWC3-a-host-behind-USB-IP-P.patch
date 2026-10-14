@@ -1,0 +1,2515 @@
+From 48eac19e39ad66a47fb43608b59f3928fb197aa4 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Tue, 13 Oct 2026 08:55:58 +0000
+Subject: [PATCH 46/47] Z 6III: USB -- a device-mode DWC3, a host behind
+ USB/IP, PTP from outside
+
+The camera now enumerates on its USB-C port and answers PTP: with
+-machine usbip=<socket | host:port>, z63-tools/ptp.py reads the device
+info ("Nikon Corporation Z6_3, firmware V2.00", 146 operations), the
+storages, the card's objects, and downloads a picture byte for byte as the
+card holds it (DSC_0329.JPG, md5 equal to the FAT copy). With d6 set to
+the electronic shutter, `ptp.py <socket> capture <dir>` releases the
+camera remotely (Nikon InitiateCaptureRecInMedia, 0x9207), waits for the
+new object and downloads it. On the camera's screen the first PTP session
+brings up the real "upload priority mode" message.
+
+The pieces:
+
+* hw/arm/nikon-z63-dwc3.h (new): the DWC3 at 0x17880000 in device mode,
+  ported from the vphone tree's apple-dwc3.c. There it was a QEMU
+  USBDevice through a hook its tree added to the USB core; this tree's
+  core wants control transfers answered at once, which guest firmware
+  cannot do, so the controller takes host tokens directly
+  (z63_dwc3_token: SETUP / IN / OUT -> OK / NAK / STALL). Endpoint
+  commands, TRB rings in DRAM (0xA1AA09410 + 1040n), the event buffer
+  (0xA1AA0C000), the event line on SPI 108 (EXS_USB3_TYPE_C_CONTROLLER;
+  ISR sub_40C6C618 masks through GEVNTSIZ and wakes EXSUSBDP,
+  sub_40C6C454). This driver numbers hardware endpoints as USB endpoint
+  + 1 (sub_40C70950 at 0x40C70A50), so PTP's 0x81/0x02/0x83 are 2/3/4;
+  SETEPCONFIG parameter 1 [29:26]/[25] says which USB endpoint each one
+  serves. Z63_DWC3_TRACE=1 logs every command, token and event.
+
+* hw/arm/nikon-z63-usbhost.h (new): the host on the other end of the
+  cable -- port reset 20 ms after the run bit, control transfers as their
+  three stages, bulk until full or short, NAKs retried when an endpoint is
+  armed -- and a USB/IP 1.1.1 server in front of it (DEVLIST, IMPORT of
+  bus id 1-1, SUBMIT/UNLINK; one client at a time; unix or tcp socket).
+  After each reset it reads the descriptors itself and logs
+  "Z63_USB: the camera enumerated -- 04b0:0454 ...".
+
+* nikon-z63.c: -machine usbip= and usb-cable= (bool, run-time settable,
+  on by default with usbip=). The cable is VBUS on logical pin 0xC8 =
+  GPIO port 14 bit 10 (descriptor .data 0xA0280AB38), sampled every 20 ms
+  by sub_403204D0, four equal samples to change; its edge starts task
+  "USB" (sub_40321D7C). The rest of the start-up needed nothing new: the
+  PD-register check through MCU link family 17 is answered by the real
+  MCU firmware.
+
+* nikon-z63-usb.h: the DWC3 window moved to nikon-z63-dwc3.h. The Type-C
+  assist block's arming write (0x17A40014, mode 0x11/0x15) used to stop
+  the machine; it now sets status bit 0 and raises SPI 109 (DECLARED --
+  what the block measures is unknown, it answers at once). Its ISR
+  (sub_40C717B4) runs on that line, so SPI 109 is the wiring, not the
+  0x17A01000 mux. docs/usb-registers.md updated to match.
+
+Three controller bugs found on the way, each from the trace:
+
+1. Enumeration stopped at the first status stage. The ISR masks and
+   EXSUSBDP unmasks through GEVNTSIZ on every batch, and the port reset
+   the ring's write pointer on any GEVNTSIZ write: each batch's events
+   went back to the start of the ring while the driver read on from where
+   it was. Only a new size restarts the ring now.
+
+2. GetObject's data phase is a chain of two TRBs (512 KiB, then the
+   rest). XferComplete was posted for each finished TRB; on the real part
+   a finished TRB is an event only when it ends the transfer (LST, or a
+   short OUT packet: XferComplete) or asks for one (IOC:
+   XferInProgress). An XferComplete after the first made the driver stall
+   both bulk endpoints when the real end came.
+
+3. A second PTP session, seconds after the first, hung on its first
+   GET_DESCRIPTOR. DEPSTARTCFG at SET_CONFIGURATION (0x00020509,
+   transfer-resource index 2) reset every endpoint, the control pair too,
+   in the middle of the status stage: endpoint 1 said XferNotReady(status)
+   twice, the driver answered the second in the next session's data stage
+   with a zero-length packet, and every control stage after it was one
+   behind. The index now says where the reset starts (0 at init, 2 here).
+
+What does not work: only the first remote release of a boot. It is taken
+from upload priority mode (live-view state 0xA03D8221C = 4); afterwards
+the camera is back in live view (state 2) and the next 0x9207 answers
+0x200F after 20 s -- the release (sub_40F903B8, case 2) waits 10 s each
+for flags 0x40000000 and 0x100000 on group 0xA03D81618, gets neither, the
+capture service returns 32 and the PTP handler (sub_40836588, switch at
+0x40836870) maps that to 0x200F. No static setter of 0x40000000 was found.
+Shutter-button releases keep working. docs/plan.md lists it, and records
+the Wi-Fi scout's findings as a Next item (CYW43455 on SDIO, driven by
+Linux; the IPCU is the first gate).
+
+Linux's usbip attach + gphoto2 against usbip=tcp:...:3240 should work and
+is not tried.
+
+smoke.sh passes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/plan.md               |  35 +-
+ docs/usb-registers.md      |  38 +-
+ hw/arm/nikon-z63-dwc3.h    | 719 +++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63-usb.h     | 194 ++-------
+ hw/arm/nikon-z63-usbhost.h | 792 +++++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63.c         |  93 ++++-
+ z63-tools/ptp.py           | 330 ++++++++++++++++
+ 7 files changed, 2017 insertions(+), 184 deletions(-)
+ create mode 100644 hw/arm/nikon-z63-dwc3.h
+ create mode 100644 hw/arm/nikon-z63-usbhost.h
+ create mode 100644 z63-tools/ptp.py
+
+diff --git a/docs/plan.md b/docs/plan.md
+index 203153f..ac40f96 100644
+--- a/docs/plan.md
++++ b/docs/plan.md
+@@ -10,7 +10,7 @@ what is known not to work, and the order proposed for what is next. The
+ history of how it got here is kept short at the end; the commit messages
+ carry the detail.
+ 
+-## Where it stands (2026-10-13, `mcu-link` at 3ac1f42)
++## Where it stands (2026-10-13, `mcu-link`)
+ 
+ * **Boot.** The RTOS runs on three A53 cores and starts CPU3 itself
+   (`Z63: released CPU3 at pc=0x40160000`); Linux 4.14 boots there to the
+@@ -39,6 +39,16 @@ carry the detail.
+ * **Storage.** NAND (the "ANAND" store, `nand=`), the settings journal in
+   SNOR_USER (written; not saved to the file), a CFexpress card on PCIe
+   (`cfexpress=on`, QEMU's nvme; the camera formats it), an empty SD slot.
++* **USB.** `-machine usbip=<socket or host:port>` puts a host on the
++  camera's USB-C port (`nikon-z63-usbhost.h`) in front of a device-mode
++  DWC3 (`nikon-z63-dwc3.h`), with the cable in (`usb-cable=`). The camera
++  enumerates as 04b0:0454 (Still Image class) and answers PTP over USB/IP:
++  `z63-tools/ptp.py <socket> info | ls | get | get-latest | capture`
++  (Linux's `usbip attach` + gphoto2 against `usbip=tcp:...:3240` should
++  work too; not tried). On the camera's screen the first session brings
++  up "upload priority mode"; a remote release (InitiateCaptureRecInMedia,
++  electronic shutter set) writes the picture to the card and the host
++  downloads it.
+ * **Standby.** 30 s after live view starts with no key pressed, the
+   camera's suspend-to-RAM runs to its end -- cores off, DRAM in
+   self-refresh, the power-hold line dropped -- and `-machine power-off=`
+@@ -75,7 +85,15 @@ Ranked by how much of the camera each one blocks.
+ 5. **Settings do not persist across boots.** SNOR_USER writes are not
+    saved (an opt-in `snor-user-save=` was proposed), so d6 must be set
+    every boot.
+-6. **Smaller ones, each seen once:** live-view zoom ends in camera error
++6. **Only the first remote release works.** It is taken from upload
++   priority mode (live-view state 0xA03D8221C = 4); after it the camera
++   is back in live view (state 2), and the next InitiateCaptureRecInMedia
++   answers 0x200F after 20 s: the release (sub_40F903B8, case 2) waits 10 s
++   each for flags 0x40000000 then 0x100000 on group 0xA03D81618 and gets
++   neither (the capture service returns 32, the PTP handler maps it). No
++   static setter of 0x40000000 was found. Releases from the shutter button
++   keep working.
++7. **Smaller ones, each seen once:** live-view zoom ends in camera error
+    0x40 with the scanout stopped; AF-ON with no lens leaves the camera
+    unresponsive; Setup > clean image sensor NACKs on I2C bank 2 address
+    0x34; voice-memo options and the colour-balance picture use GFX draws
+@@ -115,6 +133,19 @@ calibration commands of sub_455CB8CC (never reached).
+ 5. **Persist settings** behind an opt-in property (item 5).
+ 6. The histogram's bins (computed from the RAW pipeline's frame), and the
+    smaller items as the UI sweep reaches them.
++7. **Wi-Fi** (scouted 2026-10-13, nothing built): the radio is a Cypress
++   CYW43455 (FullMAC) on the SDIO host at 0x17830000 (SPI 97-99, the empty
++   slot of `nikon-z63-wlsd.h`), driven by **Linux** -- brcmfmac with
++   firmware cyfmac43455-sdio 7.45.268 from the initramfs, wpa_supplicant /
++   hostapd run by LaIfCtrl, the PTP/IP listener (TCP 15740) in
++   LaNetCameraCtrl. The RTOS only orders it over the IPCU (0x0C851000,
++   deliberately unmodelled), which is the first gate. Then: an SDIO card
++   model (QEMU has none, and `hw/sd/sdhci.c` never raises CARDINT), the
++   chip's backplane and SDPCM/BCDC command responder (the firmware is
++   accepted, never run), and its data channel bridged to `-netdev user`
++   with `hostfwd=tcp::15740`. Roughly 4-5k lines; a first test without the
++   IPCU is modprobe sdhci-nikon + wpa_supplicant + udhcpc by hand from the
++   BusyBox console.
+ 
+ ## How the work is done
+ 
+diff --git a/docs/usb-registers.md b/docs/usb-registers.md
+index dda86bb..01ac38e 100644
+--- a/docs/usb-registers.md
++++ b/docs/usb-registers.md
+@@ -555,16 +555,13 @@ Model answer: **a write to DGCMD stores the value with bit 10 forced to 0.**
+ 0x40c7179c  B.NE  loc_40C7178C            ; <-- NO BOUND
+ ```
+ 
+-The flag is set only by the ISR `sub_40C717B4`, which the model does not
+-drive. There is no register read in the loop, so there is no place to hook
+-a stop except the arming write itself. The model therefore **stops on the
+-write to 0x17A40014** with the offending PC, rather than spinning forever
+-with no diagnostic. The header says exactly what to add if a bring-up run
+-needs to get past it (raise the block's interrupt -- `EXS_USB3_TYPE_C_ASSIST`
+-is SPI 109, or it may instead arrive through the 0x17A01000 mux; which of
+-the two is wired **was not determined**, because the handler is installed
+-at runtime and neither `sub_40C6A32C` nor `sub_40C717B4` appears as a
+-32-bit constant anywhere in the image).
++The flag is set only by the ISR `sub_40C717B4`. There is no register read
++in the loop. The first model stopped on the arming write; since the USB
++work (2026-10-13) the arming write instead sets status bit 0 and raises
++**SPI 109** (DECLARED: what the block measures is still unknown, so it
++answers at once). The ISR runs on that line, clears the status, sets the
++flag, and the bring-up goes on to the run bit -- so the handler is on SPI
++109 itself, not on a channel of the 0x17A01000 mux.
+ 
+ This path runs only when the gadget stack is started: `sub_40C6C7F8` case
+ 0x4000004 at 0x40C6DAB8/0x40C6DAC0 calls `sub_40C7160C` then
+@@ -658,8 +655,9 @@ stop):
+ * `0x17A00000 + 0x2000` -- all 68 enumerated offsets, with 0x1000..0x1024
+   reading 0.
+ * `0x17A20000 + 0x1000` -- `+0x010` only.
+-* `0x17A40000 + 0x1000` -- the six established offsets; `+0x008` reads 0;
+-  `+0x014` stops on write.
++* `0x17A40000 + 0x1000` -- the six established offsets; `+0x008` is the
++  status (write 1 to clear); the arming write to `+0x014` sets bit 0 and
++  raises SPI 109 (section 4.5).
+ * `0x17A60000 + 0x1000` -- the five established offsets.
+ 
+ **Refused, deliberately:**
+@@ -676,18 +674,20 @@ stop):
+   the board's `z63_unmapped` trap already names the address and PC. Section
+   0 has everything needed to start on it.
+ 
+-**Not attempted at all** (and out of scope by instruction): any USB device
+-model, descriptor handling, TRB execution, event generation, or transfer
+-emulation. Nothing in this model walks the DRAM rings at 0xA1AA09410 or
+-produces an event in the buffer at 0xA1AA0C000.
++**Added later (2026-10-13):** the device side. `hw/arm/nikon-z63-dwc3.h`
++now owns the 0x17880000 window: endpoint commands, the TRB rings at
++0xA1AA09410 + 1040n, the event buffer at 0xA1AA0C000, the interrupt on SPI
++108. `hw/arm/nikon-z63-usbhost.h` is the host on the other end of the cable
++(enumeration, then a USB/IP server, `-machine usbip=`), and
++`-machine usb-cable=` drives the VBUS pin (GPIO port 14 bit 10). PTP from
++a host: `z63-tools/ptp.py`. The headers carry the details.
+ 
+ **Could not be determined:**
+ 
+ 1. What 0x17A40000 *is*. Register roles are solid; function is guesswork.
+    The constants 93750 and 53 are unexplained.
+-2. Which interrupt line the 0x17A40000 ISR is attached to (SPI 109 directly,
+-   or a channel of the 0x17A01000 mux). The handler is installed at runtime
+-   and its address appears nowhere as a constant.
++2. ~~Which interrupt line the 0x17A40000 ISR is attached to.~~ SPI 109
++   directly (section 4.5).
+ 3. The bit meanings of `0x17A20010[17:14]` / `0x17A60010[17:14]` beyond
+    "clear to run, set to park".
+ 4. The meaning of the four port-1 tuning words 0x000FE188, 0x00086800,
+diff --git a/hw/arm/nikon-z63-dwc3.h b/hw/arm/nikon-z63-dwc3.h
+new file mode 100644
+index 0000000..bb18c75
+--- /dev/null
++++ b/hw/arm/nikon-z63-dwc3.h
+@@ -0,0 +1,719 @@
++/*
++ * Nikon Z 6III -- the DWC3 at 0x17880000 as a device-mode controller.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The register file in nikon-z63-usb.h carried the driver through its
++ * bring-up (core soft reset, command-active bits) and no further, because
++ * what is left is not a register but a conversation: a SETUP packet has to
++ * be put where the driver is looking, and its arrival posted to the event
++ * ring the driver reads. This is that conversation, ported from
++ * ../vphone-qemu's hw/usb/apple-dwc3.c (the iPhone board's device-mode
++ * DWC3, GPL-2.0-or-later, same authors), with the Z 6III's own subset:
++ *
++ *   - one event buffer (GEVNTADRLO/HI/SIZ/COUNT at 0xc400..0xc40c, set to
++ *     0xa1aa0c000 / 0x1000 by sub_40C70F14; the walker sub_40C6C454 reads
++ *     events until GEVNTCOUNT is 0 and writes back what it took);
++ *   - sixteen endpoint command blocks (PAR2/PAR1/PAR0/DEPCMD at 0xc800 +
++ *     0x10n, composed by sub_40C70378: param << 16 | cmd, CMDIOC when
++ *     RUN_STOP is set, CMDACT always);
++ *   - the device generic command (DGCMDPAR/DGCMD 0xc710/0xc714), which
++ *     the iPhone driver never used: answered as done, nothing else;
++ *   - DSTS from the state: CONNECTSPD high speed after a reset, link in
++ *     U0, DEVCTRLHLT while the run bit is clear, and the frame number
++ *     moving with virtual time (a driver that waits polls it).
++ *
++ * The bus side is a token interface, z63_dwc3_token(), which is what a
++ * host's packets are: a SETUP lands in the descriptor the driver armed on
++ * physical endpoint 0, an IN or OUT is moved through the endpoint's
++ * descriptor chain (TRBs in the driver's rings, DRAM 0xa1aa09410 +
++ * 1040n), and each finished descriptor is handed back (HWO clear, residue
++ * and status in its size word). As on the part, a finished descriptor is
++ * an event only when it ends the transfer -- LST, or a short OUT packet:
++ * XferComplete -- or asks for one (IOC: XferInProgress); the descriptors
++ * of a chain in between are silent. (GetObject's data phase is two
++ * descriptors, 512 KiB and the rest: an XferComplete for the first has
++ * the driver stall both bulk endpoints when the real end comes.) An endpoint
++ * with nothing armed answers NAK, and on endpoint 0 says XferNotReady
++ * once. The run bit and the bus reset go through the listener and
++ * z63_dwc3_bus_reset(). The iPhone model was a QEMU USBDevice through a
++ * hook its tree added to the USB core; this tree's core runs control
++ * transfers itself and wants them answered at once, which a device that
++ * is guest firmware cannot do, so the host (nikon-z63-usbhost.h) calls
++ * in directly.
++ *
++ * This driver numbers its hardware endpoints its own way: hardware
++ * endpoint = (bEndpointAddress & 0xf) + 1 (sub_40C70950 at 0x40C70A50),
++ * so the PTP interface's 0x81 / 0x02 / 0x83 are 2 / 3 / 4, and DEPCMD(n)
++ * and the events carry that n. Which USB endpoint a hardware endpoint
++ * serves is what SETEPCONFIG says in parameter 1 bits 29:26 (number) and
++ * 25 (direction), as on the part; DALEPENA keeps the USB numbering, bit
++ * 2 * number + direction (sub_40C70B14). A token is routed by that
++ * configuration, not by an assumed 2n + direction. Each transfer is one
++ * STARTTRANSFER over a chain ending in a descriptor with LST
++ * (sub_40C70148), whose completion ends it; UPDATETRANSFER is only ever
++ * written without CMDACT (isochronous rings), so nothing waits on it.
++ *
++ * The register discipline is the board's: an offset no call site names
++ * still stops (z63_dwc3_offset_known in nikon-z63-usb.h); every other
++ * offset the driver names and nothing here gives behaviour is stored.
++ * The iPhone model's lessons are kept with it -- they are about the
++ * DWC3's programming model, not that driver: descriptors are fetched at
++ * the command, a link is followed and not written, an IN shorter than
++ * its descriptor keeps the descriptor, a SETUP clears a protocol stall.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_DWC3_H
++#define HW_ARM_NIKON_Z63_DWC3_H
++
++#include "qemu/log.h"
++#include "system/dma.h"
++
++#define Z63_DWC3_EPS            32      /* physical: 2n out, 2n+1 in */
++#define Z63_DWC3_EVENTS         1
++
++#define Z63_DWC3_GSNPSID        0xc120
++#define Z63_DWC3_DSTS_DEVCTRLHLT (1u << 22)
++#define Z63_DWC3_DSTS_SOFFN_SHIFT 3
++#define Z63_DWC3_DSTS_SOFFN_MASK 0x3fff
++#define Z63_DWC3_MICROFRAME_NS  125000
++#define Z63_DWC3_DCTL_RUN_STOP  (1u << 31)
++#define Z63_DWC3_GEVNTSIZ_INTMASK (1u << 31)
++#define Z63_DWC3_GEVNTSIZ_MASK  0xffff
++#define Z63_DWC3_GEVNTCOUNT_MASK 0xfffc
++
++#define Z63_DEPCMD_CMDIOC       (1u << 8)
++#define Z63_DEPCMD_RSC_SHIFT    16
++#define Z63_DEPCMD_SETEPCONFIG  1
++#define Z63_DEPCMD_SETTRANSFRESOURCE 2
++#define Z63_DEPCMD_GETEPSTATE   3
++#define Z63_DEPCMD_SETSTALL     4
++#define Z63_DEPCMD_CLEARSTALL   5
++#define Z63_DEPCMD_STARTTRANSFER 6
++#define Z63_DEPCMD_UPDATETRANSFER 7
++#define Z63_DEPCMD_ENDTRANSFER  8
++#define Z63_DEPCMD_STARTCFG     9
++
++#define Z63_DEPEVT_XFERCOMPLETE 1
++#define Z63_DEPEVT_XFERINPROGRESS 2
++#define Z63_DEPEVT_XFERNOTREADY 3
++#define Z63_DEPEVT_EPCMDCMPLT   7
++#define Z63_DEVT_DISCONNECT     0
++#define Z63_DEVT_RESET          1
++#define Z63_DEVT_CONNECTDONE    2
++#define Z63_DEPEVT_STATUS_CONTROL_DATA   1
++#define Z63_DEPEVT_STATUS_CONTROL_STATUS 2
++#define Z63_DEPEVT_STATUS_SHORT (1u << 1)
++#define Z63_DEPEVT_STATUS_IOC   (1u << 2)
++#define Z63_DEPEVT_STATUS_LST   (1u << 3)
++
++typedef struct Z63Trb {
++    uint32_t bpl, bph, size, ctrl;
++} Z63Trb;
++
++#define Z63_TRB_HWO             (1u << 0)
++#define Z63_TRB_LST             (1u << 1)
++#define Z63_TRB_CHN             (1u << 2)
++#define Z63_TRB_IOC             (1u << 11)
++#define Z63_TRB_TYPE(x)         (((x) >> 4) & 0x3f)
++#define Z63_TRB_SIZE_MASK       0x00ffffff
++#define Z63_TRB_STS_MASK        (0xfu << 28)
++#define Z63_TRBCTL_NORMAL       1
++#define Z63_TRBCTL_LINK         8
++#define Z63_TRB_PLAUSIBLE_SIZE  (1u << 20)
++#define Z63_TRB_WALK_LIMIT      64
++
++typedef struct Z63Dwc3Ep {
++    uint32_t par2, par1, par0, cmd;
++    uint32_t maxp, type;
++    unsigned interrupter;
++    unsigned usb_num;       /* SETEPCONFIG parameter 1, 29:26 */
++    bool usb_in;            /* and 25 */
++    bool configured;
++    uint64_t trb;           /* where the walk is */
++    uint32_t taken;         /* of that descriptor, already sent */
++    bool armed, stalled, asked;
++} Z63Dwc3Ep;
++
++typedef struct Z63Dwc3 Z63Dwc3;
++
++/* A token's outcome. */
++enum { Z63_TOK_OK, Z63_TOK_NAK, Z63_TOK_STALL };
++#define Z63_TOK_SETUP   0x2d
++#define Z63_TOK_IN      0x69
++#define Z63_TOK_OUT     0xe1
++
++/* What the host beside it hears that the wire does not say. */
++typedef struct Z63Dwc3Listener {
++    void (*attached)(void *opaque);
++    void (*detached)(void *opaque);
++    void (*bus_reset)(void *opaque);
++    void (*ep_armed)(void *opaque, unsigned phys);
++    void *opaque;
++} Z63Dwc3Listener;
++
++struct Z63Dwc3 {
++    MemoryRegion iomem;
++    qemu_irq irq;
++    uint32_t regs[0x10000 / 4];     /* what has no behaviour: stored */
++    struct {
++        uint32_t adrlo, adrhi, size, count, put;
++        bool raised;
++    } evt[Z63_DWC3_EVENTS];
++    uint32_t dctl, dsts, dalepena;
++    Z63Dwc3Ep ep[Z63_DWC3_EPS];
++    bool on_bus;
++    Z63Dwc3Listener listener;
++    bool trace;
++    uint64_t events, transfers;
++};
++
++#define Z63_DWC3_LOG(s, fmt, ...)                                    \
++    do {                                                             \
++        if ((s)->trace) {                                            \
++            qemu_log("z63-dwc3: " fmt "\n", ##__VA_ARGS__);          \
++        }                                                            \
++    } while (0)
++
++/*
++ * The line stands while the ring holds events the driver has not taken
++ * and its mask (GEVNTSIZ bit 31, which the ISR sub_40C6C618 sets before
++ * waking EXSUSBDP) is clear.
++ */
++static void z63_dwc3_update_irq(Z63Dwc3 *s, unsigned n)
++{
++    bool level = (s->evt[n].count & Z63_DWC3_GEVNTCOUNT_MASK) &&
++                 !(s->evt[n].size & Z63_DWC3_GEVNTSIZ_INTMASK);
++
++    if (level != s->evt[n].raised) {
++        Z63_DWC3_LOG(s, "line %s (%u byte(s), mask %d)", level ? "up" : "down",
++                     s->evt[n].count,
++                     !!(s->evt[n].size & Z63_DWC3_GEVNTSIZ_INTMASK));
++    }
++    s->evt[n].raised = level;
++    qemu_set_irq(s->irq, level);
++}
++
++static void z63_dwc3_push(Z63Dwc3 *s, unsigned n, uint32_t word)
++{
++    uint64_t base = ((uint64_t)s->evt[n].adrhi << 32) | s->evt[n].adrlo;
++    uint32_t size = s->evt[n].size & Z63_DWC3_GEVNTSIZ_MASK;
++    uint32_t put;
++
++    if (size < sizeof(word) || !base) {
++        Z63_DWC3_LOG(s, "event 0x%08x dropped: no event buffer", word);
++        return;
++    }
++    if (s->evt[n].count + sizeof(word) > size) {
++        error_report("Z63_DWC3: event buffer full, event 0x%08x dropped",
++                     word);
++        return;
++    }
++    put = s->evt[n].put % size;
++    word = cpu_to_le32(word);
++    if (dma_memory_write(&address_space_memory, base + put, &word,
++                         sizeof(word), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        return;
++    }
++    s->evt[n].put = (put + sizeof(word)) % size;
++    s->evt[n].count += sizeof(word);
++    s->events++;
++    Z63_DWC3_LOG(s, "event 0x%08x, %u byte(s) outstanding",
++                 le32_to_cpu(word), s->evt[n].count);
++    z63_dwc3_update_irq(s, n);
++}
++
++static void z63_dwc3_depevt(Z63Dwc3 *s, unsigned phys, unsigned type,
++                            unsigned status, unsigned params)
++{
++    unsigned n = s->ep[phys].interrupter;
++
++    z63_dwc3_push(s, n < Z63_DWC3_EVENTS ? n : 0,
++                  ((phys & 0x1f) << 1) | ((type & 0xf) << 6) |
++                  ((status & 0xf) << 12) | ((params & 0xffff) << 16));
++}
++
++static void z63_dwc3_devt(Z63Dwc3 *s, unsigned type, unsigned info)
++{
++    z63_dwc3_push(s, 0, 1u | ((type & 0xf) << 8) | ((info & 0x1ff) << 16));
++}
++
++static void z63_dwc3_ep_reset(Z63Dwc3 *s, unsigned phys)
++{
++    Z63Dwc3Ep *ep = &s->ep[phys];
++
++    ep->armed = ep->stalled = ep->asked = false;
++    ep->trb = 0;
++    ep->taken = 0;
++}
++
++/* The run bit: the device may be seen. The host notices and resets it,
++ * and the reset says what speed came out of it. */
++static void z63_dwc3_set_running(Z63Dwc3 *s, bool running)
++{
++    if (running) {
++        s->dsts &= ~Z63_DWC3_DSTS_DEVCTRLHLT;
++        if (!s->on_bus) {
++            s->on_bus = true;
++            error_report("Z63_DWC3: run bit set -- the camera is on the bus");
++            if (s->listener.attached) {
++                s->listener.attached(s->listener.opaque);
++            }
++        }
++    } else {
++        s->dsts |= Z63_DWC3_DSTS_DEVCTRLHLT;
++        if (s->on_bus) {
++            s->on_bus = false;
++            error_report("Z63_DWC3: run bit clear -- off the bus");
++            if (s->listener.detached) {
++                s->listener.detached(s->listener.opaque);
++            }
++        }
++    }
++}
++
++static bool z63_dwc3_trb_plausible(const Z63Trb *trb)
++{
++    unsigned type = Z63_TRB_TYPE(trb->ctrl);
++    uint32_t size = trb->size & Z63_TRB_SIZE_MASK;
++
++    if ((trb->ctrl & 0xffff0000u) || type < Z63_TRBCTL_NORMAL ||
++        type > Z63_TRBCTL_LINK) {
++        return false;
++    }
++    return type == Z63_TRBCTL_LINK ? size == 0
++                                   : size <= Z63_TRB_PLAUSIBLE_SIZE;
++}
++
++static bool z63_dwc3_read_trb(uint64_t at, Z63Trb *trb)
++{
++    if (dma_memory_read(&address_space_memory, at, trb, sizeof(*trb),
++                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        return false;
++    }
++    trb->bpl = le32_to_cpu(trb->bpl);
++    trb->bph = le32_to_cpu(trb->bph);
++    trb->size = le32_to_cpu(trb->size);
++    trb->ctrl = le32_to_cpu(trb->ctrl);
++    return true;
++}
++
++static void z63_dwc3_write_trb(uint64_t at, const Z63Trb *trb)
++{
++    Z63Trb w = {
++        cpu_to_le32(trb->bpl), cpu_to_le32(trb->bph),
++        cpu_to_le32(trb->size), cpu_to_le32(trb->ctrl),
++    };
++
++    smp_wmb();
++    dma_memory_write(&address_space_memory, at, &w, sizeof(w),
++                     MEMTXATTRS_UNSPECIFIED);
++}
++
++/* Links are followed at the command, while they are valid (hardware
++ * fetches at STARTTRANSFER/UPDATETRANSFER). */
++static void z63_dwc3_follow_links(Z63Dwc3 *s, unsigned phys)
++{
++    Z63Dwc3Ep *ep = &s->ep[phys];
++
++    for (unsigned steps = 0; ep->trb && !ep->taken &&
++                             steps < Z63_TRB_WALK_LIMIT; steps++) {
++        Z63Trb trb;
++
++        if (!z63_dwc3_read_trb(ep->trb, &trb) || !(trb.ctrl & Z63_TRB_HWO) ||
++            Z63_TRB_TYPE(trb.ctrl) != Z63_TRBCTL_LINK ||
++            !z63_dwc3_trb_plausible(&trb)) {
++            break;
++        }
++        ep->trb = ((uint64_t)trb.bph << 32) | trb.bpl;
++    }
++}
++
++static void z63_dwc3_depcmd(Z63Dwc3 *s, unsigned phys, uint32_t cmd)
++{
++    Z63Dwc3Ep *ep = &s->ep[phys];
++    unsigned type = cmd & 0xf, resource = 0;
++
++    Z63_DWC3_LOG(s, "ep %u command %u (0x%08x) par0 0x%08x par1 0x%08x",
++                 phys, type, cmd, ep->par0, ep->par1);
++    switch (type) {
++    case Z63_DEPCMD_STARTCFG:
++        /*
++         * Its transfer-resource index says where the reset starts: 0 at
++         * initialisation, every endpoint; 2 at SET_CONFIGURATION
++         * (0x00020509 here), only the ones past the control pair -- whose
++         * status stage is still to come. (Resetting endpoint 1 there had
++         * it say XferNotReady(status) twice; the driver answered the
++         * second in the next session's data stage with a zero-length
++         * packet, and every control stage after it was one behind.)
++         */
++        if (phys == 0) {
++            for (unsigned i = (cmd >> 16) & 0x7f; i < Z63_DWC3_EPS; i++) {
++                z63_dwc3_ep_reset(s, i);
++            }
++        }
++        break;
++    case Z63_DEPCMD_SETEPCONFIG:
++        ep->type = (ep->par0 >> 1) & 3;
++        ep->maxp = (ep->par0 >> 3) & 0x7ff;
++        ep->interrupter = ep->par1 & 0x1f;
++        ep->usb_num = (ep->par1 >> 26) & 0xf;
++        ep->usb_in = (ep->par1 >> 25) & 1;
++        ep->configured = true;
++        Z63_DWC3_LOG(s, "hardware endpoint %u is USB endpoint %u %s, type "
++                     "%u, max packet %u", phys, ep->usb_num,
++                     ep->usb_in ? "in" : "out", ep->type, ep->maxp);
++        break;
++    case Z63_DEPCMD_SETTRANSFRESOURCE:
++        break;
++    case Z63_DEPCMD_SETSTALL:
++        ep->stalled = true;
++        break;
++    case Z63_DEPCMD_CLEARSTALL:
++        ep->stalled = false;
++        break;
++    case Z63_DEPCMD_STARTTRANSFER:
++        ep->trb = ((uint64_t)ep->par0 << 32) | ep->par1;
++        ep->taken = 0;
++        ep->armed = true;
++        ep->asked = false;
++        resource = phys + 1;
++        if (phys >= 2) {
++            z63_dwc3_follow_links(s, phys);
++        }
++        break;
++    case Z63_DEPCMD_UPDATETRANSFER:
++        if (phys >= 2) {
++            z63_dwc3_follow_links(s, phys);
++        }
++        break;
++    case Z63_DEPCMD_ENDTRANSFER:
++        ep->armed = false;
++        ep->trb = 0;
++        ep->taken = 0;
++        break;
++    case Z63_DEPCMD_GETEPSTATE:
++        ep->par2 = 0;
++        break;
++    default:
++        error_report("Z63_DWC3: endpoint %u command %u is not modelled",
++                     phys, type);
++        break;
++    }
++    ep->cmd = (cmd & ~Z63_DWC3_CMDACT & 0xffff) |
++              (type == Z63_DEPCMD_STARTTRANSFER ?
++               resource << Z63_DEPCMD_RSC_SHIFT : cmd & 0xffff0000u);
++    if (cmd & Z63_DEPCMD_CMDIOC) {
++        /* the command's type in parameter 11:8: the driver ends a
++         * transfer on EPCmdCmplt of ENDTRANSFER */
++        z63_dwc3_depevt(s, phys, Z63_DEPEVT_EPCMDCMPLT, 0, type << 8);
++    }
++    if ((type == Z63_DEPCMD_STARTTRANSFER ||
++         type == Z63_DEPCMD_UPDATETRANSFER) && s->listener.ep_armed) {
++        s->listener.ep_armed(s->listener.opaque, phys);
++    }
++}
++
++/* One token's worth of a transfer through the endpoint's descriptors.
++ * Returns false when nothing armed is the block's yet (a NAK). */
++static bool z63_dwc3_run_trbs(Z63Dwc3 *s, unsigned phys, bool in,
++                              uint8_t *buf, uint32_t total,
++                              unsigned *moved, unsigned *status,
++                              bool *complete)
++{
++    Z63Dwc3Ep *ep = &s->ep[phys];
++    unsigned done = 0, steps = 0;
++    uint64_t at = ep->trb;
++    bool ours = false;
++
++    while ((done < total || !ours) && steps++ < Z63_TRB_WALK_LIMIT) {
++        Z63Trb trb;
++        uint64_t buffer;
++        uint32_t room, take;
++
++        if (!z63_dwc3_read_trb(at, &trb) || !(trb.ctrl & Z63_TRB_HWO)) {
++            break;
++        }
++        smp_rmb();
++        if (!z63_dwc3_trb_plausible(&trb)) {
++            Z63_DWC3_LOG(s, "ep %u: 0x%" PRIx64 " holds no descriptor",
++                         phys, at);
++            break;
++        }
++        buffer = ((uint64_t)trb.bph << 32) | trb.bpl;
++        if (Z63_TRB_TYPE(trb.ctrl) == Z63_TRBCTL_LINK) {
++            at = buffer;
++            ep->trb = at;
++            continue;
++        }
++        ours = true;
++        room = (trb.size & Z63_TRB_SIZE_MASK) - ep->taken;
++        buffer += ep->taken;
++        take = MIN(room, total - done);
++        if (in) {
++            if (take && dma_memory_read(&address_space_memory, buffer,
++                                        buf + done, take,
++                                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++                take = 0;
++            }
++        } else if (take) {
++            dma_memory_write(&address_space_memory, buffer, buf + done, take,
++                             MEMTXATTRS_UNSPECIFIED);
++        }
++        done += take;
++        if (in && take < room) {
++            ep->taken += take;      /* the rest of it is still owed */
++            break;
++        }
++        ep->taken = 0;
++        *status = (take < room ? Z63_DEPEVT_STATUS_SHORT : 0) |
++                  (trb.ctrl & Z63_TRB_IOC ? Z63_DEPEVT_STATUS_IOC : 0) |
++                  (trb.ctrl & Z63_TRB_LST ? Z63_DEPEVT_STATUS_LST : 0);
++        trb.size = (trb.size & ~(Z63_TRB_SIZE_MASK | Z63_TRB_STS_MASK)) |
++                   (room - take);
++        trb.ctrl &= ~Z63_TRB_HWO;
++        z63_dwc3_write_trb(at, &trb);
++        at += sizeof(trb);
++        ep->trb = at;
++        if (!in && take < room) {
++            trb.ctrl |= Z63_TRB_LST;    /* a short packet ends it there */
++        }
++        if (trb.ctrl & Z63_TRB_LST) {
++            *complete = true;
++        } else if (trb.ctrl & Z63_TRB_IOC) {
++            Z63_DWC3_LOG(s, "ep %u: descriptor done, transfer goes on", phys);
++            z63_dwc3_depevt(s, phys, Z63_DEPEVT_XFERINPROGRESS, *status, 0);
++        }
++        if (trb.ctrl & Z63_TRB_LST) {
++            /* the transfer is over: the next needs a STARTTRANSFER */
++            at = 0;
++            ep->armed = false;
++            break;
++        }
++        if (!(trb.ctrl & Z63_TRB_CHN)) {
++            break;
++        }
++    }
++    *moved = done;
++    ep->trb = at;
++    return ours;
++}
++
++/* A token from the host: pid Z63_TOK_SETUP/IN/OUT on endpoint `nr`,
++ * `len` bytes at `buf` (SETUP: the eight-byte request). */
++static int z63_dwc3_token(Z63Dwc3 *s, int pid, unsigned nr, uint8_t *buf,
++                          uint32_t len, uint32_t *moved_out)
++{
++    bool in = pid == Z63_TOK_IN;
++    unsigned phys = Z63_DWC3_EPS;
++    Z63Dwc3Ep *ep;
++    unsigned moved = 0, status = 0;
++    bool complete = false;
++
++    *moved_out = 0;
++    if (!s->on_bus || nr > 15) {
++        return Z63_TOK_STALL;
++    }
++    if (nr == 0) {
++        phys = in ? 1 : 0;
++    } else {
++        for (unsigned i = 2; i < Z63_DWC3_EPS; i++) {
++            if (s->ep[i].configured && s->ep[i].usb_num == nr &&
++                s->ep[i].usb_in == in) {
++                phys = i;
++                break;
++            }
++        }
++    }
++    if (!(s->dalepena & (1u << (2 * nr + in))) || phys >= Z63_DWC3_EPS) {
++        return Z63_TOK_NAK;
++    }
++    ep = &s->ep[phys];
++    if (pid == Z63_TOK_SETUP) {
++        s->ep[0].stalled = s->ep[1].stalled = false;
++    }
++    if (ep->stalled) {
++        return Z63_TOK_STALL;
++    }
++    if (!ep->trb) {
++        if (nr == 0 && !ep->asked) {
++            ep->asked = true;
++            z63_dwc3_depevt(s, phys, Z63_DEPEVT_XFERNOTREADY,
++                            len ? Z63_DEPEVT_STATUS_CONTROL_DATA
++                                : Z63_DEPEVT_STATUS_CONTROL_STATUS, 0);
++        }
++        return Z63_TOK_NAK;
++    }
++    if (!z63_dwc3_run_trbs(s, phys, in, buf, len, &moved, &status,
++                           &complete)) {
++        if (nr == 0 && !ep->asked) {
++            ep->asked = true;
++            z63_dwc3_depevt(s, phys, Z63_DEPEVT_XFERNOTREADY, 0, 0);
++        }
++        return Z63_TOK_NAK;
++    }
++    ep->asked = false;
++    s->transfers++;
++    *moved_out = moved;
++    Z63_DWC3_LOG(s, "ep %u moved %u of %u byte(s)%s", phys, moved, len,
++                 complete ? ", transfer done" : "");
++    if (complete) {
++        z63_dwc3_depevt(s, phys, Z63_DEPEVT_XFERCOMPLETE, status, 0);
++    }
++    return Z63_TOK_OK;
++}
++
++/* The host reset the port: high speed, address 0, Reset and ConnectDone
++ * posted -- the latter is what has the driver configure endpoint 0. */
++static void z63_dwc3_bus_reset(Z63Dwc3 *s)
++{
++    for (unsigned i = 0; i < Z63_DWC3_EPS; i++) {
++        s->ep[i].stalled = s->ep[i].asked = false;
++    }
++    s->regs[Z63_DWC3_DCFG / 4] &= ~(0x7fu << 3);
++    s->dsts &= ~7u;
++    z63_dwc3_devt(s, Z63_DEVT_RESET, 0);
++    z63_dwc3_devt(s, Z63_DEVT_CONNECTDONE, 0);
++}
++
++static uint64_t z63_dwc3_read(void *opaque, hwaddr off, unsigned size)
++{
++    Z63Dwc3 *s = opaque;
++
++    if (size != 4 || (off & 3) || !z63_dwc3_offset_known(off)) {
++        z63_stop_read("DWC3", Z63_DWC3_BASE + off, size);
++        return 0;
++    }
++    if (off >= Z63_DWC3_GEVNTADRLO && off <= Z63_DWC3_GEVNTCOUNT) {
++        switch (off - Z63_DWC3_GEVNTADRLO) {
++        case 0x0: return s->evt[0].adrlo;
++        case 0x4: return s->evt[0].adrhi;
++        case 0x8: return s->evt[0].size;
++        default:  return s->evt[0].count & Z63_DWC3_GEVNTCOUNT_MASK;
++        }
++    }
++    if (off >= Z63_DWC3_DEP_BASE && off < Z63_DWC3_DEP_END) {
++        Z63Dwc3Ep *ep = &s->ep[(off - Z63_DWC3_DEP_BASE) / 0x10];
++
++        switch (off & 0xc) {
++        case 0x0: return ep->par2;
++        case 0x4: return ep->par1;
++        case 0x8: return ep->par0;
++        default:  return ep->cmd;
++        }
++    }
++    switch (off) {
++    case Z63_DWC3_DCTL:
++        return s->dctl;
++    case Z63_DWC3_DSTS:
++        return s->dsts |
++               (((qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
++                  Z63_DWC3_MICROFRAME_NS) & Z63_DWC3_DSTS_SOFFN_MASK)
++                << Z63_DWC3_DSTS_SOFFN_SHIFT);
++    case Z63_DWC3_DALEPENA:
++        return s->dalepena;
++    default:
++        return s->regs[off / 4];
++    }
++}
++
++static void z63_dwc3_write(void *opaque, hwaddr off, uint64_t value,
++                           unsigned size)
++{
++    Z63Dwc3 *s = opaque;
++    uint32_t v = value;
++
++    if (size != 4 || (off & 3) || !z63_dwc3_offset_known(off) ||
++        off == Z63_DWC3_DSTS) {
++        z63_stop_write("DWC3", Z63_DWC3_BASE + off, size, value);
++        return;
++    }
++    if (off >= Z63_DWC3_GEVNTADRLO && off <= Z63_DWC3_GEVNTCOUNT) {
++        switch (off - Z63_DWC3_GEVNTADRLO) {
++        case 0x0: s->evt[0].adrlo = v; s->evt[0].put = 0; break;
++        case 0x4: s->evt[0].adrhi = v; s->evt[0].put = 0; break;
++        case 0x8:
++            /*
++             * The ISR masks and EXSUSBDP unmasks through this register
++             * on every batch: only a new size starts the ring over. (A
++             * reset here put each batch's events back at the start of
++             * the ring while the driver read on from where it was, and
++             * enumeration stopped at the first status stage.)
++             */
++            if ((v ^ s->evt[0].size) & Z63_DWC3_GEVNTSIZ_MASK) {
++                s->evt[0].put = 0;
++            }
++            s->evt[0].size = v;
++            break;
++        default:
++            Z63_DWC3_LOG(s, "driver took %u of %u byte(s)",
++                         v & Z63_DWC3_GEVNTCOUNT_MASK, s->evt[0].count);
++            s->evt[0].count -= MIN(v & Z63_DWC3_GEVNTCOUNT_MASK,
++                                   s->evt[0].count);
++            break;
++        }
++        z63_dwc3_update_irq(s, 0);
++        return;
++    }
++    if (off >= Z63_DWC3_DEP_BASE && off < Z63_DWC3_DEP_END) {
++        unsigned n = (off - Z63_DWC3_DEP_BASE) / 0x10;
++        Z63Dwc3Ep *ep = &s->ep[n];
++
++        switch (off & 0xc) {
++        case 0x0: ep->par2 = v; break;
++        case 0x4: ep->par1 = v; break;
++        case 0x8: ep->par0 = v; break;
++        default:
++            if (v & Z63_DWC3_CMDACT) {
++                z63_dwc3_depcmd(s, n, v);
++            } else {
++                ep->cmd = v;
++            }
++            break;
++        }
++        return;
++    }
++    switch (off) {
++    case Z63_DWC3_DCTL:
++        if (v & Z63_DWC3_DCTL_CSFTRST) {
++            for (unsigned i = 0; i < Z63_DWC3_EPS; i++) {
++                z63_dwc3_ep_reset(s, i);
++            }
++            v &= ~Z63_DWC3_DCTL_CSFTRST;
++        }
++        if ((v ^ s->dctl) & Z63_DWC3_DCTL_RUN_STOP) {
++            z63_dwc3_set_running(s, v & Z63_DWC3_DCTL_RUN_STOP);
++        }
++        s->dctl = v;
++        break;
++    case Z63_DWC3_DGCMD:
++        s->regs[off / 4] = v & ~Z63_DWC3_CMDACT;    /* done at once */
++        break;
++    case Z63_DWC3_DALEPENA:
++        s->dalepena = v;
++        break;
++    default:
++        s->regs[off / 4] = v;
++        break;
++    }
++}
++
++static const MemoryRegionOps z63_dwc3_dev_ops = {
++    .read = z63_dwc3_read,
++    .write = z63_dwc3_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void z63_dwc3_reset(Z63Dwc3 *s)
++{
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->evt, 0, sizeof(s->evt));
++    memset(s->ep, 0, sizeof(s->ep));
++    s->dctl = s->dalepena = 0;
++    s->on_bus = false;
++    s->dsts = Z63_DWC3_DSTS_DEVCTRLHLT;
++    qemu_set_irq(s->irq, 0);
++}
++
++#endif /* HW_ARM_NIKON_Z63_DWC3_H */
+diff --git a/hw/arm/nikon-z63-usb.h b/hw/arm/nikon-z63-usb.h
+index 039e2c3..ee0833a 100644
+--- a/hw/arm/nikon-z63-usb.h
++++ b/hw/arm/nikon-z63-usb.h
+@@ -296,10 +296,12 @@ typedef struct Z63UsbWin {
+     MemoryRegion region;
+ } Z63UsbWin;
+ 
++typedef struct Z63Dwc3 Z63Dwc3;
++
+ typedef struct Z63Usb {
+-    /* 0x17880000..0x1788ffff. */
+-    MemoryRegion dwc3;
+-    uint32_t dwc3_regs[Z63_DWC3_SIZE / 4];
++    /* 0x17880000..0x1788ffff: the device-mode controller,
++     * nikon-z63-dwc3.h. */
++    Z63Dwc3 *ctl;
+ 
+     /* 0x17a00000..0x17a01fff. */
+     MemoryRegion exs;
+@@ -312,6 +314,8 @@ typedef struct Z63Usb {
+     /* 0x17a40000..0x17a40fff. */
+     MemoryRegion assist;
+     uint32_t assist_regs[Z63_USB_ASSIST_SIZE / 4];
++    uint32_t assist_is;         /* +0x008 status, write one to clear */
++    qemu_irq assist_irq;        /* EXS_USB3_TYPE_C_ASSIST, SPI 109 */
+ 
+     /* -machine cfexpress=on: a card in the CFexpress slot, behind PCIe
+      * port 2 (../z9-qemu's adapter, nikon-z9-pcie.h). */
+@@ -450,146 +454,10 @@ static bool z63_usb_assist_offset_known(hwaddr off)
+     }
+ }
+ 
+-/* ------------------------------------------------------------------ */
+-/* DWC3 behaviour                                                      */
+-/*                                                                    */
+-/* Three self-clearing bits and two forced reads. Nothing else in the   */
+-/* 0x17880000 window does anything but store and return the last write.  */
+-/* ------------------------------------------------------------------ */
+-
+-static bool z63_dwc3_is_depcmd(hwaddr off)
+-{
+-    return off >= Z63_DWC3_DEP_BASE && off < Z63_DWC3_DEP_END &&
+-           (off & (Z63_DWC3_DEP_STRIDE - 1)) == Z63_DWC3_DEPCMD_IN_BLK;
+-}
+-
+-static uint64_t z63_dwc3_read(void *opaque, hwaddr off, unsigned size)
+-{
+-    Z63Usb *u = opaque;
+-
+-    if (size != 4 || (off & 3) || off >= Z63_DWC3_SIZE) {
+-        z63_stop_read("DWC3", Z63_DWC3_BASE + off, size);
+-        return 0;
+-    }
+-    if (!z63_dwc3_offset_known(off)) {
+-        z63_stop_read("DWC3", Z63_DWC3_BASE + off, size);
+-        return 0;
+-    }
+-
+-    switch (off) {
+-    case Z63_DWC3_DSTS:
+-        /* Read-only. Two call sites. sub_40C7052C (0x40C70534), run before
+-         * every STARTTRANSFER, does
+-         *     if ((DSTS & 0x3C0000) && (DCTL & 0x80000000)) DCTL |= 0x100;
+-         * -- "if USBLNKST is not U0, request link Recovery". 0 means U0 and
+-         * the request is skipped, which is the right answer for a
+-         * controller with nothing attached.
+-         *
+-         * The other site, 0x40C6CF6C, uses DSTS[2:0] CONNECTSPD as a 6-way
+-         * jump-table index (table at rodata 0x4185B22A, dispatch BR X11 at
+-         * 0x40C6CF9C) and treats a value > 5 as fault state 99; 0 is
+-         * High-Speed, legal and quiet. That site is only reachable from a
+-         * USB-reset EVENT, which cannot arrive while GEVNTCOUNT reads 0.
+-         *
+-         * Bits 22..29 (RXFIFOEMPTY, SSS, RSS, COREIDLE, DEVCTRLHLT) are
+-         * read by nothing in this image and no value is asserted for them;
+-         * they are 0 because nothing establishes otherwise. */
+-        return 0;
+-
+-    case Z63_DWC3_GEVNTCOUNT:
+-        /* The number of event bytes the controller has produced. The event
+-         * walker sub_40C6C454 (read at 0x40C6C514) uses it as the only exit
+-         * condition of a `while (1)` loop over the DRAM event buffer, so
+-         * this value decides whether the firmware parses garbage.
+-         *
+-         * 0 is not a placeholder: this model generates no events, so no
+-         * event bytes exist. Replayed against the loop it consumes one zero
+-         * word from the (zeroed) buffer at 0xA1AA0C000, dispatches nothing
+-         * because ((0 >> 6) & 0xF) - 1 fails the loop's own `>= 7` guard,
+-         * writes GEVNTCOUNT back as 0 and returns. */
+-        return 0;
+-
+-    default:
+-        /* Includes GEVNTADRLO/HI, which sub_40C6C454 reads back at
+-         * 0x40C6C4FC/0x40C6C508 to find the event buffer, and
+-         * GUSB2PHYCFG, which sub_40C70378 saves at 0x40C703C8 and restores
+-         * at 0x40C70514 around every endpoint command. Both need the last
+-         * written value, not a synthesised one.
+-         *
+-         * DEPCMD reads land here too. After STARTTRANSFER, sub_40C701F0
+-         * (0x40C70284) keeps bits [31:16] as the transfer resource index
+-         * and later hands it to ENDTRANSFER. Real DWC3 returns a
+-         * hardware-assigned XferRscIdx in [22:16]; this returns what was
+-         * written. UNMEASURED -- the firmware only needs the value to be
+-         * stable, and inventing an index would be no more defensible.
+-         *
+-         * Unwritten offsets read 0. That is NOT a measured reset value;
+-         * see docs/usb-registers.md section 5, which lists the registers
+-         * whose real reset state the read-modify-writes depend on. */
+-        return u->dwc3_regs[off / 4];
+-    }
+-}
+-
+-static void z63_dwc3_write(void *opaque, hwaddr off, uint64_t value,
+-                           unsigned size)
+-{
+-    Z63Usb *u = opaque;
+-    hwaddr abs = Z63_DWC3_BASE + off;
+-    uint32_t v = (uint32_t)value;
+-
+-    if (size != 4 || (off & 3) || off >= Z63_DWC3_SIZE) {
+-        z63_stop_write("DWC3", abs, size, value);
+-        return;
+-    }
+-    if (!z63_dwc3_offset_known(off)) {
+-        z63_stop_write("DWC3", abs, size, value);
+-        return;
+-    }
+-    if (off == Z63_DWC3_DSTS) {
+-        /* The firmware never writes DSTS. A write means either a new
+-         * firmware path or a wrong model, and both are worth a stop. */
+-        z63_stop_write("DWC3-RO", abs, size, value);
+-        return;
+-    }
+-
+-    if (off == Z63_DWC3_DCTL) {
+-        /* bit 30 CSFTRST is a self-clearing core reset. sub_40C71110 sets
+-         * it at 0x40C71168 and then polls up to 1000 times, delay(1) each,
+-         * for it to read back 0 (read 0x40C7118C, TBZ W0,#0x1E at
+-         * 0x40C71190). Clearing it in the store makes the first poll
+-         * succeed; leaving it set would cost 1000 scheduler delays and
+-         * then be ignored. */
+-        v &= ~Z63_DWC3_DCTL_CSFTRST;
+-    } else if (off == Z63_DWC3_DGCMD || z63_dwc3_is_depcmd(off)) {
+-        /* bit 10 CMDACT is the command-busy bit for both command
+-         * interfaces. DEPCMD: written 0x40C70498, polled 0x40C704B0
+-         * (TBZ W8,#0xA at 0x40C704BC), 1000 tries, then driver error 8 is
+-         * stored to BSS 0xA02E7A8A0 at 0x40C704F8. DGCMD: written
+-         * 0x40C705EC, polled 0x40C70608 (TBZ W0,#0xA at 0x40C7060C), same
+-         * shape. Clearing it in the store is "the command completed
+-         * immediately".
+-         *
+-         * Note what is NOT done here: the firmware never reads the DWC3
+-         * CMDSTATUS field [15:12] anywhere in this image, so no completion
+-         * code is synthesised. The written bits are left alone. */
+-        v &= ~Z63_DWC3_CMDACT;
+-    }
+-
+-    /* GCTL bit 11 CoreSoftReset is deliberately NOT self-cleared:
+-     * sub_40C717EC sets it (0x40C71824), delays, and clears it itself
+-     * (0x40C71838) without ever reading it back, so the stored value is
+-     * never observed and clearing it would assert behaviour nothing
+-     * measures. */
+-
+-    u->dwc3_regs[off / 4] = v;
+-}
+-
+-static const MemoryRegionOps z63_dwc3_ops = {
+-    .read = z63_dwc3_read,
+-    .write = z63_dwc3_write,
+-    .endianness = DEVICE_LITTLE_ENDIAN,
+-    .valid = { .min_access_size = 4, .max_access_size = 4 },
+-};
++/* The DWC3's behaviour -- events, endpoint commands, transfers -- is the
++ * controller in nikon-z63-dwc3.h, which keeps this file's offset list
++ * (z63_dwc3_offset_known) and its stops. */
++#include "hw/arm/nikon-z63-dwc3.h"
+ 
+ /* ------------------------------------------------------------------ */
+ /* EXS subsystem control at 0x17A00000                                 */
+@@ -790,10 +658,9 @@ static uint64_t z63_usb_assist_read(void *opaque, hwaddr off, unsigned size)
+     }
+ 
+     if (off == Z63_USB_ASSIST_IS) {
+-        /* Write-1-to-clear status, two sources. Nothing here raises them,
+-         * so nothing is pending. The read-modify-writes at 0x40C71768 and
+-         * in the ISR then write back only the two bits they set. */
+-        return 0;
++        /* Write-1-to-clear status, two sources, raised by the arming
++         * write below. */
++        return u->assist_is;
+     }
+ 
+     /* +0x010 and +0x014 are read to be modified (0x40C71728, 0x40C7177C);
+@@ -813,19 +680,25 @@ static void z63_usb_assist_write(void *opaque, hwaddr off, uint64_t value,
+         return;
+     }
+ 
+-    if (off == Z63_USB_ASSIST_MODE) {
+-        /* The arming write. See the block comment above: completing it
+-         * requires an interrupt whose line this image does not reveal, and
+-         * the firmware's wait has no bound and no register in it. Stop with
+-         * the PC rather than hang. */
+-        z63_stop_write("USB-ASSIST-ARM", abs, size, value);
+-        return;
+-    }
+     if (off == Z63_USB_ASSIST_IS) {
+-        return; /* W1C against an always-0 status */
++        u->assist_is &= ~(uint32_t)value;
++        qemu_set_irq(u->assist_irq,
++                     u->assist_is & u->assist_regs[Z63_USB_ASSIST_IE / 4]);
++        return;
+     }
+-
+     u->assist_regs[off / 4] = (uint32_t)value;
++    if (off == Z63_USB_ASSIST_MODE && (value & 0x1f)) {
++        /* The arming write (0x40C71788, mode 0x11 or 0x15), after which
++         * sub_40C716E4 waits, unbounded, for its ISR's flag 0xa02e7b078.
++         * The ISR (sub_40C6A32C -> sub_40C717B4, INTID 141 = SPI 109,
++         * installed at 0x40C6A30C and 0x40C6BFC4) only acknowledges both
++         * sources (+0x008 |= 3) and sets the flag. DECLARED: the block
++         * answers its arming at once with source 0, which is all the
++         * firmware distinguishes. */
++        u->assist_is |= 1;
++        qemu_set_irq(u->assist_irq,
++                     u->assist_is & u->assist_regs[Z63_USB_ASSIST_IE / 4]);
++    }
+ }
+ 
+ static const MemoryRegionOps z63_usb_assist_ops = {
+@@ -858,7 +731,7 @@ static void z63_usb_reset(Z63Usb *u)
+ {
+     unsigned i;
+ 
+-    memset(u->dwc3_regs, 0, sizeof(u->dwc3_regs));
++    z63_dwc3_reset(u->ctl);
+     memset(u->exs_regs, 0, sizeof(u->exs_regs));
+     memset(u->assist_regs, 0, sizeof(u->assist_regs));
+     for (i = 0; i < Z63_USB_PHY_INST; i++) {
+@@ -876,14 +749,15 @@ static void z63_usb_init(Object *owner, MemoryRegion *sysmem, Z63Usb *u)
+     };
+     unsigned i;
+ 
++    u->ctl = g_new0(Z63Dwc3, 1);
+     z63_usb_reset(u);
+ 
+     /* 0x17880000..0x1788ffff, one region, so that an offset the driver has
+      * never named still reaches this model and stops with the block name
+      * rather than landing in the unassigned pool. */
+-    memory_region_init_io(&u->dwc3, owner, &z63_dwc3_ops, u,
++    memory_region_init_io(&u->ctl->iomem, owner, &z63_dwc3_dev_ops, u->ctl,
+                           "z63-usb-dwc3", Z63_DWC3_SIZE);
+-    memory_region_add_subregion(sysmem, Z63_DWC3_BASE, &u->dwc3);
++    memory_region_add_subregion(sysmem, Z63_DWC3_BASE, &u->ctl->iomem);
+ 
+     /* 0x17a00000..0x17a01fff. Shared with the PCIe driver -- see the
+      * comment on Z63_EXS_BASE. */
+diff --git a/hw/arm/nikon-z63-usbhost.h b/hw/arm/nikon-z63-usbhost.h
+new file mode 100644
+index 0000000..b75e7eb
+--- /dev/null
++++ b/hw/arm/nikon-z63-usbhost.h
+@@ -0,0 +1,792 @@
++/*
++ * Nikon Z 6III -- a USB host on the other end of the camera's USB port,
++ * and a USB/IP server in front of it (-machine usbip=).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The camera is a USB device (nikon-z63-dwc3.h); a device needs a host.
++ * This is that host, reduced to what a host controller does for one
++ * device on one port:
++ *
++ *   - when the camera comes on the bus (the driver's run bit) it resets
++ *     the port 20 ms later, as a hub does on a connect -- the reset is
++ *     what makes the controller post Reset and ConnectDone;
++ *   - it runs transfers: a control transfer as its three stages (SETUP,
++ *     the data stage IN or OUT, the status stage the other way), a bulk
++ *     transfer as tokens until it is full or a packet comes back short
++ *     (or, OUT, until every byte has gone); a NAK is retried when the
++ *     controller says an endpoint was armed, and every millisecond
++ *     otherwise; a STALL ends the transfer;
++ *   - after each reset it reads the device descriptor, sets address 1 and
++ *     reads the configuration descriptor, for the USB/IP device list and
++ *     the log.
++ *
++ * USB/IP (the protocol of Linux's usbip-host / vhci-hcd, version 1.1.1)
++ * is the outside: OP_REQ_DEVLIST, OP_REQ_IMPORT of bus id "1-1", then
++ * CMD_SUBMIT / RET_SUBMIT and CMD_UNLINK / RET_UNLINK, one client at a
++ * time. A Linux host should attach it with `usbip attach -r <host> -b
++ * 1-1` (TCP, usbip=tcp:<addr>:3240) and gphoto2 talk PTP to it as to the
++ * real one -- not tried; what is tried is z63-tools/ptp.py, a client for
++ * hosts without vhci-hcd (macOS): descriptors, PTP info/ls/get, a remote
++ * release.
++ * The transfers are the client's own: this side configures nothing and
++ * speaks no class protocol.
++ *
++ * -machine usbip=<path> | unix:<path> | tcp:<host>:<port> | <host>:<port>
++ */
++
++#ifndef HW_ARM_NIKON_Z63_USBHOST_H
++#define HW_ARM_NIKON_Z63_USBHOST_H
++
++#include "qemu/sockets.h"
++#include "qemu/main-loop.h"
++#include "qapi/qapi-types-sockets.h"
++
++#define Z63_USBHOST_PIPES       32      /* (ep & 0xf) | in << 4 */
++#define Z63_USBHOST_RETRY_NS    (1 * SCALE_MS)
++#define Z63_USBHOST_RESET_NS    (20 * SCALE_MS)
++#define Z63_USBHOST_BULK_MAXP   512     /* high speed bulk */
++#define Z63_USBHOST_MAX_LEN     (16 * MiB)
++
++#define Z63_USBIP_VERSION       0x0111
++#define Z63_USBIP_REQ_IMPORT    0x8003
++#define Z63_USBIP_REP_IMPORT    0x0003
++#define Z63_USBIP_REQ_DEVLIST   0x8005
++#define Z63_USBIP_REP_DEVLIST   0x0005
++#define Z63_USBIP_CMD_SUBMIT    1
++#define Z63_USBIP_CMD_UNLINK    2
++#define Z63_USBIP_RET_SUBMIT    3
++#define Z63_USBIP_RET_UNLINK    4
++#define Z63_USBIP_DEVICE_SIZE   312
++#define Z63_USBIP_BUSID         "1-1"
++
++typedef struct Z63UsbHost Z63UsbHost;
++typedef struct Z63UsbXfer Z63UsbXfer;
++
++typedef void (*Z63UsbDone)(Z63UsbHost *h, Z63UsbXfer *x);
++
++enum { Z63X_SETUP, Z63X_DATA, Z63X_STATUS, Z63X_BULK };
++
++struct Z63UsbXfer {
++    QTAILQ_ENTRY(Z63UsbXfer) link;
++    uint8_t ep;                 /* address: number | 0x80 for IN */
++    bool control;
++    uint8_t setup[8];
++    bool in;                    /* data direction */
++    uint8_t *data;
++    uint32_t len, actual;
++    int phase;
++    int status;                 /* 0, or a negative errno (USB/IP's) */
++    Z63UsbDone done;
++    uint32_t seqnum;            /* USB/IP; 0 for the host's own */
++    bool orphan;                /* its client is gone or unlinked it */
++};
++
++typedef struct Z63UsbPipe {
++    QTAILQ_HEAD(, Z63UsbXfer) q;
++    bool waiting;               /* the head was NAKed */
++} Z63UsbPipe;
++
++typedef struct Z63UsbIpConn {
++    int fd;
++    uint8_t hdr[48];
++    unsigned have, need;
++    uint8_t *body;
++    unsigned body_len;
++    int state;
++    GByteArray *out;
++} Z63UsbIpConn;
++
++enum { Z63IP_OP, Z63IP_BUSID, Z63IP_URB, Z63IP_DATA };
++
++struct Z63UsbHost {
++    Z63Dwc3 *ctl;               /* the camera's controller */
++    bool ready;                 /* reset done: tokens may go */
++    QEMUTimer *reset_timer;
++    QEMUTimer *retry_timer;
++    QEMUBH *kick_bh;
++    Z63UsbPipe pipe[Z63_USBHOST_PIPES];
++    /* what the device said about itself after the last reset */
++    uint8_t dev_desc[18];
++    uint8_t cfg_desc[1024];
++    unsigned cfg_len;
++    bool desc_valid;
++    /* USB/IP */
++    char *addr;
++    int listen_fd;
++    Z63UsbIpConn *conn;
++    uint64_t submits;
++};
++
++static unsigned z63_usbhost_pipe_of(uint8_t ep)
++{
++    return (ep & 0x0f) | ((ep & 0x80) && (ep & 0x0f) ? 0x10 : 0);
++}
++
++/* ---------------------------------------------------------------- */
++/* Transfers                                                         */
++/* ---------------------------------------------------------------- */
++
++static int z63_usbhost_token(Z63UsbHost *h, Z63UsbXfer *x, int pid,
++                             void *buf, uint32_t len, uint32_t *moved)
++{
++    return z63_dwc3_token(h->ctl, pid, x->ep & 0x0f, buf, len, moved);
++}
++
++/* One step of the head transfer: true when it moved (or ended), false
++ * when the device NAKed and the pipe has to wait. */
++static bool z63_usbhost_step(Z63UsbHost *h, Z63UsbXfer *x, bool *finished)
++{
++    uint32_t moved = 0;
++    int st;
++
++    *finished = false;
++    if (!h->ctl->on_bus || !h->ready) {
++        x->status = -ESHUTDOWN;
++        *finished = true;
++        return true;
++    }
++    switch (x->phase) {
++    case Z63X_SETUP:
++        st = z63_usbhost_token(h, x, Z63_TOK_SETUP, x->setup, 8, &moved);
++        if (st == Z63_TOK_OK) {
++            x->phase = x->len ? Z63X_DATA : Z63X_STATUS;
++        }
++        break;
++    case Z63X_DATA:
++        st = z63_usbhost_token(h, x, x->in ? Z63_TOK_IN : Z63_TOK_OUT,
++                               x->data + x->actual, x->len - x->actual,
++                               &moved);
++        if (st == Z63_TOK_OK) {
++            x->actual += moved;
++            if (x->in || x->actual >= x->len || !moved) {
++                x->phase = Z63X_STATUS;
++            }
++        }
++        break;
++    case Z63X_STATUS:
++        st = z63_usbhost_token(h, x, x->in && x->len ? Z63_TOK_OUT
++                                                     : Z63_TOK_IN,
++                               NULL, 0, &moved);
++        if (st == Z63_TOK_OK) {
++            x->status = 0;
++            *finished = true;
++        }
++        break;
++    default:    /* bulk */
++        st = z63_usbhost_token(h, x, x->in ? Z63_TOK_IN : Z63_TOK_OUT,
++                               x->data + x->actual, x->len - x->actual,
++                               &moved);
++        if (st == Z63_TOK_OK) {
++            if (!x->in && !moved && x->len) {
++                st = Z63_TOK_NAK;           /* nothing taken: wait */
++                break;
++            }
++            x->actual += moved;
++            if (x->in ? (moved == 0 || moved % Z63_USBHOST_BULK_MAXP ||
++                         x->actual >= x->len)
++                      : x->actual >= x->len) {
++                x->status = 0;
++                *finished = true;
++            }
++        }
++        break;
++    }
++    if (st == Z63_TOK_NAK) {
++        return false;
++    }
++    if (st != Z63_TOK_OK) {
++        x->status = -EPIPE;
++        *finished = true;
++    }
++    return true;
++}
++
++static void z63_usbhost_run(Z63UsbHost *h, Z63UsbPipe *pipe)
++{
++    Z63UsbXfer *x;
++
++    pipe->waiting = false;
++    while ((x = QTAILQ_FIRST(&pipe->q)) != NULL) {
++        bool finished;
++
++        if (!z63_usbhost_step(h, x, &finished)) {
++            pipe->waiting = true;
++            if (!timer_pending(h->retry_timer)) {
++                timer_mod(h->retry_timer,
++                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                          Z63_USBHOST_RETRY_NS);
++            }
++            return;
++        }
++        if (finished) {
++            QTAILQ_REMOVE(&pipe->q, x, link);
++            x->done(h, x);
++        }
++    }
++}
++
++static void z63_usbhost_kick(void *opaque)
++{
++    Z63UsbHost *h = opaque;
++
++    for (unsigned i = 0; i < Z63_USBHOST_PIPES; i++) {
++        if (h->pipe[i].waiting) {
++            z63_usbhost_run(h, &h->pipe[i]);
++        }
++    }
++}
++
++static void z63_usbhost_submit(Z63UsbHost *h, Z63UsbXfer *x)
++{
++    Z63UsbPipe *pipe = &h->pipe[z63_usbhost_pipe_of(x->ep)];
++    bool idle = QTAILQ_EMPTY(&pipe->q);
++
++    x->phase = x->control ? Z63X_SETUP : Z63X_BULK;
++    QTAILQ_INSERT_TAIL(&pipe->q, x, link);
++    if (idle) {
++        z63_usbhost_run(h, pipe);
++    }
++}
++
++/* Every queued transfer ends with `status`, its owner told. */
++static void z63_usbhost_fail_all(Z63UsbHost *h, int status)
++{
++    for (unsigned i = 0; i < Z63_USBHOST_PIPES; i++) {
++        Z63UsbXfer *x;
++
++        h->pipe[i].waiting = false;
++        while ((x = QTAILQ_FIRST(&h->pipe[i].q)) != NULL) {
++            QTAILQ_REMOVE(&h->pipe[i].q, x, link);
++            x->status = status;
++            x->done(h, x);
++        }
++    }
++}
++
++/* The controller armed an endpoint (nikon-z63-dwc3.h): try again, from
++ * the main loop rather than from inside its register write. */
++static void z63_usbhost_ep_armed(void *opaque, unsigned phys)
++{
++    Z63UsbHost *h = opaque;
++
++    qemu_bh_schedule(h->kick_bh);
++}
++
++/* ---------------------------------------------------------------- */
++/* The host's own reads after a reset                                */
++/* ---------------------------------------------------------------- */
++
++static void z63_usbhost_control(Z63UsbHost *h, uint8_t type, uint8_t req,
++                                uint16_t value, uint16_t index,
++                                uint16_t length, Z63UsbDone done)
++{
++    Z63UsbXfer *x = g_new0(Z63UsbXfer, 1);
++
++    x->ep = (type & 0x80) ? 0x80 : 0;
++    x->control = true;
++    x->in = type & 0x80;
++    x->setup[0] = type;
++    x->setup[1] = req;
++    stw_le_p(x->setup + 2, value);
++    stw_le_p(x->setup + 4, index);
++    stw_le_p(x->setup + 6, length);
++    x->len = length;
++    x->data = g_malloc0(MAX(length, 1));
++    x->done = done;
++    z63_usbhost_submit(h, x);
++}
++
++static void z63_usbhost_free(Z63UsbXfer *x)
++{
++    g_free(x->data);
++    g_free(x);
++}
++
++static void z63_usbhost_got_config(Z63UsbHost *h, Z63UsbXfer *x)
++{
++    if (!x->status && x->actual >= 9) {
++        h->cfg_len = MIN(x->actual, sizeof(h->cfg_desc));
++        memcpy(h->cfg_desc, x->data, h->cfg_len);
++        h->desc_valid = true;
++        error_report("Z63_USB: the camera enumerated -- %04x:%04x, class "
++                     "%u, %u configuration(s), %u interface(s), %u bytes of "
++                     "configuration%s", lduw_le_p(h->dev_desc + 8),
++                     lduw_le_p(h->dev_desc + 10), h->dev_desc[4],
++                     h->dev_desc[17], h->cfg_desc[4], h->cfg_len,
++                     h->addr ? "; USB/IP bus id " Z63_USBIP_BUSID : "");
++    } else {
++        error_report("Z63_USB: configuration descriptor read failed (%d)",
++                     x->status);
++    }
++    z63_usbhost_free(x);
++}
++
++static void z63_usbhost_got_config9(Z63UsbHost *h, Z63UsbXfer *x)
++{
++    if (!x->status && x->actual >= 4) {
++        uint16_t total = lduw_le_p(x->data + 2);
++
++        z63_usbhost_control(h, 0x80, 6, 0x0200, 0,
++                            MIN(total, sizeof(h->cfg_desc)),
++                            z63_usbhost_got_config);
++    } else {
++        error_report("Z63_USB: configuration descriptor read failed (%d)",
++                     x->status);
++    }
++    z63_usbhost_free(x);
++}
++
++static void z63_usbhost_set_address(Z63UsbHost *h, Z63UsbXfer *x)
++{
++    if (!x->status) {
++        z63_usbhost_control(h, 0x80, 6, 0x0200, 0, 9,
++                            z63_usbhost_got_config9);
++    } else {
++        error_report("Z63_USB: SET_ADDRESS failed (%d)", x->status);
++    }
++    z63_usbhost_free(x);
++}
++
++static void z63_usbhost_got_device(Z63UsbHost *h, Z63UsbXfer *x)
++{
++    if (!x->status && x->actual >= 18) {
++        memcpy(h->dev_desc, x->data, 18);
++        z63_usbhost_control(h, 0x00, 5, 1, 0, 0, z63_usbhost_set_address);
++    } else {
++        error_report("Z63_USB: device descriptor read failed (%d, %u "
++                     "bytes)", x->status, x->actual);
++    }
++    z63_usbhost_free(x);
++}
++
++static void z63_usbhost_reset_tick(void *opaque)
++{
++    Z63UsbHost *h = opaque;
++
++    if (!h->ctl->on_bus) {
++        return;
++    }
++    z63_dwc3_bus_reset(h->ctl);
++    h->ready = true;
++    h->desc_valid = false;
++    error_report("Z63_USB: port reset -- reading the camera's descriptors");
++    z63_usbhost_control(h, 0x80, 6, 0x0100, 0, 18, z63_usbhost_got_device);
++}
++
++/* ---------------------------------------------------------------- */
++/* On and off the bus (the controller's run bit)                     */
++/* ---------------------------------------------------------------- */
++
++static void z63_usbhost_attached(void *opaque)
++{
++    Z63UsbHost *h = opaque;
++
++    h->ready = false;
++    timer_mod(h->reset_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                              Z63_USBHOST_RESET_NS);
++}
++
++static void z63_usbhost_detached(void *opaque)
++{
++    Z63UsbHost *h = opaque;
++
++    h->ready = false;
++    h->desc_valid = false;
++    timer_del(h->reset_timer);
++    z63_usbhost_fail_all(h, -ESHUTDOWN);
++}
++
++/* ---------------------------------------------------------------- */
++/* USB/IP                                                            */
++/* ---------------------------------------------------------------- */
++
++static void z63_usbip_close(Z63UsbHost *h);
++
++static void z63_usbip_flush(void *opaque);
++
++static void z63_usbip_send(Z63UsbHost *h, const void *buf, size_t len)
++{
++    Z63UsbIpConn *c = h->conn;
++
++    if (!c) {
++        return;
++    }
++    g_byte_array_append(c->out, buf, len);
++    z63_usbip_flush(h);
++}
++
++static void z63_usbip_read(void *opaque);
++
++static void z63_usbip_flush(void *opaque)
++{
++    Z63UsbHost *h = opaque;
++    Z63UsbIpConn *c = h->conn;
++
++    while (c && c->out->len) {
++        ssize_t n = send(c->fd, c->out->data, c->out->len, 0);
++
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            break;
++        }
++        if (n <= 0) {
++            z63_usbip_close(h);
++            return;
++        }
++        g_byte_array_remove_range(c->out, 0, n);
++    }
++    if (c) {
++        qemu_set_fd_handler(c->fd, z63_usbip_read,
++                            c->out->len ? z63_usbip_flush : NULL, h);
++    }
++}
++
++/* The usbip_usb_device record: 312 bytes, big-endian. */
++static void z63_usbip_device(Z63UsbHost *h, uint8_t *d)
++{
++    memset(d, 0, Z63_USBIP_DEVICE_SIZE);
++    pstrcpy((char *)d, 256, "/sys/devices/platform/nikon-z63/usb1/1-1");
++    pstrcpy((char *)d + 256, 32, Z63_USBIP_BUSID);
++    stl_be_p(d + 288, 1);                       /* busnum */
++    stl_be_p(d + 292, 2);                       /* devnum */
++    stl_be_p(d + 296, 3);                       /* speed: high */
++    stw_be_p(d + 300, lduw_le_p(h->dev_desc + 8));
++    stw_be_p(d + 302, lduw_le_p(h->dev_desc + 10));
++    stw_be_p(d + 304, lduw_le_p(h->dev_desc + 12));
++    d[306] = h->dev_desc[4];
++    d[307] = h->dev_desc[5];
++    d[308] = h->dev_desc[6];
++    d[309] = 0;                                 /* configuration value */
++    d[310] = h->dev_desc[17];
++    d[311] = h->cfg_desc[4];
++}
++
++static void z63_usbip_devlist(Z63UsbHost *h)
++{
++    g_autoptr(GByteArray) r = g_byte_array_new();
++    uint8_t hdr[12], dev[Z63_USBIP_DEVICE_SIZE];
++
++    stw_be_p(hdr, Z63_USBIP_VERSION);
++    stw_be_p(hdr + 2, Z63_USBIP_REP_DEVLIST);
++    stl_be_p(hdr + 4, 0);
++    stl_be_p(hdr + 8, h->desc_valid ? 1 : 0);
++    g_byte_array_append(r, hdr, sizeof(hdr));
++    if (h->desc_valid) {
++        z63_usbip_device(h, dev);
++        g_byte_array_append(r, dev, sizeof(dev));
++        /* each interface, alternate setting 0: class, subclass, protocol */
++        for (unsigned o = 0; o + 9 <= h->cfg_len && h->cfg_desc[o];
++             o += h->cfg_desc[o]) {
++            if (h->cfg_desc[o + 1] == 4 && h->cfg_desc[o + 3] == 0) {
++                uint8_t i[4] = { h->cfg_desc[o + 5], h->cfg_desc[o + 6],
++                                 h->cfg_desc[o + 7], 0 };
++
++                g_byte_array_append(r, i, 4);
++            }
++        }
++    }
++    z63_usbip_send(h, r->data, r->len);
++}
++
++static void z63_usbip_import(Z63UsbHost *h, const char *busid)
++{
++    uint8_t r[8 + Z63_USBIP_DEVICE_SIZE];
++    bool ok = h->desc_valid && !strncmp(busid, Z63_USBIP_BUSID, 32);
++
++    stw_be_p(r, Z63_USBIP_VERSION);
++    stw_be_p(r + 2, Z63_USBIP_REP_IMPORT);
++    stl_be_p(r + 4, ok ? 0 : 1);
++    if (ok) {
++        z63_usbip_device(h, r + 8);
++        h->conn->state = Z63IP_URB;
++        error_report("Z63_USB: USB/IP client attached the camera");
++    } else {
++        error_report("Z63_USB: USB/IP import of '%.32s' refused -- %s",
++                     busid, h->desc_valid ? "no such bus id"
++                                          : "the camera is not on the bus");
++    }
++    z63_usbip_send(h, r, ok ? sizeof(r) : 8);
++}
++
++static void z63_usbip_ret_submit(Z63UsbHost *h, Z63UsbXfer *x)
++{
++    if (!x->orphan && h->conn && h->conn->state >= Z63IP_URB) {
++        uint8_t r[48] = { 0 };
++        bool in = x->control ? x->in : (x->ep & 0x80);
++        uint32_t data = in && !x->status ? x->actual : 0;
++
++        stl_be_p(r, Z63_USBIP_RET_SUBMIT);
++        stl_be_p(r + 4, x->seqnum);
++        stl_be_p(r + 20, (uint32_t)x->status);
++        stl_be_p(r + 24, x->status ? 0 : x->actual);
++        g_byte_array_append(h->conn->out, r, sizeof(r));
++        if (data) {
++            g_byte_array_append(h->conn->out, x->data, data);
++        }
++        z63_usbip_flush(h);
++    }
++    z63_usbhost_free(x);
++}
++
++static void z63_usbip_submit(Z63UsbHost *h, const uint8_t *hdr,
++                             uint8_t *data, uint32_t len)
++{
++    Z63UsbXfer *x = g_new0(Z63UsbXfer, 1);
++    uint32_t dir = ldl_be_p(hdr + 12), ep = ldl_be_p(hdr + 16);
++
++    x->seqnum = ldl_be_p(hdr + 4);
++    x->control = (ep & 0x0f) == 0;
++    x->len = len;
++    x->data = data ? data : g_malloc0(MAX(len, 1));
++    if (x->control) {
++        memcpy(x->setup, hdr + 40, 8);
++        x->in = x->setup[0] & 0x80;
++        x->ep = 0;
++    } else {
++        x->in = dir == 1;
++        x->ep = (ep & 0x0f) | (x->in ? 0x80 : 0);
++    }
++    x->done = z63_usbip_ret_submit;
++    h->submits++;
++    z63_usbhost_submit(h, x);
++}
++
++static void z63_usbip_unlink(Z63UsbHost *h, const uint8_t *hdr)
++{
++    uint32_t seq = ldl_be_p(hdr + 4), victim = ldl_be_p(hdr + 20);
++    uint8_t r[48] = { 0 };
++    int status = 0;
++
++    for (unsigned i = 0; i < Z63_USBHOST_PIPES && !status; i++) {
++        Z63UsbXfer *x, *head = QTAILQ_FIRST(&h->pipe[i].q);
++
++        QTAILQ_FOREACH(x, &h->pipe[i].q, link) {
++            if (x->seqnum != victim || x->orphan) {
++                continue;
++            }
++            status = -ECONNRESET;
++            if (x != head || x->phase == Z63X_SETUP ||
++                (x->phase == Z63X_BULK && !x->actual)) {
++                /* not started on the wire: just take it away, and let
++                 * whatever is behind it go */
++                bool was_head = x == head;
++
++                QTAILQ_REMOVE(&h->pipe[i].q, x, link);
++                    z63_usbhost_free(x);
++                if (was_head) {
++                    h->pipe[i].waiting = !QTAILQ_EMPTY(&h->pipe[i].q);
++                    qemu_bh_schedule(h->kick_bh);
++                }
++            } else {
++                x->orphan = true;   /* finishes, unanswered */
++            }
++            break;
++        }
++    }
++    stl_be_p(r, Z63_USBIP_RET_UNLINK);
++    stl_be_p(r + 4, seq);
++    stl_be_p(r + 20, (uint32_t)status);
++    z63_usbip_send(h, r, sizeof(r));
++}
++
++static void z63_usbip_close(Z63UsbHost *h)
++{
++    Z63UsbIpConn *c = h->conn;
++
++    if (!c) {
++        return;
++    }
++    qemu_set_fd_handler(c->fd, NULL, NULL, NULL);
++    close(c->fd);
++    g_byte_array_free(c->out, true);
++    g_free(c->body);
++    g_free(c);
++    h->conn = NULL;
++    for (unsigned i = 0; i < Z63_USBHOST_PIPES; i++) {
++        Z63UsbXfer *x;
++
++        QTAILQ_FOREACH(x, &h->pipe[i].q, link) {
++            if (x->seqnum) {
++                x->orphan = true;
++            }
++        }
++    }
++    error_report("Z63_USB: USB/IP client gone");
++}
++
++/* Bytes in: an 8-byte op header, a 32-byte bus id, then 48-byte URB
++ * headers each followed by its OUT data. */
++static void z63_usbip_read(void *opaque)
++{
++    Z63UsbHost *h = opaque;
++    Z63UsbIpConn *c = h->conn;
++
++    while (c) {
++        uint8_t *dst = c->state == Z63IP_DATA ? c->body + c->have
++                                              : c->hdr + c->have;
++        ssize_t n = recv(c->fd, dst, c->need - c->have, 0);
++
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            return;
++        }
++        if (n <= 0) {
++            z63_usbip_close(h);
++            return;
++        }
++        c->have += n;
++        if (c->have < c->need) {
++            continue;
++        }
++        c->have = 0;
++        switch (c->state) {
++        case Z63IP_OP: {
++            uint16_t code = lduw_be_p(c->hdr + 2);
++
++            if (code == Z63_USBIP_REQ_DEVLIST) {
++                z63_usbip_devlist(h);
++                c->need = 8;
++            } else if (code == Z63_USBIP_REQ_IMPORT) {
++                c->state = Z63IP_BUSID;
++                c->need = 32;
++            } else {
++                error_report("Z63_USB: USB/IP op 0x%04x not understood",
++                             code);
++                z63_usbip_close(h);
++                return;
++            }
++            break;
++        }
++        case Z63IP_BUSID:
++            c->need = 48;
++            c->state = Z63IP_OP;
++            z63_usbip_import(h, (const char *)c->hdr);
++            if (h->conn && c->state != Z63IP_URB) {
++                z63_usbip_close(h);
++                return;
++            }
++            break;
++        case Z63IP_URB: {
++            uint32_t cmd = ldl_be_p(c->hdr);
++
++            c->need = 48;
++            if (cmd == Z63_USBIP_CMD_SUBMIT) {
++                uint32_t dir = ldl_be_p(c->hdr + 12);
++                int32_t len = (int32_t)ldl_be_p(c->hdr + 24);
++
++                if (len < 0 || len > Z63_USBHOST_MAX_LEN) {
++                    error_report("Z63_USB: USB/IP transfer of %d bytes "
++                                 "refused", len);
++                    z63_usbip_close(h);
++                    return;
++                }
++                if (dir == 0 && len > 0) {
++                    c->body = g_malloc(len);
++                    c->body_len = len;
++                    c->need = len;
++                    c->state = Z63IP_DATA;
++                } else {
++                    z63_usbip_submit(h, c->hdr, NULL, len);
++                }
++            } else if (cmd == Z63_USBIP_CMD_UNLINK) {
++                z63_usbip_unlink(h, c->hdr);
++            } else {
++                error_report("Z63_USB: USB/IP command %u not understood",
++                             cmd);
++                z63_usbip_close(h);
++                return;
++            }
++            break;
++        }
++        case Z63IP_DATA: {
++            uint8_t *body = c->body;
++
++            c->body = NULL;
++            c->state = Z63IP_URB;
++            c->need = 48;
++            z63_usbip_submit(h, c->hdr, body, c->body_len);
++            break;
++        }
++        }
++        c = h->conn;
++    }
++}
++
++static void z63_usbip_accept(void *opaque)
++{
++    Z63UsbHost *h = opaque;
++    int fd = qemu_accept(h->listen_fd, NULL, NULL);
++    Z63UsbIpConn *c;
++
++    if (fd < 0) {
++        return;
++    }
++    if (h->conn) {
++        /* one client: the camera's endpoints have one owner */
++        close(fd);
++        return;
++    }
++    qemu_set_blocking(fd, false, NULL);
++    c = g_new0(Z63UsbIpConn, 1);
++    c->fd = fd;
++    c->need = 8;
++    c->state = Z63IP_OP;
++    c->out = g_byte_array_new();
++    h->conn = c;
++    qemu_set_fd_handler(fd, z63_usbip_read, NULL, h);
++}
++
++static void z63_usbip_listen(Z63UsbHost *h, Error **errp)
++{
++    const char *a = h->addr;
++    g_autofree char *spec = NULL;
++    SocketAddress *sa;
++
++    if (g_str_has_prefix(a, "tcp:")) {
++        a += 4;
++    }
++    spec = a[0] == '/' || a[0] == '.' ? g_strdup_printf("unix:%s", a)
++                                      : g_strdup(a);
++    sa = socket_parse(spec, errp);
++    if (!sa) {
++        return;
++    }
++    if (sa->type == SOCKET_ADDRESS_TYPE_UNIX) {
++        unlink(sa->u.q_unix.path);
++    }
++    h->listen_fd = socket_listen(sa, 1, errp);
++    qapi_free_SocketAddress(sa);
++    if (h->listen_fd < 0) {
++        return;
++    }
++    qemu_set_fd_handler(h->listen_fd, z63_usbip_accept, NULL, h);
++    error_report("Z63_USB: USB/IP server at %s (bus id " Z63_USBIP_BUSID
++                 ")", h->addr);
++}
++
++/* ---------------------------------------------------------------- */
++/* The host                                                          */
++/* ---------------------------------------------------------------- */
++
++static void z63_usbhost_init(Z63UsbHost *h, Z63Dwc3 *ctl, const char *addr,
++                             Error **errp)
++{
++    h->ctl = ctl;
++    for (unsigned i = 0; i < Z63_USBHOST_PIPES; i++) {
++        QTAILQ_INIT(&h->pipe[i].q);
++    }
++    h->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                  z63_usbhost_reset_tick, h);
++    h->retry_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_usbhost_kick, h);
++    h->kick_bh = qemu_bh_new(z63_usbhost_kick, h);
++    h->listen_fd = -1;
++    ctl->listener.attached = z63_usbhost_attached;
++    ctl->listener.detached = z63_usbhost_detached;
++    ctl->listener.ep_armed = z63_usbhost_ep_armed;
++    ctl->listener.opaque = h;
++    if (addr && *addr) {
++        h->addr = g_strdup(addr);
++        z63_usbip_listen(h, errp);
++    }
++}
++
++#endif /* HW_ARM_NIKON_Z63_USBHOST_H */
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index fc657d5..3005f27 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -580,6 +580,7 @@ static const hwaddr z63_dma_bases[Z63_DMA_BANKS] = {
+ #include "hw/arm/nikon-z63-toplcd.h"
+ #include "hw/arm/nikon-z63-hdmi.h"
+ #include "hw/arm/nikon-z63-usb.h"
++#include "hw/arm/nikon-z63-usbhost.h"
+ #include "hw/arm/nikon-z63-sensorif.h"
+ #include "hw/arm/nikon-z63-isp-apb.h"
+ #include "hw/arm/nikon-z63-spibus.h"
+@@ -845,6 +846,9 @@ typedef struct NikonZ63State {
+     QEMUTimer *li_wait_timer;
+     Z63Hdmi hdmi;              /* HDMI transmitter, 0x15496000 */
+     Z63Usb usb;                /* DWC3 USB device, 0x17880000 */
++    Z63UsbHost *usbhost;       /* the host on its port, nikon-z63-usbhost.h */
++    char *usbip;               /* -machine usbip=, the host's USB/IP server */
++    bool usb_cable, usb_cable_set; /* -machine usb-cable=, the VBUS pin */
+ 
+     uint8_t soc_revision; /* virtual; exposed as a machine property */
+     uint8_t soc_chip_id;  /* virtual; exposed as a machine property */
+@@ -2092,6 +2096,30 @@ static void z63_release_contacts(NikonZ63State *s)
+                    (closed >> Z63_RELEASE_FULL_BIT) & 1);
+ }
+ 
++/*
++ * Inputs the board drives on GPIO_TOP that nothing else models.
++ *
++ * The USB cable: logical pin 0xc8, descriptor .data 0xa0280ab38 = {0xc8,
++ * port 14, bit 10}, read through sub_40C15BFC by the cyclic handler
++ * sub_403204D0 every 20 ms, four equal samples to change (0xa02815924 /
++ * 0xa02815928); 1 is a cable with VBUS. Its debounced edge starts the
++ * task "USB" (sub_40321D7C) and, through the connection manager, the
++ * gadget (nikon-z63-dwc3.h). -machine usb-cable=on|off, settable at run
++ * time; on by default when usbip= is given.
++ */
++#define Z63_USB_VBUS_WORD       0x038   /* port 14 */
++#define Z63_USB_VBUS_BIT        10
++
++static uint16_t z63_gpio_board_inputs(NikonZ63State *s, hwaddr addr,
++                                      uint16_t value)
++{
++    if (addr == Z63_USB_VBUS_WORD) {
++        value = (value & ~(1u << Z63_USB_VBUS_BIT)) |
++                (s->usb_cable << Z63_USB_VBUS_BIT);
++    }
++    return value;
++}
++
+ static uint64_t z63_gpio_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     NikonZ63State *s = opaque;
+@@ -2127,8 +2155,8 @@ static uint64_t z63_gpio_read(void *opaque, hwaddr addr, unsigned size)
+         z63_wires_parse(s);
+     }
+     if (s->real_mcu_built && addr < 0x100 && !(addr % 4)) {
+-        return z63_wires_mcu_levels(s, addr / 4,
+-                                    s->gpio_config[0][addr / 4]);
++        return z63_gpio_board_inputs(s, addr,
++            z63_wires_mcu_levels(s, addr / 4, s->gpio_config[0][addr / 4]));
+     }
+ 
+     /*
+@@ -2147,7 +2175,8 @@ static uint64_t z63_gpio_read(void *opaque, hwaddr addr, unsigned size)
+                      "this model never changes", z63_current_pc(),
+                      s->gpio_config[0][4]);
+     }
+-    return s->gpio_config[addr / 0x100][(addr % 0x100) / 4];
++    return z63_gpio_board_inputs(s, addr,
++                                 s->gpio_config[addr / 0x100][(addr % 0x100) / 4]);
+ }
+ 
+ /*
+@@ -4659,6 +4688,21 @@ static void z63_init(MachineState *machine)
+     /* DWC3 USB in device mode plus its EXS and PHY glue.
+      * See docs/usb-registers.md. */
+     z63_usb_init(OBJECT(machine), sysmem, &s->usb);
++    /* The other end of the camera's USB port: a host, with -machine
++     * usbip= in front. See nikon-z63-usbhost.h and nikon-z63-dwc3.h. */
++    s->usbhost = g_new0(Z63UsbHost, 1);
++    z63_usbhost_init(s->usbhost, s->usb.ctl, s->usbip, &error_fatal);
++    if (!s->usb_cable_set && s->usbip) {
++        s->usb_cable = true;
++    }
++    if (s->usb_cable) {
++        error_report("Z63_USB: a USB cable is in (GPIO port 14 bit 10)");
++    }
++    /* EXS_USB3_TYPE_C_ASSIST, the 0x17a40000 block's line. */
++    s->usb.assist_irq = qdev_get_gpio_in(s->gic, Z63_GIC_SPI(109));
++    s->usb.ctl->trace = getenv("Z63_DWC3_TRACE") != NULL;
++    /* EXS_USB3_TYPE_C_CONTROLLER, the DWC3's event interrupt. */
++    s->usb.ctl->irq = qdev_get_gpio_in(s->gic, Z63_GIC_SPI(108));
+     if (s->cfexpress && !s->z9_capture) {
+         error_report("cfexpress=on needs z9-capture=on: the slot's PCIe port "
+                      "is ../z9-qemu's adapter (nikon-z63-z9lab.h)");
+@@ -5397,6 +5441,36 @@ static char *z63_prop_get_mcu_keys(Object *obj, Error **errp)
+     return g_strdup(NIKON_Z63(obj)->mcu_keys ? NIKON_Z63(obj)->mcu_keys : "");
+ }
+ 
++static bool z63_prop_get_usb_cable(Object *obj, Error **errp)
++{
++    return NIKON_Z63(obj)->usb_cable;
++}
++
++static void z63_prop_set_usb_cable(Object *obj, bool value, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    if (s->usbhost && value != s->usb_cable) {
++        error_report("Z63_USB: USB cable %s", value ? "plugged in"
++                                                     : "pulled out");
++    }
++    s->usb_cable = value;
++    s->usb_cable_set = true;
++}
++
++static char *z63_prop_get_usbip(Object *obj, Error **errp)
++{
++    return g_strdup(NIKON_Z63(obj)->usbip);
++}
++
++static void z63_prop_set_usbip(Object *obj, const char *value, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    g_free(s->usbip);
++    s->usbip = g_strdup(value);
++}
++
+ static char *z63_prop_get_power_off(Object *obj, Error **errp)
+ {
+     return g_strdup(NIKON_Z63(obj)->power_off);
+@@ -5839,6 +5913,19 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "The posture sensor's input, x:y:z in milligravity; default 0:0:1000, "
+         "a body at rest. Settable at run time with qom-set. See "
+         "nikon-z63-imu.h.");
++    object_class_property_add_bool(oc, "usb-cable", z63_prop_get_usb_cable,
++                                   z63_prop_set_usb_cable);
++    object_class_property_set_description(oc, "usb-cable",
++        "A USB cable with VBUS in the camera's USB-C port (GPIO port 14 "
++        "bit 10): on or off; settable at run time with qom-set. On by "
++        "default when usbip= is given.");
++    object_class_property_add_str(oc, "usbip", z63_prop_get_usbip,
++                                  z63_prop_set_usbip);
++    object_class_property_set_description(oc, "usbip",
++        "A USB/IP server for the camera's USB port: <path>, unix:<path>, "
++        "or [tcp:]<host>:<port>. The camera appears as bus id 1-1 once it "
++        "is on the bus (usbip attach -r <host> -b 1-1; z63-tools/ptp.py). "
++        "See nikon-z63-usbhost.h.");
+     object_class_property_add_str(oc, "power-off", z63_prop_get_power_off,
+                                   z63_prop_set_power_off);
+     object_class_property_set_description(oc, "power-off",
+diff --git a/z63-tools/ptp.py b/z63-tools/ptp.py
+new file mode 100644
+index 0000000..96ea14c
+--- /dev/null
++++ b/z63-tools/ptp.py
+@@ -0,0 +1,330 @@
++#!/usr/bin/env python3
++"""PTP to the Nikon Z 6III machine over its USB/IP server (-machine usbip=).
++
++    ptp.py <server> info                 GetDeviceInfo, storages
++    ptp.py <server> ls                   every object: handle, size, name
++    ptp.py <server> get <handle> <file>  GetObject
++    ptp.py <server> get-latest <dir>     the newest image, by handle
++    ptp.py <server> capture [<dir>]      release; the new image(s) to <dir>
++    ptp.py <server> raw <opcode> [p...]  one operation, its response
++
++<server> is what usbip= was given: a unix socket path, unix:<path>, or
++host:port. A reply that takes longer than $PTP_TIMEOUT seconds (30) ends
++the run. This is a USB/IP client (the protocol of Linux's vhci-hcd)
++speaking USB to the camera itself -- descriptors, SET_CONFIGURATION, then
++PTP containers on the Still Image interface's bulk endpoints -- for hosts
++that have no vhci-hcd. On Linux, `usbip attach -r <host> -b 1-1` (with
++usbip=tcp:<addr>:3240) and gphoto2 should do the same; that is not tried.
++
++`capture` is Nikon's InitiateCaptureRecInMedia (0x9207: no AF, to the
++card), retried while the camera says busy, then DeviceReady (0x90C8) and
++the object list until the new image is in it. On this machine a release only completes with Custom Settings
++d6 Shutter type = Electronic shutter, which does not persist across boots.
++"""
++import os
++import socket
++import struct
++import sys
++import time
++
++USBIP_VERSION = 0x0111
++BUSID = b"1-1"
++
++# PTP
++PTP_CMD, PTP_DATA, PTP_RESP = 1, 2, 3
++OP_GET_DEVICE_INFO = 0x1001
++OP_OPEN_SESSION = 0x1002
++OP_CLOSE_SESSION = 0x1003
++OP_GET_STORAGE_IDS = 0x1004
++OP_GET_STORAGE_INFO = 0x1005
++OP_GET_OBJECT_HANDLES = 0x1007
++OP_GET_OBJECT_INFO = 0x1008
++OP_GET_OBJECT = 0x1009
++OP_NIKON_DEVICE_READY = 0x90C8
++OP_NIKON_CAPTURE_REC_IN_MEDIA = 0x9207
++RC_OK = 0x2001
++RC_DEVICE_BUSY = 0x2019
++RC_SESSION_OPEN = 0x201E
++
++
++class UsbIp:
++    def __init__(self, where):
++        if where.startswith("unix:"):
++            where = where[5:]
++        if where.startswith("tcp:"):
++            where = where[4:]
++        if "/" in where or not ":" in where:
++            self.s = socket.socket(socket.AF_UNIX)
++            self.s.connect(where)
++        else:
++            host, port = where.rsplit(":", 1)
++            self.s = socket.create_connection((host, int(port)))
++        self.s.settimeout(float(os.environ.get("PTP_TIMEOUT", "30")))
++        self.seq = 0
++        self.import_device()
++
++    def recvn(self, n):
++        b = b""
++        while len(b) < n:
++            c = self.s.recv(n - len(b))
++            if not c:
++                raise IOError("USB/IP server closed the connection")
++            b += c
++        return b
++
++    def import_device(self):
++        self.s.sendall(struct.pack(">HHI", USBIP_VERSION, 0x8003, 0) +
++                       BUSID.ljust(32, b"\0"))
++        ver, code, status = struct.unpack(">HHI", self.recvn(8))
++        if status:
++            raise IOError("import refused -- is the camera on the bus?")
++        dev = self.recvn(312)
++        self.vid, self.pid = struct.unpack(">HH", dev[300:304])
++
++    def submit(self, ep, direction, length=0, setup=b"\0" * 8, data=b""):
++        """ep: endpoint number; direction 1 = IN. Returns (status, data)."""
++        self.seq += 1
++        hdr = struct.pack(">IIIII", 1, self.seq, 0x00010002, direction, ep)
++        hdr += struct.pack(">IiiiI", 0, length if direction else len(data),
++                           0, 0, 0) + setup
++        self.s.sendall(hdr + (data if not direction else b""))
++        while True:
++            r = self.recvn(48)
++            cmd, seq = struct.unpack(">II", r[:8])
++            status, actual = struct.unpack(">ii", r[20:28])
++            payload = self.recvn(actual) if direction and actual > 0 else b""
++            if cmd == 3 and seq == self.seq:
++                return status, payload
++
++    def control(self, bmRequestType, bRequest, wValue, wIndex, data_or_len):
++        setup_in = bmRequestType & 0x80
++        length = data_or_len if setup_in else len(data_or_len)
++        setup = struct.pack("<BBHHH", bmRequestType, bRequest, wValue,
++                            wIndex, length)
++        st, d = self.submit(0, 1 if setup_in else 0, length, setup,
++                            b"" if setup_in else data_or_len)
++        if st:
++            raise IOError("control request %02x/%02x failed: %d" %
++                          (bmRequestType, bRequest, st))
++        return d
++
++    def bulk_out(self, ep, data):
++        st, _ = self.submit(ep, 0, data=data)
++        if st:
++            raise IOError("bulk OUT ep %d failed: %d" % (ep, st))
++
++    def bulk_in(self, ep, length):
++        st, d = self.submit(ep, 1, length)
++        if st:
++            raise IOError("bulk IN ep %d failed: %d" % (ep, st))
++        return d
++
++
++class Ptp:
++    def __init__(self, where):
++        self.u = UsbIp(where)
++        dev = self.u.control(0x80, 6, 0x0100, 0, 18)
++        cfg = self.u.control(0x80, 6, 0x0200, 0, 9)
++        total = struct.unpack("<H", cfg[2:4])[0]
++        cfg = self.u.control(0x80, 6, 0x0200, 0, total)
++        self.ep_in = self.ep_out = self.ep_int = None
++        self.config = cfg[5]
++        i, still = 0, False
++        while i + 2 <= len(cfg) and cfg[i]:
++            ln, ty = cfg[i], cfg[i + 1]
++            if ty == 4:                       # interface
++                still = cfg[i + 5] == 6 or (cfg[i + 5] == 0xff and
++                                             self.ep_in is None)
++                self.iface = cfg[i + 2]
++            elif ty == 5 and still:           # endpoint
++                addr, attr = cfg[i + 2], cfg[i + 3] & 3
++                if attr == 2 and addr & 0x80:
++                    self.ep_in = addr & 0x0f
++                elif attr == 2:
++                    self.ep_out = addr & 0x0f
++                elif attr == 3:
++                    self.ep_int = addr & 0x0f
++            i += ln
++        if self.ep_in is None or self.ep_out is None:
++            raise IOError("no Still Image interface with two bulk endpoints")
++        self.u.control(0x00, 9, self.config, 0, b"")
++        self.tid = 0
++        self.vid, self.pid = struct.unpack("<HH", dev[8:12])
++
++    def transaction(self, op, params=(), data=None, want_data=True):
++        self.tid += 1
++        cmd = struct.pack("<IHHI", 12 + 4 * len(params), PTP_CMD, op,
++                          self.tid) + b"".join(struct.pack("<I", p)
++                                               for p in params)
++        self.u.bulk_out(self.ep_out, cmd)
++        if data is not None:
++            self.u.bulk_out(self.ep_out, struct.pack(
++                "<IHHI", 12 + len(data), PTP_DATA, op, self.tid) + data)
++        payload = b""
++        while True:
++            c = self.u.bulk_in(self.ep_in, 512 * 1024)
++            if len(c) < 12:
++                continue                      # a zero-length packet
++            ln, ty, code, tid = struct.unpack("<IHHI", c[:12])
++            if ty == PTP_DATA:
++                buf = c
++                while len(buf) < ln:
++                    more = self.u.bulk_in(self.ep_in,
++                                          min(ln - len(buf), 4 << 20))
++                    if not more:
++                        break
++                    buf += more
++                payload = buf[12:ln]
++                continue
++            if ty == PTP_RESP:
++                rparams = struct.unpack("<%dI" % ((ln - 12) // 4), c[12:ln])
++                return code, rparams, payload
++
++    def open(self):
++        code, _, _ = self.transaction(OP_OPEN_SESSION, (1,))
++        if code not in (RC_OK, RC_SESSION_OPEN):
++            raise IOError("OpenSession: 0x%04x" % code)
++
++    def close(self):
++        self.transaction(OP_CLOSE_SESSION)
++
++
++def ptp_string(b, o):
++    n = b[o]
++    s = b[o + 1:o + 1 + 2 * n].decode("utf-16-le", "replace").rstrip("\0")
++    return s, o + 1 + 2 * n
++
++
++def ptp_array(b, o, fmt="I"):
++    n = struct.unpack_from("<I", b, o)[0]
++    w = struct.calcsize(fmt)
++    return list(struct.unpack_from("<%d%s" % (n, fmt), b, o + 4)), \
++        o + 4 + n * w
++
++
++def device_info(b):
++    o = 8
++    o += 0  # standard version, vendor extension id/version
++    std, vext, vver = struct.unpack_from("<HIH", b, 0)
++    o = 8
++    ext, o = ptp_string(b, o)
++    o += 2                                     # functional mode
++    ops, o = ptp_array(b, o, "H")
++    events, o = ptp_array(b, o, "H")
++    props, o = ptp_array(b, o, "H")
++    capf, o = ptp_array(b, o, "H")
++    imgf, o = ptp_array(b, o, "H")
++    manuf, o = ptp_string(b, o)
++    model, o = ptp_string(b, o)
++    version, o = ptp_string(b, o)
++    serial, o = ptp_string(b, o)
++    return dict(manufacturer=manuf, model=model, version=version,
++                serial=serial, extension=ext, operations=ops)
++
++
++def object_info(b):
++    storage, fmt, prot, size = struct.unpack_from("<IHHI", b, 0)
++    name, o = ptp_string(b, 52)
++    return dict(storage=storage, format=fmt, size=size, name=name)
++
++
++def main():
++    if len(sys.argv) < 3:
++        sys.exit(__doc__)
++    where, verb = sys.argv[1], sys.argv[2]
++    p = Ptp(where)
++    print("camera %04x:%04x, Still Image interface %d, bulk in %d out %d" %
++          (p.vid, p.pid, p.iface, p.ep_in, p.ep_out))
++    if verb == "raw":
++        op = int(sys.argv[3], 0)
++        params = [int(a, 0) for a in sys.argv[4:]]
++        if op != OP_GET_DEVICE_INFO:
++            p.open()
++        code, rp, data = p.transaction(op, params)
++        print("response 0x%04x params %s, %d data bytes" %
++              (code, [hex(x) for x in rp], len(data)))
++        sys.stdout.write(data[:256].hex(" ") + "\n")
++        return
++    code, _, data = p.transaction(OP_GET_DEVICE_INFO)
++    info = device_info(data)
++    if verb == "info":
++        print("%s %s, firmware %s, serial %s" % (info["manufacturer"],
++              info["model"], info["version"], info["serial"]))
++        print("%d operations: %s" % (len(info["operations"]),
++              " ".join("%04x" % x for x in info["operations"])))
++    p.open()
++    try:
++        code, _, data = p.transaction(OP_GET_STORAGE_IDS)
++        storages, _ = ptp_array(data, 0)
++        if verb == "info":
++            print("storages:", " ".join("%08x" % s for s in storages))
++            return
++        code, _, data = p.transaction(OP_GET_OBJECT_HANDLES,
++                                      (0xffffffff, 0, 0))
++        handles, _ = ptp_array(data, 0)
++        if verb == "ls":
++            for h in handles:
++                _, _, d = p.transaction(OP_GET_OBJECT_INFO, (h,))
++                oi = object_info(d)
++                print("%08x %10d %04x %s" % (h, oi["size"], oi["format"],
++                                             oi["name"]))
++        elif verb == "capture":
++            for _ in range(10):
++                code, _, _ = p.transaction(OP_NIKON_CAPTURE_REC_IN_MEDIA,
++                                           (0xffffffff, 0))
++                if code != RC_DEVICE_BUSY:
++                    break
++                time.sleep(2)
++            if code != RC_OK:
++                sys.exit("InitiateCaptureRecInMedia: 0x%04x" % code)
++            new = []
++            for _ in range(60):             # until the image is listed
++                time.sleep(1)
++                code, _, _ = p.transaction(OP_NIKON_DEVICE_READY)
++                if code != RC_OK:
++                    continue
++                _, _, data = p.transaction(OP_GET_OBJECT_HANDLES,
++                                           (0xffffffff, 0, 0))
++                after, _ = ptp_array(data, 0)
++                new = [(h, object_info(p.transaction(OP_GET_OBJECT_INFO,
++                                                     (h,))[2]))
++                       for h in after if h not in handles]
++                new = [(h, oi) for h, oi in new if oi["format"] != 0x3001]
++                if new:
++                    break
++            else:
++                sys.exit("no new image after 60 s (DeviceReady 0x%04x)" %
++                         code)
++            for h, oi in new:
++                print("%08x %10d %s" % (h, oi["size"], oi["name"]))
++                if len(sys.argv) > 3:
++                    _, _, d = p.transaction(OP_GET_OBJECT, (h,))
++                    out = os.path.join(sys.argv[3], oi["name"])
++                    with open(out, "wb") as f:
++                        f.write(d)
++                    print("  -> %s (%d bytes)" % (out, len(d)))
++        elif verb in ("get", "get-latest"):
++            if verb == "get":
++                h, out = int(sys.argv[3], 16), sys.argv[4]
++            else:
++                images = [h for h in handles
++                          if object_info(p.transaction(
++                              OP_GET_OBJECT_INFO, (h,))[2])["format"]
++                          not in (0x3001,)]
++                if not images:
++                    sys.exit("no images")
++                h = images[-1]
++                _, _, d = p.transaction(OP_GET_OBJECT_INFO, (h,))
++                out = os.path.join(sys.argv[3], object_info(d)["name"])
++            code, _, data = p.transaction(OP_GET_OBJECT, (h,))
++            if code != RC_OK:
++                sys.exit("GetObject: 0x%04x" % code)
++            with open(out, "wb") as f:
++                f.write(data)
++            print("%08x -> %s (%d bytes)" % (h, out, len(data)))
++    finally:
++        p.close()
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.55.0
+

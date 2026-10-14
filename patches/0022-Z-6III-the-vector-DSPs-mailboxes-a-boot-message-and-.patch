@@ -1,0 +1,565 @@
+From 979480168dace6633cf6bec050eef74b555d6562 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 11:28:08 +0000
+Subject: [PATCH 22/47] Z 6III: the vector DSPs -- mailboxes, a boot message,
+ and run/stop
+
+Live view was refused frame by frame: the display module's frame entry,
+sub_40E7FF80 (log 57, reason 2), drops every frame while DSP 0 is not in
+state 2. That state belongs to task DSPS0 (sub_40C8F780): 0 -> 1 when it
+starts the DSP, 1 -> 2 when, in state 1, a message arrives whose first
+word is 0xffffffff -- the DSP's own firmware saying it has booted. There
+is no DSP core in this machine, so nothing ever said so.
+
+nikon-z63-dspipc.h models the three DSPs' IPCUs (XM6_SEN 0x1c802000,
+XM6_CV 0x1d802000, NP2K 0x1fc02000; SPIs 45/46, 49/50, 41/42) as the
+driver drives them (0x40c2e6ac..0x40c2eaa4): eight mailboxes, claim by
+writing the sender bit, send, the receiver's acknowledge and the
+acknowledge status, nine data words; output 0 "acknowledged", output 1
+"a message for the ARM". It watches the DSP's reset release in the core
+window (Z63RegWindow gains a write hook for that) and, DECLARED, posts the
+boot message after it; acknowledges every ARM message at once; and
+completes every job at once with result 0 and nothing written -- the
+reply {command, result, slot} that sub_40C8FC98 matches against the slot
+the job came from. Without a reply the first job never finished and the
+menu no longer opened.
+
+And run/stop. DSPs 1 and 2 are put to sleep as soon as they have booted
+and woken for each job: sub_40C8F780's event-2 path calls
+sub_40C0A6E4(ctl, 3) for every DSP but 0 before it marks the DSP ready,
+sub_40C90B24 wakes it (mode 2) when sub_40C0A64C reads 3, sub_40C90118
+puts it back to sleep. sub_40C0A6E4 writes the request into core +0x050
+bit 0 (built from halfword reads of +0x050 and +0x052) and spins, with
+no timeout, until +0x054 bits 3:2 read 8 (running) or 0xc (stopped) --
+and first, if they read 0, until they read 8. The window returned its
+reset value 0: DSPS1 spun at 0x40c0a700 from its boot on, holding CPU 2.
+DSP 1 never became ready; the photometry stage that submits to it
+(sub_40FDC5F0 -> loc_40FD43BC -> sub_40C8FF78) waited for ever with its
+module's lock held; the exposure module's first live-view frames waited
+on that lock (sub_41101354 -> 0x4150001), so their frame ends were never
+posted, and the live-view frame jobs stalled behind them. DECLARED: the
+state reads 0 from a boot request until the boot message, then 8, and a
+write of +0x050 sets 8 or 0xc by its bit 0 at once. +0x050..+0x057 are
+served by this model over the window at the 2- and 4-byte widths the
+driver uses.
+
+Verified: DSP 1 boots, sleeps and wakes for photometry jobs 0x1a/0x1b;
+no CPU spins; live view's first frames get their exposure frame ends.
+smoke.sh passes.
+
+Where it stands: every DSP job completes with nothing written, so the
+photometry results read as a black scene -- the exposure goes to ISO
+64000 and 1.6", and live view runs in its long-exposure mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-dspipc.h    | 446 +++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63-regwindow.h |   9 +
+ hw/arm/nikon-z63.c           |   4 +
+ 3 files changed, 459 insertions(+)
+ create mode 100644 hw/arm/nikon-z63-dspipc.h
+
+diff --git a/hw/arm/nikon-z63-dspipc.h b/hw/arm/nikon-z63-dspipc.h
+new file mode 100644
+index 0000000..4d89804
+--- /dev/null
++++ b/hw/arm/nikon-z63-dspipc.h
+@@ -0,0 +1,446 @@
++/*
++ * Nikon Z 6III -- the vector DSPs' mailboxes (IPCU), and DSPs that say
++ * they have booted.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Live view was refused frame by frame. The display module's frame entry,
++ * sub_40E7FF80 (log 57, reason 2, ~30 a second), drops every frame while
++ * sub_40E6ECC8 is false: (0xa03d26f30 | 0xa03d26f08) == 0 -- the live-view
++ * mode's feature mask, 0x72000 here, from sub_40E974E4 -- or DSP 0 in
++ * state 2. That state belongs to task DSPS0 (task table entry 181), whose
++ * handler sub_40C8F780 moves it 0 -> 1 when it starts the DSP and 1 -> 2
++ * on event bit 1, which DSP 0's message callback sub_40C8FC98 posts when,
++ * in state 1, a message arrives whose first word is 0xffffffff. That is
++ * the DSP's own firmware saying it has booted. Tasks DSPS1/DSPS2 and
++ * callbacks 0x40c8fcb0/0x40c8fcc8 do the same for the other two.
++ *
++ * The DSPs are the three cores behind nikon-z63-dsp1c80.h's windows --
++ * 0x1c800000, 0x1d800000, 0x1fc00000 -- which the interrupt name table
++ * calls XM6_SEN, XM6_CV and NP2K. Each has an IPCU at +0x2000 (the
++ * driver's base table 0xa02dc5990: 0x0c851000, the ARM's own, then
++ * 0x1c802000, 0x1d802000, 0x1fc02000, 0x1b802000), with two interrupt
++ * outputs: SPI 45/46 XM6_SEN_IPCU_0/1, 49/50 XM6_CV_IPCU_0/1, 41/42
++ * NP2K_IPCU_0/1 (sub_40C2E2AC installs the stubs at 0x40c2e5d8..0x40c2e600
++ * on INTIDs 0x4d/0x4e, 0x51/0x52, 0x49/0x4a). There is no DSP core in this
++ * machine, so nothing ever answered and DSP 0 stayed in state 1.
++ *
++ * The IPCU, as this firmware drives it (0x40c2e6ac..0x40c2eaa4):
++ *
++ *   +0x080 + 4 o  output o's status: the address (low 12 bits) of the
++ *                 mailbox it is for; the stub turns it into an index
++ *   +0x100 + 0x80 k  mailbox k, k = 0..7:
++ *     +0x00   source: a sender claims a free mailbox by writing its bit
++ *             and reading it back (sub_40C2E6AC); 0 releases (sub_40C2E778)
++ *     +0x04   mode (& 7)            +0x08   send = 1 (sub_40C2E91C)
++ *     +0x10   destination mask      +0x14   receiver's acknowledge
++ *     +0x20, +0x24, +0x30           masks the driver sets (no reader seen)
++ *     +0x28   read by sub_40C2E878  +0x34   acknowledge clear
++ *     +0x38   acknowledge status    +0x40   nine data words
++ *   +0x900   which mailboxes are claimed (read by the claim loop)
++ *
++ * Output 1 is "a message for the ARM": the stub reads +0x084, sub_40C0A8B4
++ * copies the nine words, writes the mailbox's +0x14 and calls the
++ * channel's callback. Output 0 is "the receiver acknowledged your
++ * message": +0x080, read +0x38, write it back to +0x34, release.
++ *
++ * What this model does, all of it DECLARED -- there is no DSP here:
++ *
++ *   - Each boot -- the driver's reset release sub_40C0A52C, +0x024 = 1
++ *     then, with no boot image (address 0, as at every start here),
++ *     +0x028 = 1 and later 0 (0x40c0a5fc) -- is followed after
++ *     Z63_DSPIPC_BOOT_NS by the boot message: mailbox 7, word 0
++ *     0xffffffff, the rest 0, on output 1. Mailbox 7 and the sender bit
++ *     are choices; the ARM reads neither.
++ *   - Every message the ARM sends is acknowledged at once on output 0,
++ *     with the acknowledge status set to its destination mask.
++ *   - And every job is finished at once, with nothing done. The ARM sends
++ *     a job as four words -- command, two buffer addresses, and the job's
++ *     word +24 (sub_40C90B24 -> sub_40C0A83C) -- and records the command
++ *     in the slot the job came from (two per DSP, at +0x800 of the task
++ *     object; sub_40C90630). A DSP-to-ARM message {command, result, slot}
++ *     whose command matches that slot completes it (sub_40C8FC98 ->
++ *     events 8 / 16 -> sub_40C90118). The reply here is {command, 0,
++ *     word 3 when it is 0 or 1, else 0}: result 0, and no buffer is
++ *     written -- whatever the ARM asks for, subject detection by the
++ *     image's strings, it gets nothing. Which word carries the slot is an
++ *     inference from the first job (word 3 = 0, slot 0). Without a reply
++ *     the first job never finished, and the menu no longer opened.
++ *
++ * Levels: an output's interrupt is held until the ARM clears what it
++ * reports (+0x14 for a message, +0x34 for an acknowledge).
++ *
++ * Run and stop. DSPs 1 and 2 are put to sleep as soon as they have booted,
++ * and woken for each job: sub_40C8F780's event-2 path calls
++ * sub_40C0A6E4(ctl, 3) for any DSP but 0 before it marks the DSP ready,
++ * sub_40C90B24 calls sub_40C0A6E4(ctl, 2) when sub_40C0A64C reads 3, and
++ * sub_40C90118 puts the DSP back to sleep when its queues are empty.
++ * sub_40C0A6E4 on the core window:
++ *
++ *   +0x054 bits 3:2   state: (+0x54 >> 2) & 3 is sub_40C0A64C's answer
++ *   +0x050 bit 0      the request, written as one word built from the
++ *                     halfword reads of +0x050 and +0x052
++ *
++ *   if ((+0x54 & 0xc) == 0) wait until (+0x54 & 0xc) == 8;
++ *   wake:  +0x50 |= 1, then wait until (+0x54 & 0xc) == 8;
++ *   sleep: +0x50 &= ~1, then wait until (+0x54 & 0xc) == 0xc,
++ *
++ * every wait a bare spin with no timeout. So 8 is "running", 0xc
++ * "stopped", and 0 a state the driver waits out -- read here as the DSP
++ * not having started yet. The window returned its reset value 0 for
++ * +0x54, and DSP 1's task (DSPS1) spun at 0x40c0a700 from its boot on,
++ * holding CPU 2: DSP 1 never became ready, and the photometry stage that
++ * submits to it (sub_40FDC5F0 -> loc_40FD43BC -> sub_40C8FF78) waited
++ * forever with its module's lock held -- which in turn blocked the
++ * AE's first live-view frames, so the frame pipeline stalled.
++ *
++ * Here, DECLARED, since no DSP core runs: the state reads 0 from a boot
++ * request (+0x024 = 1) until the boot message, then 8; a write of +0x050
++ * after that sets 8 or 0xc by its bit 0 at once. +0x050..+0x057 are served
++ * by this model over the window, at the 2- and 4-byte widths the driver
++ * uses (sub_40C0A6E4 reads +0x052 as a halfword).
++ */
++
++#ifndef HW_ARM_NIKON_Z63_DSPIPC_H
++#define HW_ARM_NIKON_Z63_DSPIPC_H
++
++#define Z63_IPCU_OFFSET         0x2000      /* inside each DSP window */
++#define Z63_IPCU_SIZE           0x1000
++#define Z63_IPCU_MBOXES         8
++#define Z63_IPCU_MBOX(k)        (0x100 + 0x80 * (k))
++#define Z63_IPCU_STATUS(o)      (0x080 + 4 * (o))
++#define Z63_IPCU_CLAIMED        0x900
++
++#define Z63_IPCU_SRC            0x00
++#define Z63_IPCU_MODE           0x04
++#define Z63_IPCU_SEND           0x08
++#define Z63_IPCU_DEST           0x10
++#define Z63_IPCU_RACK           0x14
++#define Z63_IPCU_ACLR           0x34
++#define Z63_IPCU_ASTAT          0x38
++#define Z63_IPCU_DATA           0x40
++#define Z63_IPCU_WORDS          9
++
++#define Z63_DSPIPC_BOOT_NS      (1 * SCALE_MS)
++#define Z63_DSPIPC_BOOT_MBOX    7
++#define Z63_DSPIPC_DSP_BIT      0x2         /* the sender the DSP claims as */
++#define Z63_DSPIPC_NAMED        8
++
++#define Z63_DSP_RUN_OFFSET      0x050       /* +0x050..+0x057 of the core */
++#define Z63_DSP_RUN_SIZE        8
++#define Z63_DSP_STATE           0x4         /* +0x054, in that range */
++#define Z63_DSP_STARTING        0x0
++#define Z63_DSP_RUNNING         0x8
++#define Z63_DSP_STOPPED         0xc
++
++typedef struct Z63DspIpc {
++    MemoryRegion mr;
++    const char *name;
++    hwaddr base;                    /* the IPCU's own base */
++    Z63RegWindow *core;             /* the DSP's control window */
++    qemu_irq irq[2];                /* 0: acknowledge, 1: message */
++    uint32_t regs[Z63_IPCU_SIZE / 4];
++    QEMUTimer *boot_timer;
++    bool booted;                    /* this boot's message has gone */
++    uint64_t boots, sent, acked, replied, runs;
++    /* +0x050 (the run request) and +0x054 (the state) of the core. */
++    MemoryRegion run_mr;
++    uint32_t run, state;
++    /* Replies waiting for the DSP-to-ARM mailbox, oldest first. */
++    uint32_t reply[16][2];          /* command, slot */
++    unsigned reply_head, reply_count;
++} Z63DspIpc;
++
++static Z63DspIpc z63_dspipc[3];
++
++/* SPIs, output 0 and 1, in the order of z63_dsp1c80[]. */
++static const uint8_t z63_dspipc_spi[3][2] = {
++    { Z63_SPI_XM6_SEN_IPCU_0, Z63_SPI_XM6_SEN_IPCU_1 },  /* 0x1c800000 */
++    { Z63_SPI_XM6_CV_IPCU_0,  Z63_SPI_XM6_CV_IPCU_1 },   /* 0x1d800000 */
++    { Z63_SPI_NP2K_IPCU_0,    Z63_SPI_NP2K_IPCU_1 },     /* 0x1fc00000 */
++};
++
++static bool z63_dspipc_known(hwaddr off)
++{
++    hwaddr r;
++
++    if (off == 0x000 || off == Z63_IPCU_STATUS(0) ||
++        off == Z63_IPCU_STATUS(1) || off == Z63_IPCU_CLAIMED) {
++        return true;
++    }
++    if (off < Z63_IPCU_MBOX(0) || off >= Z63_IPCU_MBOX(Z63_IPCU_MBOXES)) {
++        return false;
++    }
++    r = (off - Z63_IPCU_MBOX(0)) % 0x80;
++    switch (r) {
++    case Z63_IPCU_SRC: case Z63_IPCU_MODE: case Z63_IPCU_SEND:
++    case Z63_IPCU_DEST: case Z63_IPCU_RACK: case 0x20: case 0x24:
++    case 0x28: case 0x30: case Z63_IPCU_ACLR: case Z63_IPCU_ASTAT:
++        return true;
++    default:
++        return r >= Z63_IPCU_DATA && r < Z63_IPCU_DATA + 4 * Z63_IPCU_WORDS;
++    }
++}
++
++static uint32_t *z63_dspipc_reg(Z63DspIpc *d, unsigned k, unsigned r)
++{
++    return &d->regs[(Z63_IPCU_MBOX(k) + r) / 4];
++}
++
++/* Output 0 reports the first mailbox with an acknowledge outstanding. */
++static void z63_dspipc_ack_update(Z63DspIpc *d)
++{
++    uint32_t status = 0;
++
++    for (unsigned k = 0; k < Z63_IPCU_MBOXES && !status; k++) {
++        if (*z63_dspipc_reg(d, k, Z63_IPCU_ASTAT)) {
++            status = Z63_IPCU_MBOX(k);
++        }
++    }
++    d->regs[Z63_IPCU_STATUS(0) / 4] = status;
++    qemu_set_irq(d->irq[0], status != 0);
++}
++
++/* Put a message from the DSP in its mailbox and raise output 1. */
++static void z63_dspipc_post(Z63DspIpc *d, const uint32_t *w, unsigned n)
++{
++    unsigned k = Z63_DSPIPC_BOOT_MBOX;
++
++    *z63_dspipc_reg(d, k, Z63_IPCU_SRC) = Z63_DSPIPC_DSP_BIT;
++    *z63_dspipc_reg(d, k, Z63_IPCU_DEST) = 1;
++    for (unsigned i = 0; i < Z63_IPCU_WORDS; i++) {
++        *z63_dspipc_reg(d, k, Z63_IPCU_DATA + 4 * i) = i < n ? w[i] : 0;
++    }
++    d->regs[Z63_IPCU_STATUS(1) / 4] = Z63_IPCU_MBOX(k);
++    qemu_set_irq(d->irq[1], 1);
++}
++
++static bool z63_dspipc_busy(Z63DspIpc *d)
++{
++    return d->regs[Z63_IPCU_STATUS(1) / 4] != 0;
++}
++
++/* The next queued reply, once the mailbox is free. */
++static void z63_dspipc_next(Z63DspIpc *d)
++{
++    uint32_t w[3];
++
++    if (z63_dspipc_busy(d) || !d->reply_count) {
++        return;
++    }
++    w[0] = d->reply[d->reply_head][0];
++    w[1] = 0;
++    w[2] = d->reply[d->reply_head][1];
++    d->reply_head = (d->reply_head + 1) % ARRAY_SIZE(d->reply);
++    d->reply_count--;
++    if (d->replied++ < Z63_DSPIPC_NAMED) {
++        error_report("Z63_DSPIPC: %s: job %#x (slot %u) finished, result 0, "
++                     "nothing written (DECLARED)", d->name, w[0], w[2]);
++    }
++    z63_dspipc_post(d, w, 3);
++}
++
++static void z63_dspipc_boot(void *opaque)
++{
++    Z63DspIpc *d = opaque;
++    static const uint32_t ready = 0xffffffff;
++
++    if (z63_dspipc_busy(d)) {
++        timer_mod(d->boot_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  Z63_DSPIPC_BOOT_NS);
++        return;
++    }
++    d->booted = true;
++    d->state = Z63_DSP_RUNNING;
++    d->reply_count = 0;
++    if (d->boots++ < Z63_DSPIPC_NAMED) {
++        error_report("Z63_DSPIPC: %s released from reset; its boot message "
++                     "(word 0xffffffff, mailbox %u) is DECLARED -- no DSP "
++                     "core runs here (nikon-z63-dspipc.h)", d->name,
++                     Z63_DSPIPC_BOOT_MBOX);
++    }
++    z63_dspipc_post(d, &ready, 1);
++}
++
++/* The DSP's control window: +0x024 = 1 starts a boot sequence and +0x028
++ * written 0 ends it (sub_40C0A52C, then sub_40C0A5F4 at 0x40c0a5fc). */
++static void z63_dspipc_core_write(void *opaque, hwaddr off, uint32_t value)
++{
++    Z63DspIpc *d = opaque;
++
++    if (off == 0x024 && value == 1) {
++        d->booted = false;
++        d->state = Z63_DSP_STARTING;
++        timer_del(d->boot_timer);
++    } else if (off == 0x028 && value == 0 && !d->booted &&
++               d->core->words[0x024 / 4] == 1) {
++        timer_mod(d->boot_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  Z63_DSPIPC_BOOT_NS);
++    }
++}
++
++static uint64_t z63_dspipc_read(void *opaque, hwaddr off, unsigned size)
++{
++    Z63DspIpc *d = opaque;
++
++    if (size != 4 || (off & 3) || !z63_dspipc_known(off)) {
++        z63_stop_read(d->name, d->base + off, size);
++        return 0;
++    }
++    if (off == Z63_IPCU_CLAIMED) {
++        uint32_t v = 0;
++
++        for (unsigned k = 0; k < Z63_IPCU_MBOXES; k++) {
++            v |= (*z63_dspipc_reg(d, k, Z63_IPCU_SRC) != 0) << k;
++        }
++        return v;
++    }
++    return d->regs[off / 4];
++}
++
++static void z63_dspipc_write(void *opaque, hwaddr off, uint64_t value,
++                             unsigned size)
++{
++    Z63DspIpc *d = opaque;
++    unsigned k, r;
++
++    if (size != 4 || (off & 3) || !z63_dspipc_known(off) ||
++        off == Z63_IPCU_CLAIMED || off == Z63_IPCU_STATUS(0) ||
++        off == Z63_IPCU_STATUS(1)) {
++        z63_stop_write(d->name, d->base + off, size, value);
++        return;
++    }
++    d->regs[off / 4] = value;
++    if (off < Z63_IPCU_MBOX(0)) {
++        return;
++    }
++    k = (off - Z63_IPCU_MBOX(0)) / 0x80;
++    r = (off - Z63_IPCU_MBOX(0)) % 0x80;
++    switch (r) {
++    case Z63_IPCU_SEND:
++        if (value & 1) {
++            /* The ARM sent; the DSP takes it and acknowledges. */
++            uint32_t dest = *z63_dspipc_reg(d, k, Z63_IPCU_DEST);
++            uint32_t *w = z63_dspipc_reg(d, k, Z63_IPCU_DATA);
++
++            *z63_dspipc_reg(d, k, Z63_IPCU_ASTAT) = dest ? dest : 1;
++            if (d->sent++ < Z63_DSPIPC_NAMED) {
++                error_report("Z63_DSPIPC: %s: ARM message on mailbox %u "
++                             "(to 0x%x): %08x %08x %08x %08x -- acknowledged "
++                             "(DECLARED)", d->name, k, dest,
++                             w[0], w[1], w[2], w[3]);
++            }
++            if (d->reply_count < ARRAY_SIZE(d->reply)) {
++                unsigned t = (d->reply_head + d->reply_count) %
++                             ARRAY_SIZE(d->reply);
++
++                d->reply[t][0] = w[0];
++                d->reply[t][1] = w[3] <= 1 ? w[3] : 0;
++                d->reply_count++;
++            }
++            z63_dspipc_ack_update(d);
++            z63_dspipc_next(d);
++        }
++        break;
++    case Z63_IPCU_ACLR:
++        *z63_dspipc_reg(d, k, Z63_IPCU_ASTAT) &= ~(uint32_t)value;
++        d->acked++;
++        z63_dspipc_ack_update(d);
++        break;
++    case Z63_IPCU_RACK:
++        /* The ARM has read a message of the DSP's: the DSP releases it. */
++        if (*z63_dspipc_reg(d, k, Z63_IPCU_SRC) == Z63_DSPIPC_DSP_BIT &&
++            d->regs[Z63_IPCU_STATUS(1) / 4] == Z63_IPCU_MBOX(k)) {
++            memset(z63_dspipc_reg(d, k, 0), 0, 0x80);
++            d->regs[Z63_IPCU_STATUS(1) / 4] = 0;
++            qemu_set_irq(d->irq[1], 0);
++            z63_dspipc_next(d);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static const MemoryRegionOps z63_dspipc_ops = {
++    .read = z63_dspipc_read,
++    .write = z63_dspipc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t z63_dsp_run_read(void *opaque, hwaddr off, unsigned size)
++{
++    Z63DspIpc *d = opaque;
++    hwaddr addr = d->core->base + Z63_DSP_RUN_OFFSET + off;
++
++    if (size == 4 && off == 0) {
++        return d->run;
++    }
++    if (size == 2 && (off == 0 || off == 2)) {
++        return extract32(d->run, 8 * off, 16);
++    }
++    if (size == 4 && off == Z63_DSP_STATE) {
++        return d->state;
++    }
++    z63_stop_read(d->core->name, addr, size);
++    return 0;
++}
++
++static void z63_dsp_run_write(void *opaque, hwaddr off, uint64_t value,
++                              unsigned size)
++{
++    Z63DspIpc *d = opaque;
++
++    if (size != 4 || off != 0) {
++        z63_stop_write(d->core->name, d->core->base + Z63_DSP_RUN_OFFSET + off,
++                       size, value);
++        return;
++    }
++    d->run = value;
++    if (d->booted) {
++        d->state = (value & 1) ? Z63_DSP_RUNNING : Z63_DSP_STOPPED;
++    }
++    if (d->runs++ < Z63_DSPIPC_NAMED) {
++        error_report("Z63_DSPIPC: %s +0x050 = 0x%x: %s at once (DECLARED, "
++                     "nikon-z63-dspipc.h)", d->core->name, (uint32_t)value,
++                     !d->booted ? "not booted, state unchanged" :
++                     (value & 1) ? "running" : "stopped");
++    }
++}
++
++static const MemoryRegionOps z63_dsp_run_ops = {
++    .read = z63_dsp_run_read,
++    .write = z63_dsp_run_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 2, .max_access_size = 4 },
++};
++
++/* Over each DSP window's +0x2000 page, which the window otherwise serves
++ * as one storage word (+0x2000, kept here as offset 0). */
++static void z63_dspipc_init(Object *owner, MemoryRegion *sysmem,
++                            DeviceState *gic, Z63RegWindow *cores)
++{
++    for (unsigned i = 0; i < ARRAY_SIZE(z63_dspipc); i++) {
++        Z63DspIpc *d = &z63_dspipc[i];
++
++        d->core = &cores[i];
++        d->base = cores[i].base + Z63_IPCU_OFFSET;
++        d->name = g_strdup_printf("IPCU-0x%" HWADDR_PRIX, d->base);
++        d->irq[0] = qdev_get_gpio_in(gic, Z63_GIC_SPI(z63_dspipc_spi[i][0]));
++        d->irq[1] = qdev_get_gpio_in(gic, Z63_GIC_SPI(z63_dspipc_spi[i][1]));
++        d->boot_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_dspipc_boot, d);
++        cores[i].write_hook = z63_dspipc_core_write;
++        cores[i].write_hook_opaque = d;
++        memory_region_init_io(&d->mr, owner, &z63_dspipc_ops, d, d->name,
++                              Z63_IPCU_SIZE);
++        memory_region_add_subregion_overlap(sysmem, d->base, &d->mr, 1);
++        memory_region_init_io(&d->run_mr, owner, &z63_dsp_run_ops, d,
++                              "dsp-run", Z63_DSP_RUN_SIZE);
++        memory_region_add_subregion_overlap(sysmem,
++                                            cores[i].base + Z63_DSP_RUN_OFFSET,
++                                            &d->run_mr, 1);
++    }
++}
++
++#endif /* HW_ARM_NIKON_Z63_DSPIPC_H */
+diff --git a/hw/arm/nikon-z63-regwindow.h b/hw/arm/nikon-z63-regwindow.h
+index 04d4a91..1b6dc91 100644
+--- a/hw/arm/nikon-z63-regwindow.h
++++ b/hw/arm/nikon-z63-regwindow.h
+@@ -56,6 +56,12 @@ typedef struct Z63RegWindow {
+     uint32_t *words;
+     unsigned long *modelled;    /* indexed by (addr % stride) / 4 */
+     bool dense;                 /* the whole span is storage; see below */
++    /* A model that needs to see one register's writes without owning the
++     * block (nikon-z63-dspipc.h watches a DSP's reset release): called
++     * after each stored write, with the window offset. Storage stays the
++     * answer to every read. */
++    void (*write_hook)(void *opaque, hwaddr off, uint32_t value);
++    void *write_hook_opaque;
+ } Z63RegWindow;
+ 
+ /*
+@@ -127,6 +133,9 @@ static void z63_regwindow_write(void *opaque, hwaddr addr, uint64_t value,
+         return;
+     }
+     w->words[addr / 4] = value;
++    if (w->write_hook) {
++        w->write_hook(w->write_hook_opaque, addr, value);
++    }
+ }
+ 
+ static const MemoryRegionOps z63_regwindow_ops = {
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 5348ea4..6126e76 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -593,6 +593,7 @@ static const hwaddr z63_dma_bases[Z63_DMA_BANKS] = {
+ #include "hw/arm/nikon-z63-exs1784.h"
+ #include "hw/arm/nikon-z63-blk15d8.h"
+ #include "hw/arm/nikon-z63-dsp1c80.h"
++#include "hw/arm/nikon-z63-dspipc.h"   /* their mailboxes */
+ #include "hw/arm/nikon-z63-dsp1b80.h"
+ #include "hw/arm/nikon-z63-spibus.h"
+ static uint64_t z63_current_pc(void);
+@@ -4282,6 +4283,9 @@ static void z63_init(MachineState *machine)
+                            Z63_DSP1C80_SIZE, z63_dsp1c80_offsets,
+                            ARRAY_SIZE(z63_dsp1c80_offsets));
+     }
++    /* Their mailboxes, and a boot message from each (nikon-z63-dspipc.h). */
++    QEMU_BUILD_BUG_ON(ARRAY_SIZE(z63_dspipc) != ARRAY_SIZE(s->dsp1c80));
++    z63_dspipc_init(OBJECT(machine), sysmem, s->gic, s->dsp1c80);
+ 
+     s->storage.caps_stub = s->storage_caps_stub;
+     z63_create_storage(&s->storage, OBJECT(machine), sysmem);
+-- 
+2.55.0
+

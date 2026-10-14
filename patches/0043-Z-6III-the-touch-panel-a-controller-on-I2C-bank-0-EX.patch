@@ -1,0 +1,612 @@
+From 678f77b35384b7918605e20f5c0b7e3593cd8dae Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Tue, 13 Oct 2026 03:52:03 +0000
+Subject: [PATCH 43/47] Z 6III: the touch panel -- a controller on I2C bank 0,
+ EXT_INT_14, and -machine touch
+
+The rear monitor's touch panel had no device. Its driver
+(0x40cc1aa0-0x40cc3300) feeds the touch input service TPIS
+(0x40d2bf70.., the gestures TouchOn/Slide/Flick/Pinch), and is wired by
+its init sub_40CC20A8 through the runtime tables:
+
+  I2C        handle sub_40C00460(0) -> bank 0; slave 0x55
+  interrupt  resource 0x2d, pin {port 3, bit 14}, line record {bank 1,
+             bit 5, INTID 69} = EXT_INT_14, falling edge, callback
+             0x40cc21c8 (flag bit 0 of 0xa030582e8)
+  power      resource 0x8c, pin {port 9, bit 15}, 1 = on
+
+The driver's task (sub_40CC1BA8) waits for an interrupt and reads
+register 0x10 (2 bytes: records, flags); the first interrupt after power
+is taken only with flags bit 7 (0x40cc1e64), after which it writes
+02/01 to start scanning and its configuration. Then each interrupt
+reads 0x10 and, per record, 0x11 (7 bytes: bit 7 down, id, x and y
+little-endian; 0x40cc1da4..e34), and hands the points to TPIS, in the
+screen's 1024x682.
+
+nikon-z63-touch.h answers those registers: the boot interrupt 10 ms
+after power comes on (repeated until read), a report every 16 ms while a
+finger is down and one more at the release, the line idling high and
+falling for each report. DECLARED, as the chip is not identified: the
+timings, flags bit 7 kept set as "ready", scanning while registers 1 and
+2 hold 1, version 1.00.00. Fingers come from the new run-time property
+touch: qom-set /machine touch 512:341 (or x:y+x:y for two), "" or "up"
+to lift. The I2C banks now route through the board: the touch panel at
+bank 0/0x55, the posture sensor's endpoint for the rest.
+
+The EXT_INT edge detector put line n at bank n / 16, bit n % 16. The line
+records (.data 0xa0280c1b8.., {enable, bank, bit, INTID, ISR, callback})
+have nine lines a bank: EXT_INT_0..8 in bank 0, 9..17 in bank 1 bits
+0..8. Every line driven so far was in bank 0, so nothing showed it until
+the touch panel's EXT_INT_14 never arrived. Fixed.
+
+Checked: after power-on the controller reports ready and scanning starts;
+with the camera kept awake (one half-press), a tap at 970:515 opens the
+live view's i menu and a tap on its QUAL tile opens image quality. A
+touch while the panel is off (standby) is dropped and named.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/plan.md              |   3 +
+ hw/arm/nikon-z63-extint.h |  16 +-
+ hw/arm/nikon-z63-touch.h  | 324 ++++++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63.c        |  93 ++++++++++-
+ 4 files changed, 430 insertions(+), 6 deletions(-)
+ create mode 100644 hw/arm/nikon-z63-touch.h
+
+diff --git a/docs/plan.md b/docs/plan.md
+index 704d3d0..203153f 100644
+--- a/docs/plan.md
++++ b/docs/plan.md
+@@ -25,6 +25,9 @@ carry the detail.
+   tabs walk top to bottom without a stop.
+ * **Input.** Keys through the MCU (`mcu-keys=`, or `qom-set mcu-keys` at
+   run time); the shutter button's contacts reach the EXPEED as EXT_INT_4/5.
++  The rear touch panel (`nikon-z63-touch.h`: I2C bank 0 slave 0x55,
++  EXT_INT_14) takes fingers from `qom-set /machine touch x:y` / `up` in its
++  1024x682 screen space; a tap on the live view's i icon opens the i menu.
+ * **Live view.** The sensor streams from a Bayer file (`z9-capture-raw=`)
+   through `../z9-qemu`'s capture models (`-machine z9-capture=on`, default
+   props in `nikon-z63-z9lab.h`), the vector DSPs and the display's direct
+diff --git a/hw/arm/nikon-z63-extint.h b/hw/arm/nikon-z63-extint.h
+index 491f69d..554efd6 100644
+--- a/hw/arm/nikon-z63-extint.h
++++ b/hw/arm/nikon-z63-extint.h
+@@ -36,6 +36,13 @@
+  * line descriptors (0xa02dc3dd8 + 8 * (INTID - 55)) put EXT_INT_2 on GPIO
+  * port 3 bit 2 and EXT_INT_3 on port 3 bit 3. Lines are driven through
+  * z63_extint_set(); a line nothing drives stays low, as before.
++ *
++ * Nine lines a bank: the line records sub_40C15DFC installs from
++ * ({enable, bank, bit, INTID, ISR, callback}, .data 0xa0280c1b8 onward,
++ * 0x28 apart) put EXT_INT_0..8 at bank 0 bits 0..8 and EXT_INT_9..17 at
++ * bank 1 bits 0..8 (EXT_INT_14, the touch panel's, is {1, 5, INTID 69}).
++ * This model first assumed sixteen a bank, which only bank 0's lines --
++ * all that had been driven -- could not show.
+  */
+ 
+ #ifndef HW_ARM_NIKON_Z63_EXTINT_H
+@@ -45,6 +52,7 @@
+ #define Z63_EXTINT_BANKS    2
+ #define Z63_EXTINT_SPAN     0x20        /* overlaid words per bank */
+ #define Z63_EXTINT_LINES    18          /* EXT_INT_0..17 */
++#define Z63_EXTINT_PER_BANK 9           /* bits 0..8 of each bank */
+ 
+ typedef struct Z63ExtInt Z63ExtInt;
+ 
+@@ -70,10 +78,10 @@ struct Z63ExtInt {
+ static void z63_extint_update(Z63ExtInt *e, unsigned bank)
+ {
+     for (unsigned bit = 0; bit < 32; bit++) {
+-        unsigned line = bank * 16 + bit;
++        unsigned line = bank * Z63_EXTINT_PER_BANK + bit;
+         uint32_t m = 1u << bit;
+ 
+-        if (bit >= 16 || line >= Z63_EXTINT_LINES) {
++        if (bit >= Z63_EXTINT_PER_BANK || line >= Z63_EXTINT_LINES) {
+             continue;
+         }
+         if ((e->configured[bank] & m) && !(e->edge[bank] & m) &&
+@@ -87,8 +95,8 @@ static void z63_extint_update(Z63ExtInt *e, unsigned bank)
+ /* A pin feeding EXT_INT `line` changed level. */
+ static void z63_extint_set(Z63ExtInt *e, unsigned line, bool level)
+ {
+-    unsigned bank = line / 16;
+-    uint32_t m = 1u << (line % 16);
++    unsigned bank = line / Z63_EXTINT_PER_BANK;
++    uint32_t m = 1u << (line % Z63_EXTINT_PER_BANK);
+     bool was = e->level[bank] & m;
+ 
+     if (was == level) {
+diff --git a/hw/arm/nikon-z63-touch.h b/hw/arm/nikon-z63-touch.h
+new file mode 100644
+index 0000000..fa8c499
+--- /dev/null
++++ b/hw/arm/nikon-z63-touch.h
+@@ -0,0 +1,324 @@
++/*
++ * Nikon Z 6III -- the rear monitor's touch panel controller.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The driver is 0x40cc1aa0-0x40cc3300; its readings go to the touch input
++ * service TPIS (0x40d2bf70.., objects TPISFLG/TPISMTX/TPISCYC1/2, which
++ * turns points into TouchOn/Slide/Flick/Pinch/...). Board wiring, from
++ * the driver's init sub_40CC20A8 and the runtime tables:
++ *
++ *   I2C          handle sub_40C00460(0) = 0x00000001 -> bank 0 (0x0e005000);
++ *                slave 0x55 (normal mode; 0x41 is a flash-update mode the
++ *                service menu uses, not modelled)
++ *   interrupt    resource 0x2d, pin descriptor 0xa02809300 = {0x2d, port
++ *                3, bit 14}: EXT_INT_14, installed mode 0 with config word
++ *                0 -- the edge detector's falling edge (nikon-z63-extint.h)
++ *                -- callback 0x40cc21c8, which sets flag bit 0 of 0xa030582e8
++ *   power        resource 0x8c, {0x8c, port 9, bit 15}: an output, 1 = on
++ *                (the task sets it at start-up; sub_40CC27A0 and the power
++ *                hook sub_40CC21F8 clear it; sub_40CC2660 sets it)
++ *
++ * The protocol (register addresses are one byte; a read is "write the
++ * register, repeated START, read"; message lengths from sub_40CA709C):
++ *
++ *   0x10, read 2     {S0 records, S1 flags}. The first interrupt after
++ *                    power-on is taken only with S1 bit 7 set
++ *                    (0x40cc1e64); after it the driver writes 02/01, the
++ *                    four configuration pairs and a block, and is
++ *                    configured. On later interrupts S1 bit 4 drops the
++ *                    event and bit 3 means no finger (0x40cc1d8c/90).
++ *   0x11, read 7     one record per read, up to S0 of them and at most two
++ *                    (0x40cc1da4..e34): R0 bit 7 down, R0 & 0x3f the id,
++ *                    x = R1 | R2 << 8, y = R3 | R4 << 8; R5/R6 unread.
++ *   0x21, read 3     the firmware version, after "F6 21" (sub_40CC2944)
++ *   0x01, 0x02       written 1 then 1 to start scanning ("02 01", "01 01"
++ *                    after the boot status, and in sub_40CC2660), 0 and 0
++ *                    to stop it (sub_40CC27A0). An interrupt while it is
++ *                    stopped is taken as a new boot interrupt.
++ *   anything else    written and kept
++ *
++ * Points are in the screen's own 1024x682 (TPIS sub_40D2D4D8 keeps
++ * 0 <= x <= 1024, 0 <= y <= 682, the window at 0x42b74178), origin top
++ * left. A report with no finger is the release, delivered once.
++ *
++ * What is modelled -- DECLARED where the part is not known: the chip is
++ * not identified, so this answers the registers above and no more. 10 ms
++ * after power comes on it raises the boot interrupt (S1 bit 7), and
++ * repeats the edge every 100 ms until 0x10 has been read, so a line not
++ * yet installed does not lose it. The interrupt line idles high and goes
++ * low for each report, released when the report has been read (0x10
++ * with no finger, or the last record). While a finger is down a report
++ * is made every 16 ms; the release makes one more. S1 bit 7 stays set
++ * after the boot (a "ready" flag nothing else tests). Touches are made
++ * only while registers 1 and 2 both hold 1 (scanning). The version reads
++ * 1.00.00. Fingers come from the machine property "touch": "x:y" for one,
++ * "x:y+x:y" for two (a pinch), "" or "up" to lift them; settable at run
++ * time with qom-set. A touch before the controller has been configured
++ * is dropped and named.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_TOUCH_H
++#define HW_ARM_NIKON_Z63_TOUCH_H
++
++#define Z63_TOUCH_BANK          0
++#define Z63_TOUCH_ADDRESS       0x55
++#define Z63_TOUCH_INT_LINE      14      /* EXT_INT_14, GPIO port 3 bit 14 */
++#define Z63_TOUCH_POWER_PORT    9       /* GPIO port 9 bit 15 */
++#define Z63_TOUCH_POWER_BIT     15
++#define Z63_TOUCH_WIDTH         1024
++#define Z63_TOUCH_HEIGHT        682
++#define Z63_TOUCH_FINGERS       2
++#define Z63_TOUCH_BOOT_NS       (10 * SCALE_MS)
++#define Z63_TOUCH_RETRY_NS      (100 * SCALE_MS)
++#define Z63_TOUCH_FRAME_NS      (16 * SCALE_MS)
++
++typedef struct Z63Touch {
++    Z63ExtInt *extint;
++    QEMUTimer *timer;
++    /* I2C */
++    bool selected, receive, pointer_set;
++    uint8_t pointer;
++    uint8_t regs[256];
++    uint8_t rx[8];
++    unsigned rx_len, rx_pos;
++    /* the panel */
++    bool powered;
++    bool boot_pending;          /* S1 bit 7 not yet read */
++    bool booted;
++    bool int_low;
++    unsigned fingers;           /* down now */
++    uint16_t x[Z63_TOUCH_FINGERS], y[Z63_TOUCH_FINGERS];
++    bool release_pending;       /* one report with no finger owed */
++    unsigned report_n;          /* fingers in the report being read */
++    unsigned records_left;
++    uint16_t rx_x[Z63_TOUCH_FINGERS], rx_y[Z63_TOUCH_FINGERS];
++    uint64_t reports, boot_edges, dropped;
++} Z63Touch;
++
++static bool z63_touch_scanning(Z63Touch *t)
++{
++    return t->booted && (t->regs[0x01] & 1) && (t->regs[0x02] & 1);
++}
++
++static void z63_touch_int(Z63Touch *t, bool low)
++{
++    t->int_low = low;
++    z63_extint_set(t->extint, Z63_TOUCH_INT_LINE, !low);
++}
++
++/* A report: the fingers as they are now, latched for the reads. */
++static void z63_touch_report(Z63Touch *t)
++{
++    t->report_n = t->fingers;
++    for (unsigned i = 0; i < t->fingers; i++) {
++        t->rx_x[i] = t->x[i];
++        t->rx_y[i] = t->y[i];
++    }
++    t->records_left = t->report_n;
++    if (!t->fingers) {
++        t->release_pending = false;
++    }
++    t->reports++;
++    if (t->int_low) {
++        z63_touch_int(t, false);        /* make an edge for this one */
++    }
++    z63_touch_int(t, true);
++}
++
++static void z63_touch_tick(void *opaque)
++{
++    Z63Touch *t = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (!t->powered) {
++        return;
++    }
++    if (t->boot_pending) {
++        t->boot_edges++;
++        if (t->int_low) {
++            z63_touch_int(t, false);
++        }
++        z63_touch_int(t, true);
++        timer_mod(t->timer, now + Z63_TOUCH_RETRY_NS);
++        return;
++    }
++    if (!z63_touch_scanning(t)) {
++        return;
++    }
++    if (t->fingers || t->release_pending) {
++        z63_touch_report(t);
++    }
++    if (t->fingers) {
++        timer_mod(t->timer, now + Z63_TOUCH_FRAME_NS);
++    }
++}
++
++/* GPIO port 9 bit 15, as the firmware drives it. */
++static void z63_touch_power(Z63Touch *t, bool on)
++{
++    if (on == t->powered) {
++        return;
++    }
++    t->powered = on;
++    t->booted = false;
++    t->boot_pending = on;
++    t->records_left = 0;
++    t->report_n = 0;
++    t->regs[0x01] = t->regs[0x02] = 0;
++    z63_touch_int(t, false);
++    if (on) {
++        timer_mod(t->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                            Z63_TOUCH_BOOT_NS);
++    } else {
++        timer_del(t->timer);
++    }
++    error_report("Z63_TOUCH: panel power %s", on ? "on" : "off");
++}
++
++/* "x:y", "x:y+x:y", "" or "up". */
++static bool z63_touch_set(Z63Touch *t, const char *text, Error **errp)
++{
++    g_auto(GStrv) fingers = NULL;
++    unsigned n = 0;
++    uint16_t x[Z63_TOUCH_FINGERS], y[Z63_TOUCH_FINGERS];
++
++    if (text && *text && strcmp(text, "up")) {
++        fingers = g_strsplit(text, "+", -1);
++        for (n = 0; fingers[n]; n++) {
++            unsigned long fx, fy;
++            char *end;
++
++            if (n == Z63_TOUCH_FINGERS) {
++                error_setg(errp, "touch: at most %u fingers",
++                           Z63_TOUCH_FINGERS);
++                return false;
++            }
++            fx = strtoul(fingers[n], &end, 0);
++            if (*end != ':') {
++                goto bad;
++            }
++            fy = strtoul(end + 1, &end, 0);
++            if (*end || fx > Z63_TOUCH_WIDTH || fy > Z63_TOUCH_HEIGHT) {
++                goto bad;
++            }
++            x[n] = fx;
++            y[n] = fy;
++        }
++    }
++    if (n && !z63_touch_scanning(t)) {
++        t->dropped++;
++        error_report("Z63_TOUCH: touch at %u:%u dropped -- the controller "
++                     "is %s", x[0], y[0], !t->powered ? "off" :
++                     !t->booted ? "starting" : "not scanning");
++        return true;
++    }
++    if (!n && t->fingers) {
++        t->release_pending = true;
++    }
++    t->fingers = n;
++    memcpy(t->x, x, sizeof(x[0]) * n);
++    memcpy(t->y, y, sizeof(y[0]) * n);
++    if (z63_touch_scanning(t) && !timer_pending(t->timer)) {
++        z63_touch_tick(t);
++    }
++    return true;
++
++bad:
++    error_setg(errp, "touch wants x:y (0..%u, 0..%u), x:y+x:y, or up",
++               Z63_TOUCH_WIDTH, Z63_TOUCH_HEIGHT);
++    return false;
++}
++
++/* The I2C endpoint (bank 0, slave 0x55). */
++static bool z63_touch_start(Z63Touch *t, bool receive)
++{
++    t->selected = true;
++    t->receive = receive;
++    if (!receive) {
++        t->pointer_set = false;
++        return true;
++    }
++    t->rx_pos = 0;
++    t->rx_len = 0;
++    memset(t->rx, 0, sizeof(t->rx));
++    switch (t->pointer) {
++    case 0x10:
++        t->rx[0] = t->boot_pending ? 0 : t->report_n;
++        t->rx[1] = (t->boot_pending || t->booted) ? 0x80 : 0;
++        t->rx_len = 2;
++        if (t->boot_pending) {
++            t->boot_pending = false;
++            t->booted = true;
++            timer_del(t->timer);
++            error_report("Z63_TOUCH: boot status read -- the controller "
++                         "is ready");
++        }
++        if (!t->report_n) {
++            z63_touch_int(t, false);
++        }
++        break;
++    case 0x11:
++        if (t->records_left) {
++            unsigned i = t->report_n - t->records_left;
++
++            t->rx[0] = 0x80 | i;
++            t->rx[1] = t->rx_x[i];
++            t->rx[2] = t->rx_x[i] >> 8;
++            t->rx[3] = t->rx_y[i];
++            t->rx[4] = t->rx_y[i] >> 8;
++            if (--t->records_left == 0) {
++                t->report_n = 0;
++                z63_touch_int(t, false);
++            }
++        }
++        t->rx_len = 7;
++        break;
++    default:
++        memcpy(t->rx, &t->regs[t->pointer],
++               MIN(sizeof(t->rx), 256 - t->pointer));
++        t->rx_len = sizeof(t->rx);
++        break;
++    }
++    return true;
++}
++
++static bool z63_touch_write(Z63Touch *t, uint8_t byte)
++{
++    bool was = z63_touch_scanning(t);
++
++    if (!t->pointer_set) {
++        t->pointer = byte;
++        t->pointer_set = true;
++        return true;
++    }
++    t->regs[t->pointer++] = byte;
++    if (was != z63_touch_scanning(t)) {
++        error_report("Z63_TOUCH: scanning %s", was ? "stopped" : "started");
++        if (was) {
++            timer_del(t->timer);
++            t->records_left = t->report_n = 0;
++            z63_touch_int(t, false);
++        } else if (t->fingers) {
++            z63_touch_tick(t);
++        }
++    }
++    return true;
++}
++
++static bool z63_touch_read(Z63Touch *t, uint8_t *byte)
++{
++    *byte = t->rx_pos < t->rx_len ? t->rx[t->rx_pos] : 0;
++    t->rx_pos++;
++    return true;
++}
++
++static void z63_touch_init(Z63Touch *t, Z63ExtInt *extint)
++{
++    t->extint = extint;
++    t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_touch_tick, t);
++    t->regs[0x21] = 0x01;       /* version 1.00.00, DECLARED */
++    z63_touch_int(t, false);    /* the line idles high */
++}
++
++#endif /* HW_ARM_NIKON_Z63_TOUCH_H */
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index c7c311b..fc657d5 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -607,6 +607,7 @@ static uint64_t z63_current_pc(void);
+ #include "hw/arm/nikon-z63-hdmac.h"
+ #include "hw/arm/nikon-z63-i2c.h"
+ #include "hw/arm/nikon-z63-imu.h"
++#include "hw/arm/nikon-z63-touch.h"
+ #include "hw/arm/nikon-z63-sio.h"
+ #include "hw/arm/nikon-z63-audio.h"
+ #include "hw/arm/nikon-z63-mcu.h"
+@@ -777,6 +778,8 @@ typedef struct NikonZ63State {
+     Z63Hdmac hdmac;            /* 0x0e100000, in place of EMIO-E1 */
+     Z63I2c i2c;                /* 0x0e005000, over EMIO-E0's last page */
+     Z63Imu imu;                /* the posture sensor on I2C bank 3 */
++    Z63Touch touch;            /* the touch panel on I2C bank 0 */
++    bool i2c_to_touch[Z63_I2C_BANKS]; /* the bank's addressed device */
+     uint32_t emio_e0_words[Z63_EMIO_E0_SIZE / 4];
+     uint32_t emio_e1_words[Z63_EMIO_E1_SIZE / 4];
+     uint32_t emio_e2_words[Z63_EMIO_E2_SIZE / 4];
+@@ -836,6 +839,7 @@ typedef struct NikonZ63State {
+     char *z9_capture_props;
+     char *z9_capture_raw;
+     char *mcu_keys;              /* held keys, nikon-z63-mcu.h */
++    char *touch_points;          /* fingers on the panel, nikon-z63-touch.h */
+     char *mcu_rtc;               /* the MCU's calendar at power-on */
+     char *power_off;             /* power-hold dropped: shutdown|continue */
+     QEMUTimer *li_wait_timer;
+@@ -2187,6 +2191,56 @@ static void z63_power_hold_dropped(NikonZ63State *s)
+     }
+ }
+ 
++/* The I2C banks' devices: the touch panel at bank 0 address 0x55
++ * (nikon-z63-touch.h), everything else the posture sensor's endpoint,
++ * which answers its own address and NACKs and names the rest. */
++static bool z63_bus_start(void *opaque, unsigned bank, uint16_t address,
++                          bool receive, bool repeated)
++{
++    NikonZ63State *s = opaque;
++
++    s->i2c_to_touch[bank] = bank == Z63_TOUCH_BANK &&
++                            address == Z63_TOUCH_ADDRESS;
++    if (s->i2c_to_touch[bank]) {
++        return z63_touch_start(&s->touch, receive);
++    }
++    return z63_imu_start(&s->imu, bank, address, receive, repeated);
++}
++
++static bool z63_bus_write(void *opaque, unsigned bank, uint8_t byte)
++{
++    NikonZ63State *s = opaque;
++
++    return s->i2c_to_touch[bank] ? z63_touch_write(&s->touch, byte)
++                                 : z63_imu_write(&s->imu, bank, byte);
++}
++
++static bool z63_bus_read(void *opaque, unsigned bank, uint8_t *byte)
++{
++    NikonZ63State *s = opaque;
++
++    return s->i2c_to_touch[bank] ? z63_touch_read(&s->touch, byte)
++                                 : z63_imu_read(&s->imu, bank, byte);
++}
++
++static void z63_bus_stop(void *opaque, unsigned bank)
++{
++    NikonZ63State *s = opaque;
++
++    if (s->i2c_to_touch[bank]) {
++        s->touch.selected = false;
++    } else {
++        z63_imu_stop(&s->imu, bank);
++    }
++}
++
++static const Z63I2cEndpoint z63_bus_endpoint = {
++    .start = z63_bus_start,
++    .write = z63_bus_write,
++    .read = z63_bus_read,
++    .stop = z63_bus_stop,
++};
++
+ static void z63_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+                            unsigned size)
+ {
+@@ -2217,6 +2271,10 @@ static void z63_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+         !(value & Z63_POWER_HOLD_BIT)) {
+         z63_power_hold_dropped(s);
+     }
++    if (addr == Z63_TOUCH_POWER_PORT * 4 &&
++        (mask & (1u << Z63_TOUCH_POWER_BIT))) {
++        z63_touch_power(&s->touch, (*config >> Z63_TOUCH_POWER_BIT) & 1);
++    }
+ }
+ 
+ static const MemoryRegionOps z63_gpio_ops = {
+@@ -4618,6 +4676,7 @@ static void z63_init(MachineState *machine)
+      * is behaviour; see nikon-z63-extint.h. Then the MCU on top of it and
+      * of the serial bus. */
+     z63_extint_init(OBJECT(machine), sysmem, s->gic, &s->extint);
++    z63_touch_init(&s->touch, &s->extint);
+     /* The peer on the other end of instances 0/1: either the synthetic one
+      * that answers at the transport level (nikon-z63-mcu.h), or the MCU's
+      * own image, run on a Cortex-M4 beside the A53s (nikon-z63-stm32.h).
+@@ -4821,8 +4880,8 @@ static void z63_init(MachineState *machine)
+     z63_hdmac_init(OBJECT(machine), sysmem, s->gic, &s->hdmac,
+                    s->emio_e1_words, &s->noc);
+     z63_imu_init(&s->imu);
+-    z63_i2c_init(OBJECT(machine), sysmem, s->gic, &s->i2c, &z63_imu_endpoint,
+-                 &s->imu);
++    z63_i2c_init(OBJECT(machine), sysmem, s->gic, &s->i2c, &z63_bus_endpoint,
++                 s);
+     s->sio.hdmac = &s->hdmac;
+ 
+     /*
+@@ -5371,6 +5430,29 @@ static void z63_prop_set_mcu_rtc(Object *obj, const char *value,
+     s->mcu_rtc = g_strdup(value);
+ }
+ 
++static char *z63_prop_get_touch(Object *obj, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    return g_strdup(s->touch_points ? s->touch_points : "");
++}
++
++static void z63_prop_set_touch(Object *obj, const char *value, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    if (!s->touch.timer) {
++        error_setg(errp, "touch: settable only while the machine runs "
++                   "(qom-set /machine touch x:y)");
++        return;
++    }
++    if (!z63_touch_set(&s->touch, value, errp)) {
++        return;
++    }
++    g_free(s->touch_points);
++    s->touch_points = g_strdup(value);
++}
++
+ static void z63_prop_set_mcu_keys(Object *obj, const char *value,
+                                   Error **errp)
+ {
+@@ -5773,6 +5855,13 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "calendar that has stopped, as with a flat clock battery, which "
+         "the camera answers with its default time and the clock-not-set "
+         "warning. See nikon-z63-stm32.h.");
++    object_class_property_add_str(oc, "touch", z63_prop_get_touch,
++                                  z63_prop_set_touch);
++    object_class_property_set_description(oc, "touch",
++        "Fingers on the rear touch panel, in its 1024x682 screen space from "
++        "the top left: x:y, or x:y+x:y for two (a pinch); empty or 'up' "
++        "lifts them. Run time only (qom-set /machine touch 512:341). See "
++        "nikon-z63-touch.h.");
+     object_class_property_add_str(oc, "mcu-keys",
+                                   z63_prop_get_mcu_keys,
+                                   z63_prop_set_mcu_keys);
+-- 
+2.55.0
+

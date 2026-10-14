@@ -1,0 +1,359 @@
+From a33ec2b27e85f6b28260619b07c222eb44ef6cae Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Sun, 11 Oct 2026 15:51:04 +0000
+Subject: [PATCH 06/47] Z 6III MCU: SPI and TIM1/8 compare interrupts, switch
+ snapshot, live view starts
+
+With these the body MCU's own firmware takes the camera as far as the
+synthetic peer with mcu-camctl-reply=on did: the MCU sends its key
+report, answers the EXPEED's family-9 mode command (kind 2 -> kind 3)
+itself, the display comes on, and CAPST enters mode 1 (capture trace
+category 0x1a, code 0x7835) -- live view starts.
+
+- SPI1-6 drive their interrupt line, level-sensitive: TXE with TXEIE or
+  RXNE with RXNEIE while SPE is set (both flags always read set). The
+  SbCtl task's HAL interrupt-driven sends on SPI3 waited for a TXE
+  interrupt that never came; now its family-10 requests get answered.
+  (SbCtl/SbMng look like the Speedlight -- hot-shoe -- service: status
+  1 is "nothing on the shoe", which the EXPEED keeps polling.)
+- TIM1 and TIM8 compare matches go to their own vectors (27, 46) through
+  a second sysbus IRQ on stm32f2xx_timer, IRQ 0 when it is not wired.
+  SbCtl's transfer timeout is a TIM1 channel 2 match.
+- TIMx_CNT reads wrap at ARR, as the counter does.
+- "ccr-wraps", a declared deviation on stm32f2xx_timer, off by default
+  and on for this MCU: a CCRx beyond ARR matches at CCRx mod (ARR + 1).
+  The switch service arms TIM10 (ARR 499) at CCR1 = CNT + 500 for its
+  first snapshot of the switches; only that match's callback takes the
+  snapshot, and only the snapshot lets SwMng send the key report, which
+  is what the EXPEED waits for before it sends the mode command. RM0386
+  says such a match never happens, yet the camera does get its key
+  report; until that is explained this reads the firmware's "one period
+  later" as it plainly means it. Each channel that uses it is named on
+  stderr.
+- SPI enables are named four times per SPI, not every time (SPI4 is
+  re-enabled for every frame).
+- gdb_probe.py ATTACH=1 attaches to a running machine's stub (the A53s,
+  process 1) instead of starting one.
+
+Next on the path: the EXPEED has not raised its capture-sync request
+(GPIO port 3 bit 12) yet, and that pair of wires is not connected to
+the MCU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-stm32.h           | 46 +++++++++++++++++++---
+ hw/timer/stm32f2xx_timer.c         | 62 ++++++++++++++++++++++++++----
+ include/hw/timer/stm32f2xx_timer.h |  3 ++
+ z63-tools/gdb_probe.py             | 28 +++++++++++---
+ 4 files changed, 121 insertions(+), 18 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-stm32.h b/hw/arm/nikon-z63-stm32.h
+index 964f710..a54ba36 100644
+--- a/hw/arm/nikon-z63-stm32.h
++++ b/hw/arm/nikon-z63-stm32.h
+@@ -105,6 +105,7 @@ typedef struct Z63Stm32Spi {
+     uint32_t seen;                  /* probe: one bit per register touched */
+     uint32_t dr;                    /* last word handed back on a DR read */
+     uint64_t words_out, words_in;   /* probe: DR writes / reads */
++    unsigned enables;               /* CR1.SPE 0 -> 1, for the log */
+     /* The peer on the other end of this bus, if one is wired up. A word
+      * written to DR is handed to it and the word it returns is what the
+      * next DR read sees -- which is what full duplex means. NULL is an
+@@ -230,15 +231,19 @@ static const int z63_stm32_tim_irq[4] = { 28, 29, 30, 50 };
+  * TIM1/TIM8 extras -- RCR, BDTR, complementary outputs -- are not
+  * modelled). APB2 timers run at 180 MHz, APB1 ones at 90 MHz. irq < 0
+  * names a shared vector: -1 is 25 (TIM1_UP/TIM10), -2 is 44 (TIM8_UP/
+- * TIM13). The application reads TIM11 at pc 0x080522ca. */
++ * TIM13). The application reads TIM11 at pc 0x080522ca. cc is TIM1's and
++ * TIM8's separate capture/compare vector (27, 46): the SbCtl task's 5000-
++ * tick transfer timeout is a TIM1 channel 2 match, which on the update
++ * vector reached nobody. */
+ static const struct {
+     const char *name;
+     hwaddr base;
+     int irq;
+     uint64_t hz;
++    int cc;
+ } z63_stm32_tim_more[10] = {
+-    { "tim1",  0x40010000, -1, 180000000 },
+-    { "tim8",  0x40010400, -2, 180000000 },
++    { "tim1",  0x40010000, -1, 180000000, 27 },
++    { "tim8",  0x40010400, -2, 180000000, 46 },
+     { "tim9",  0x40014000, 24, 180000000 },
+     { "tim10", 0x40014400, -1, 180000000 },
+     { "tim11", 0x40014800, 26, 180000000 },
+@@ -1593,6 +1598,21 @@ static void z63_stm32_spi_note(Z63Stm32Spi *sp, hwaddr off, bool write)
+                  (unsigned)off, z63_stm32_pc());
+ }
+ 
++/* The SPI's interrupt (RM0386 26.3.11), level-sensitive as on the part:
++ * TXE with CR2.TXEIE or RXNE with CR2.RXNEIE, while CR1.SPE is set. Both
++ * flags always read set here (see the SR read below), so enabling either
++ * interrupt enters the handler at once and a HAL interrupt-driven transfer
++ * moves one word per entry until it disables the interrupt again. That is
++ * how the SbCtl task's transfers on SPI3 finish; without the line its HAL
++ * send waited for a TXE interrupt that never came. No error is ever
++ * raised, so ERRIE alone asserts nothing -- which matters for SPI1/2/4,
++ * whose CR2 holds ERRIE beside their DMA enables. */
++static void z63_stm32_spi_irq_update(Z63Stm32Spi *sp)
++{
++    qemu_set_irq(sp->irq, (sp->r[Z63_SPI_CR1 / 4] & 0x40) &&
++                          (sp->r[Z63_SPI_CR2 / 4] & 0xc0));
++}
++
+ static uint64_t z63_stm32_spi_read(void *opaque, hwaddr off, unsigned size)
+ {
+     Z63Stm32Spi *sp = opaque;
+@@ -1631,6 +1651,7 @@ static void z63_stm32_spi_write(void *opaque, hwaddr off, uint64_t value,
+          * peer the bus is unconnected, and an unconnected MISO reads 0. */
+         sp->words_out++;
+         sp->dr = sp->peer ? sp->peer(sp->peer_opaque, sp->inst, value) : 0;
++        z63_stm32_spi_irq_update(sp);
+         return;
+     }
+     if (off < sizeof(sp->r)) {
+@@ -1641,10 +1662,15 @@ static void z63_stm32_spi_write(void *opaque, hwaddr off, uint64_t value,
+             /* Enabling the SPI raises a request line, as on the part; if a
+              * stream is already armed for this instance, that is the moment
+              * the link starts moving. */
+-            error_report("Z63_STM32: SPI%u enabled (CR1.SPE set) pc=0x%08x",
+-                         sp->inst + 1, z63_stm32_pc());
++            if (++sp->enables <= 4) {
++                error_report("Z63_STM32: SPI%u enabled (CR1.SPE set) "
++                             "pc=0x%08x%s", sp->inst + 1, z63_stm32_pc(),
++                             sp->enables == 4 ? " (further enables not "
++                             "named)" : "");
++            }
+             z63_stm32_dma_kick(sp->mcu);
+         }
++        z63_stm32_spi_irq_update(sp);
+         return;
+     }
+     z63_stm32_stop("SPI", z63_stm32_spi_base[sp->inst] + off, size, true,
+@@ -2438,6 +2464,9 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+         SysBusDevice *sbd;
+ 
+         object_initialize_child(owner, name, &m->tim[i], TYPE_STM32F2XX_TIMER);
++        /* See "ccr-wraps" in hw/timer/stm32f2xx_timer.c: the switch
++         * service's first snapshot is a TIM10 match beyond ARR. */
++        qdev_prop_set_bit(DEVICE(&m->tim[i]), "ccr-wraps", true);
+         qdev_prop_set_uint64(DEVICE(&m->tim[i]), "clock-frequency",
+                              Z63_STM32_TIM_HZ);
+         sbd = SYS_BUS_DEVICE(&m->tim[i]);
+@@ -2488,6 +2517,9 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+ 
+         object_initialize_child(owner, name, &m->tim_more[i],
+                                 TYPE_STM32F2XX_TIMER);
++        /* See "ccr-wraps" in hw/timer/stm32f2xx_timer.c: the switch
++         * service's first snapshot is a TIM10 match beyond ARR. */
++        qdev_prop_set_bit(DEVICE(&m->tim_more[i]), "ccr-wraps", true);
+         qdev_prop_set_uint64(DEVICE(&m->tim_more[i]), "clock-frequency",
+                              z63_stm32_tim_more[i].hz);
+         sbd = SYS_BUS_DEVICE(&m->tim_more[i]);
+@@ -2504,6 +2536,10 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+             line = qdev_get_gpio_in(DEVICE(&m->tim_or[g]), shared[g]++);
+         }
+         sysbus_connect_irq(sbd, 0, line);
++        if (z63_stm32_tim_more[i].cc) {
++            sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(armv7m,
++                                               z63_stm32_tim_more[i].cc));
++        }
+     }
+ 
+     /* serial[i], when given, is the host end of USART i (the standalone
+diff --git a/hw/timer/stm32f2xx_timer.c b/hw/timer/stm32f2xx_timer.c
+index 65bb120..9ff0118 100644
+--- a/hw/timer/stm32f2xx_timer.c
++++ b/hw/timer/stm32f2xx_timer.c
+@@ -28,6 +28,7 @@
+ #include "hw/timer/stm32f2xx_timer.h"
+ #include "migration/vmstate.h"
+ #include "qemu/log.h"
++#include "qemu/error-report.h"
+ #include "qemu/module.h"
+ 
+ #ifndef STM_TIMER_ERR_DEBUG
+@@ -58,6 +59,21 @@ static void stm32f2xx_timer_set_alarm(STM32F2XXTimerState *s, int64_t now);
+  * channel-1-only version this replaces fired every CCR1 * (PSC + 1) ticks
+  * from the write, which for CCRx = CNT + n is a delay of CNT + n.)
+  *
++ * One declared deviation, off unless the board sets "ccr-wraps": with it, a
++ * CCRx beyond ARR matches at CCRx mod (ARR + 1) instead of never. The
++ * Z 6III body MCU's switch service arms TIM10 (ARR = 499) at CCR1 = CNT +
++ * 500 for the first snapshot of its switches, and nothing else takes that
++ * snapshot or sends the EXPEED a key report; RM0386 says such a match
++ * never happens, yet the camera evidently gets its key report. Until that
++ * is explained, the board asks for the reading that makes the firmware's
++ * "one period later" mean what it plainly intends. Each channel that uses
++ * it is named once on stderr.
++ *
++ * The match interrupt goes out on sysbus IRQ 1 when that is connected --
++ * TIM1 and TIM8 have a capture/compare vector of their own on the part
++ * (TIM1_CC, TIM8_CC) -- and on IRQ 0 with the update event otherwise, which
++ * is the one vector the general-purpose timers have.
++ *
+  * Matches are settled lazily: cc_seen_ns is the time up to which they have
+  * been accounted, and stm32f2xx_timer_cc_sync() settles (cc_seen_ns, now]
+  * before SR is read and before any register is written, with the settings
+@@ -84,8 +100,25 @@ static bool stm32f2xx_timer_oc(STM32F2XXTimerState *s, unsigned ch)
+ {
+     uint32_t ccmr = ch < 2 ? s->tim_ccmr1 : s->tim_ccmr2;
+ 
+-    return !((ccmr >> (8 * (ch & 1))) & 3) &&
+-           stm32f2xx_timer_ccr(s, ch) <= s->tim_arr;
++    if ((ccmr >> (8 * (ch & 1))) & 3) {
++        return false;                           /* an input channel */
++    }
++    if (stm32f2xx_timer_ccr(s, ch) <= s->tim_arr) {
++        return true;
++    }
++    if (!s->ccr_wraps) {
++        return false;                           /* RM0386: never reached */
++    }
++    if (!(s->ccr_wraps_named & (1u << ch))) {
++        s->ccr_wraps_named |= 1u << ch;
++        g_autofree char *path = object_get_canonical_path(OBJECT(s));
++
++        warn_report("%s: CCR%u = %u is beyond ARR = %u; matching it at "
++                    "CCR mod (ARR + 1), the declared deviation \"ccr-wraps\" "
++                    "asks for", path, ch + 1, stm32f2xx_timer_ccr(s, ch),
++                    s->tim_arr);
++    }
++    return true;
+ }
+ 
+ static inline int64_t stm32f2xx_ns_to_ticks(STM32F2XXTimerState *s, int64_t t);
+@@ -108,7 +141,8 @@ static uint64_t stm32f2xx_timer_cc_due(STM32F2XXTimerState *s, unsigned ch,
+     if (pos < 0) {
+         pos += period;
+     }
+-    d = ((int64_t)stm32f2xx_timer_ccr(s, ch) - pos + period) % period;
++    d = ((int64_t)(stm32f2xx_timer_ccr(s, ch) % period) - pos + period) %
++        period;
+     return d ? d : period;
+ }
+ 
+@@ -130,7 +164,7 @@ static void stm32f2xx_timer_cc_sync(STM32F2XXTimerState *s, int64_t now)
+         }
+     }
+     if (irq) {
+-        qemu_irq_pulse(s->irq);
++        qemu_irq_pulse(s->cc_irq ? s->cc_irq : s->irq);
+     }
+ }
+ 
+@@ -270,9 +304,20 @@ static uint64_t stm32f2xx_timer_read(void *opaque, hwaddr offset,
+         return s->tim_ccmr2;
+     case TIM_CCER:
+         return s->tim_ccer;
+-    case TIM_CNT:
+-        return stm32f2xx_ns_to_ticks(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) -
+-               s->tick_offset;
++    case TIM_CNT: {
++        /* The counter runs 0..ARR and wraps (RM0386 18.3.2), so that is
++         * what it reads: the firmware's delays are CCRx = CNT + n, and an
++         * unwrapped count put them anywhere in the 16-bit range. */
++        int64_t c = stm32f2xx_ns_to_ticks(s,
++                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) - s->tick_offset;
++        int64_t period = (int64_t)s->tim_arr + 1;
++
++        if (!s->tim_arr) {
++            return c;
++        }
++        c %= period;
++        return c < 0 ? c + period : c;
++    }
+     case TIM_PSC:
+         return s->tim_psc;
+     case TIM_ARR:
+@@ -433,6 +478,8 @@ static const VMStateDescription vmstate_stm32f2xx_timer = {
+ };
+ 
+ static const Property stm32f2xx_timer_properties[] = {
++    DEFINE_PROP_BOOL("ccr-wraps", struct STM32F2XXTimerState, ccr_wraps,
++                     false),
+     DEFINE_PROP_UINT64("clock-frequency", struct STM32F2XXTimerState,
+                        freq_hz, 1000000000),
+ };
+@@ -442,6 +489,7 @@ static void stm32f2xx_timer_init(Object *obj)
+     STM32F2XXTimerState *s = STM32F2XXTIMER(obj);
+ 
+     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->cc_irq);
+ 
+     memory_region_init_io(&s->iomem, obj, &stm32f2xx_timer_ops, s,
+                           "stm32f2xx_timer", 0x400);
+diff --git a/include/hw/timer/stm32f2xx_timer.h b/include/hw/timer/stm32f2xx_timer.h
+index c28a8e9..f188186 100644
+--- a/include/hw/timer/stm32f2xx_timer.h
++++ b/include/hw/timer/stm32f2xx_timer.h
+@@ -83,6 +83,9 @@ struct STM32F2XXTimerState {
+      * are all compare matches. */
+     QEMUTimer *cc_timer;
+     int64_t cc_seen_ns;
++    qemu_irq cc_irq;            /* sysbus IRQ 1; IRQ 0 when not connected */
++    bool ccr_wraps;             /* "ccr-wraps": see stm32f2xx_timer_oc() */
++    uint8_t ccr_wraps_named;    /* channels that have used it, for the log */
+     qemu_irq irq;
+ 
+     int64_t tick_offset;
+diff --git a/z63-tools/gdb_probe.py b/z63-tools/gdb_probe.py
+index d5c8afa..3487b02 100755
+--- a/z63-tools/gdb_probe.py
++++ b/z63-tools/gdb_probe.py
+@@ -15,6 +15,11 @@ on /tmp/bt-qmp.sock while it runs. Environment:
+   DUMP=n       also dump n bytes of the stack as u32
+   KEYS="t:keys;t:keys"  set -machine mcu-keys at t seconds (host time)
+   WATCH=a:n    write watchpoint (unreliable in this setup -- see plan.md)
++  ATTACH=1     do not start QEMU: attach to a machine already running with
++               -gdb tcp:127.0.0.1:41234 (<qemu> <machine opts> <eg> are
++               ignored; pass "-"), and detach at the end, which resumes it.
++               The A53s are the stub's process 1, attached by default; the
++               body MCU's M4 is process 2 (z63-tools/mcu_probe.py).
+ 
+ Hits on any CPU are reported; the breakpoint is stepped over and re-armed.
+ """
+@@ -32,11 +37,13 @@ qemu, mopts, eg, secs, addrs = sys.argv[1:6]
+ maxhits = int(sys.argv[6]) if len(sys.argv) > 6 else 4
+ addrs = [int(a, 16) for a in addrs.split(",") if a]
+ port = 41234
+-q = subprocess.Popen([qemu, "-machine", mopts, "-cpu", "cortex-a53", "-smp", "4",
+-                      "-bios", eg, "-serial", "null", "-monitor", "none",
+-                      "-display", "none", "-gdb", "tcp:127.0.0.1:%d" % port, "-S",
+-                      "-qmp", "unix:/tmp/bt-qmp.sock,server=on,wait=off"],
+-                     stdout=subprocess.DEVNULL, stderr=open("/tmp/bt.log", "w"))
++ATTACH = os.environ.get("ATTACH")
++q = None if ATTACH else subprocess.Popen(
++    [qemu, "-machine", mopts, "-cpu", "cortex-a53", "-smp", "4",
++     "-bios", eg, "-serial", "null", "-monitor", "none",
++     "-display", "none", "-gdb", "tcp:127.0.0.1:%d" % port, "-S",
++     "-qmp", "unix:/tmp/bt-qmp.sock,server=on,wait=off"],
++    stdout=subprocess.DEVNULL, stderr=open("/tmp/bt.log", "w"))
+ 
+ class Rsp:
+     def __init__(self):
+@@ -65,6 +72,8 @@ class Rsp:
+ 
+ r = Rsp()
+ r.cmd("qSupported")
++if ATTACH:
++    r.cmd("?")
+ for a in addrs:
+     print("Z1", hex(a), r.cmd("Z1,%x,4" % a))
+ WATCH = os.environ.get("WATCH")        # "addr:len" write watchpoint
+@@ -149,4 +158,11 @@ while time.time() < deadline and hits < maxhits:
+     if WATCH:
+         r.cmd("Z2,%s,%s" % (wa, wl))
+     r.send(b"c")
+-q.kill()
++if q:
++    q.kill()
++else:
++    r.s.sendall(b"\x03")                # running: stop it before talking
++    r.recv(timeout=10)
++    for a in addrs:
++        r.cmd("z1,%x,4" % a)
++    r.cmd("D")                          # resumes the machine
+-- 
+2.55.0
+

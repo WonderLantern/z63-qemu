@@ -1,0 +1,132 @@
+From e3012061e7eb0ce7802776deddd1933b39a4a650 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 13:35:27 +0000
+Subject: [PATCH 30/47] Z 6III: the shutter button's contacts on the EXPEED --
+ the release fires
+
+A full press showed on screen (SW0 bit 30 in the MCU's key report,
+decoded by sub_41011850) but released nothing. The release does not
+come from the report: the RTOS's runtime line descriptors put EXT_INT_4
+(INTID 59) on pin 35 = GPIO port 3 bit 4 and EXT_INT_5 (INTID 60) on
+pin 36 = port 3 bit 5, both each-edge (mode 2) with callback
+sub_40FC7CDC(intid, level). That callback treats INTID 59 (0xa03d8a910)
+as the half press, sub_40FC4140(0), and INTID 60 (0xa03d8a914) as the
+full press, which with half held releases: sub_40FC4140(1). ../z9-qemu
+drives the same pair on the Z 9 (bank 3 bits 4/5, INTIDs 59/60).
+
+The board now closes them with the MCU's PG1/PG13 (nikon-z63-mcukeys.h,
+z63_mcukeys_contacts): high while closed, read in port 3 and an edge
+into EXT_INT_4/5 whenever the buttons change -- mcu-keys=, qom-set and
+the window's keyboard alike. DECLARED: the wiring and the level (the
+descriptors' active byte is 1).
+
+Traced: half -> callback(0x3b, 1) -> sub_40FC4140(0); full ->
+callback(0x3c, 1) -> sub_40FC4140(1) -> CAPCOM's capture-sync (operation
+6, answered by the MCU on PD7), and the buffer count goes from r050 to
+r049. The capture itself stops further on (CAPSVC, sensor readout).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-mcukeys.h | 33 +++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63.c         | 20 ++++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/hw/arm/nikon-z63-mcukeys.h b/hw/arm/nikon-z63-mcukeys.h
+index f0b4866..bfeba29 100644
+--- a/hw/arm/nikon-z63-mcukeys.h
++++ b/hw/arm/nikon-z63-mcukeys.h
+@@ -145,6 +145,39 @@ static bool z63_mcukeys_set(Z63Stm32 *m, const char *list, Error **errp)
+     return true;
+ }
+ 
++/*
++ * The shutter button's two contacts reach the EXPEED as well, not only the
++ * MCU. The RTOS's runtime line descriptors (0xa02dc3dd8 + 8 * (INTID - 55),
++ * installed by sub_40C15DFC) put EXT_INT_4 (INTID 59) on pin 35 = GPIO
++ * port 3 bit 4 and EXT_INT_5 (INTID 60) on pin 36 = port 3 bit 5, both
++ * mode 2 (each edge, the ISR sub_40C16194.. re-reading the pin) and both
++ * with callback sub_40FC7CDC(pin, level). That callback takes the pin in
++ * 0xa03d8a910 as the half press -- level 1 starts it, sub_40FC4140(0) --
++ * and the pin in 0xa03d8a914 as the full press, which with half already
++ * held releases the shutter, sub_40FC4140(1). The MCU's key report alone
++ * (family 2 kind 1, SW0 bit 30) shows the press on screen but releases
++ * nothing. ../z9-qemu (WonderLantern, GPL-2.0-or-later) drives the same
++ * pair on the Z 9 -- bank 3 bits 4 and 5, INTIDs 59 and 60, high while
++ * closed -- through its capture-gpio model.
++ *
++ * DECLARED: that the button closes these alongside the MCU's PG1 and PG13,
++ * high while closed (the pin descriptors' active-level byte +12 is 1, and
++ * sub_40FC7CDC treats a 1 as pressed). Contact bounce and the order in
++ * which the two halves close are not modelled. The contacts follow PG1 and
++ * PG13 as driven, so mcu-keys=, the keyboard and mcu-pins= all reach them.
++ */
++#define Z63_RELEASE_HALF_BIT    4       /* EXPEED port 3, EXT_INT_4 */
++#define Z63_RELEASE_FULL_BIT    5       /* EXPEED port 3, EXT_INT_5 */
++
++static uint16_t z63_mcukeys_contacts(Z63Stm32 *m)
++{
++    Z63Stm32Gpio *g = &m->gpio[6];      /* port G */
++    uint16_t closed = g->driven & ~g->level;
++
++    return (((closed >> 1) & 1) << Z63_RELEASE_HALF_BIT) |
++           (((closed >> 13) & 1) << Z63_RELEASE_FULL_BIT);
++}
++
+ /* The display window's keyboard. */
+ static void z63_mcukeys_kbd(Z63Stm32 *m, int qcode, bool down)
+ {
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 949347a..fab36a9 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -1967,6 +1967,12 @@ static uint16_t z63_wires_mcu_levels(NikonZ63State *s, unsigned bank,
+             value = (value & ~(1u << w->a53_bit)) | (level << w->a53_bit);
+         }
+     }
++    if (s->real_mcu_built && bank == 3) {
++        /* The shutter button's contacts (nikon-z63-mcukeys.h). */
++        value = (value & ~((1u << Z63_RELEASE_HALF_BIT) |
++                           (1u << Z63_RELEASE_FULL_BIT))) |
++                z63_mcukeys_contacts(&s->real_mcu);
++    }
+     return value;
+ }
+ 
+@@ -2030,6 +2036,18 @@ static void z63_wires_pin_out(void *opaque, unsigned port, unsigned pin,
+     }
+ }
+ 
++/* The MCU's buttons changed: the shutter button's contacts on the EXPEED
++ * side are edges into EXT_INT_4 and 5 (nikon-z63-mcukeys.h). */
++static void z63_release_contacts(NikonZ63State *s)
++{
++    uint16_t closed = z63_mcukeys_contacts(&s->real_mcu);
++
++    z63_extint_set(&s->extint, Z63_RELEASE_HALF_BIT,
++                   (closed >> Z63_RELEASE_HALF_BIT) & 1);
++    z63_extint_set(&s->extint, Z63_RELEASE_FULL_BIT,
++                   (closed >> Z63_RELEASE_FULL_BIT) & 1);
++}
++
+ static uint64_t z63_gpio_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     NikonZ63State *s = opaque;
+@@ -3663,6 +3681,7 @@ static void z63_kbd_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
+     if (s->real_mcu_built) {
+         z63_mcukeys_kbd(&s->real_mcu, qemu_input_key_value_to_qcode(key->key),
+                         key->down);
++        z63_release_contacts(s);
+         return;
+     }
+     if (!s->mcu_peer || !s->mcu.queue) {
+@@ -4999,6 +5018,7 @@ static void z63_prop_set_mcu_keys(Object *obj, const char *value,
+         if (!z63_mcukeys_set(&s->real_mcu, value, errp)) {
+             return;
+         }
++        z63_release_contacts(s);
+     } else if (s->mcu_peer && s->mcu.queue) {
+         if (!z63_mcu_keys(&s->mcu, value, errp)) {
+             return;
+-- 
+2.55.0
+

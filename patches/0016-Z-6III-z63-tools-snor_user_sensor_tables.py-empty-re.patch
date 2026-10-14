@@ -1,0 +1,114 @@
+From 5c25334788b58c57b0230078d8fa759fc023a4bb Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 05:47:20 +0000
+Subject: [PATCH 16/47] Z 6III: z63-tools/snor_user_sensor_tables.py -- empty
+ record 0x63's register tables
+
+CAPTG took a data abort (PC 0x4115bc40, FAR 0x48000000) whenever live
+view started, photo or movie: the sensor module's walker sub_4116CF98
+(data, lengths) sends register tables to the sensor's control port
+chunk by chunk, and in the RAM-derived SNOR_USER body record 0x63's
+chunk-length lists do not read as lists -- at +0x133140 the "lengths"
+are (value, 0xe2xx) pairs like the register data around them -- so the
+walk runs off the end of the flash. The lists are picked by
+sub_4116CAE0 (a switch over the sensor mode, +0x119510 .. +0x122310),
+sub_4116CFF0 (+0x1262e0), sub_4116D064 (+0x128830) and sub_4116D0F4
+(+0x133140).
+
+The tool writes a NEW body with the first u16 of each of those lists set
+to zero, in every copy of the record, so every walk sends nothing. A
+declared edit of the input, like snor_user_sensor_version.py, not a
+model: nothing consumes the tables here (the control port is a sink,
+sio-sink=), the original file is never touched, and a dump of record
+0x63 from a body would replace it. On the body in use only +0x128830
+and +0x133140 were non-zero, in all four copies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ z63-tools/snor_user_sensor_tables.py | 74 ++++++++++++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+ create mode 100644 z63-tools/snor_user_sensor_tables.py
+
+diff --git a/z63-tools/snor_user_sensor_tables.py b/z63-tools/snor_user_sensor_tables.py
+new file mode 100644
+index 0000000..ccd8d08
+--- /dev/null
++++ b/z63-tools/snor_user_sensor_tables.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""Write a copy of a SNOR_USER body whose sensor register tables are empty.
++
++Record 0x63 is the image sensor's parameter block (kept at 0xA04CE13A0, the
++copy the firmware uses is RAM 0x47e80000; see snor_user_sensor_version.py).
++Besides the version bytes, it holds the register tables the sensor module
++sends to the sensor's control port: a data area and, for each, a list of
++chunk lengths ending at a zero u16. One walker sends them, sub_4116CF98(data,
++lengths), packet by packet through sub_4115BBB8; its callers pick the two
++offsets:
++
++  sub_4116CAE0  a switch over the sensor mode, lists at +0x119510 ..
++                +0x122310 (the MOV/MOVK pairs into W11 at 0x4116cb64 ..
++                0x4116ceb8)
++  sub_4116CFF0  +0x1262e0
++  sub_4116D064  +0x128830
++  sub_4116D0F4  +0x133140
++
++The SNOR_USER body is RAM-derived (snor_user_extract.py) and this record is
++incomplete: most of its pages are zero, and where the pages that hold a list
++are populated, what is there does not read as one -- at +0x133140 the
++"lengths" are (value, 0xe2xx) pairs like the register data around them. The
++walk then runs to the end of the flash and CAPTG takes a data abort at
++0x4115bc40 (FAR 0x48000000) when live view starts, photo or movie.
++
++This writes a NEW file with the first u16 of each of those lists set to zero
++in every copy of the record, so every walk sends nothing. It is a declared
++edit of the input, not a model, like snor_user_sensor_version.py: nothing
++consumes the tables here -- the sensor's control port is a write-only sink
++(nikon-z63.c, sio-sink) -- and the original file is never touched. The
++camera's real tables are not known; a dump of record 0x63 from a body would
++replace this.
++
++    snor_user_sensor_tables.py <snor_user.bin> <out.bin>
++"""
++import sys
++
++REGION = 0x45980000            # snor_user.json "region.base"
++RECORD = 0x47E80000 - REGION   # record 0x63, the copy the firmware reads
++LISTS = [
++    0x119510, 0x119790, 0x119910, 0x119A90, 0x119C10, 0x11E8B0,
++    0x11F5D0, 0x11F810, 0x11FB10, 0x11FD30, 0x120050, 0x120270,
++    0x120610, 0x1209B0, 0x120CD0, 0x120EF0, 0x121290, 0x121630,
++    0x1219D0, 0x121B50, 0x121CB0, 0x121E10, 0x121F70, 0x122310,
++    0x1262E0, 0x128830, 0x133140,
++]
++
++src, dst = sys.argv[1:3]
++if src == dst:
++    sys.exit("refusing to overwrite the input; give a different output path")
++data = bytearray(open(src, "rb").read())
++if len(data) < RECORD + max(LISTS) + 2:
++    sys.exit("input is too short to hold record 0x63 at %#x" % RECORD)
++head = bytes(data[RECORD:RECORD + 16])
++if not any(head):
++    sys.exit("no record header at %#x; is this a SNOR_USER body?" % RECORD)
++copies = 0
++cleared = 0
++i = data.find(head)
++while i >= 0:
++    if i + max(LISTS) + 2 <= len(data):
++        copies += 1
++        for off in LISTS:
++            o = i + off
++            if data[o] or data[o + 1]:
++                print("copy at %#x: list +%#x starts %s -> 00 00"
++                      % (i, off, data[o:o + 2].hex(" ")))
++                data[o] = data[o + 1] = 0
++                cleared += 1
++    i = data.find(head, i + 1)
++if not copies:
++    sys.exit("no copy of record 0x63 found; nothing written")
++open(dst, "wb").write(data)
++print("wrote %s (%d copies, %d lists emptied)" % (dst, copies, cleared))
+-- 
+2.55.0
+

@@ -1,0 +1,1021 @@
+From c5a36c428594c2f62b8c5c5858416b89877fd118 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Tue, 13 Oct 2026 02:04:29 +0000
+Subject: [PATCH 40/47] Z 6III: standby runs to the end -- the cores' WFI
+ status, core hold, DDR self-refresh, the power-hold line
+
+An untouched boot stopped at kernel ~68 s on
+  Z63_UNMAPPED read addr=0x00c86a010 size=4 pc=0x0082010a0
+That is the camera going to standby: 30 s after live view starts, the
+application's auto-power-off timer (AppC_Tim at 0xa03389c50; the
+duration from sub_40D65648, settings item 0x1521 = 5, 30 s) posts
+0x3000003 (handled at 0x40d5a7a4), the EXPEED tells the MCU (family 1
+kind 8 mode 08, then mode 06 and a 106-byte wake mask), saves the
+settings journal, Linux enters s2idle, and the power-down the standby
+path copies to WorkSRAM, sub_4019502C, runs on CPU0. Each of its steps
+now has its device:
+
+  - 0x0c86a010, the cores' WFI status (new, z63_cpustat_read): bit n is
+    core n halted in WFI or switched off. The loop at 0x401950a0 waits
+    for cores 1 and 2; the CPU3 off routine at 0x40179f50 holds core 3
+    only when bit 3 is up. ../z9-qemu answers a constant 6.
+  - 0x0d154344 core bits 1..3, the reset controller's set window: the
+    power-down holds cores 1 and 2 (0x40195170) and 0x40179f80 holds
+    core 3. It used to stop as "not modelled"; the core is now switched
+    off as PSCI CPU_OFF does and its release bit drops, so a later
+    release starts it afresh.
+  - the DDR channels' self-refresh handshake (z63_ddr_broadcast): the
+    0x138xxxxx instance writes to all four channels, and the channels'
+    +0x7940 answers +0x7800 = 0x100 / 0x200 with 0x10 / 0, and +0x7458
+    bit 0 acknowledges a bit-16 request, low on the first read after it.
+    The same handshake is what the DDR frequency change sub_418422B8
+    waits on (+0x7458 == 0x80010001). DECLARED: immediate.
+  - GPIO_TOP port 3 bit 11 low, the power-hold line: driven high by the
+    pin setup at boot (sub_41187B00, 0xffff0800), low only as the last
+    store before WFI here (0x401952e8) and in the loader's and the
+    emergency power-off (0x40093628, 0x40c08020). New machine property
+    power-off: "shutdown" (default) requests a guest shutdown, as a
+    camera that switched itself off -- -action shutdown=pause keeps the
+    VM; "continue" only logs it.
+
+Checked: an untouched boot now logs the cores' status 0xe, cores 1 and
+2 held from WFI, and the power-hold drop at pc 0x82012e8, then shuts
+down cleanly.
+
+What the MCU does with the line, and waking from standby on a key, are
+not modelled; the line is not in the default mcu-wires=. (The MCU's
+power manager cuts the EXPEED's rails but DRAM's when its input reads
+low after the power-off frame, and on a key restores them and raises a
+resume flag the EXPEED reads on port 3 bit 6 -- a warm reboot with
+DRAM kept, not a jump back.)
+
+The live view's histogram (the second DISP press stopped on
+0x15430104): the RSZ E unit, 0x15430100, is configured by sub_40C2767C
+and started each frame (+0x00 = 1, 0x40c27670); z63-lv-frame-done now
+admits those words (bits as each store sets them) and lets a start arm
+E's next frame end, as its enable does, and the board maps the
+resizer's histogram RAM at 0x15c00000 (0xc00, read by sub_40C2662C).
+DECLARED: the bins read 0, an empty histogram. DISP now cycles through
+the histogram screen.
+
+Also from a sweep of every fixed device address the image materialises
+against the board's windows, registers the firmware names that were
+still unmapped:
+  - SENSOR-IF: device 0x190's third and fourth banks, 0x15085000 and
+    0x15085400 (+0x24, +0x108, +0x110, +0x118, +0x11c, the acknowledge
+    words of sub_40C29C98/CCC/D34/D68), the window now 0x5800; device
+    0x18e's +0x54 and +0x60 (sub_40C2B4C8, sub_40C2B5D4);
+  - ISP-APB device 0x1a0: +0x2dc, +0x2e8, +0x2f4 (sub_40C1FBC8);
+  - devices 0x1cc/0x1cd/0x1ce: the eight channels the loop at
+    0x40c0b048 programs at +0x1000 i + 0x400 j (+0x144..+0x21c), the
+    windows 0x2000;
+  - device 0x184 at 0x15280000, a four-channel engine (new,
+    nikon-z63-dev184.h);
+  - EXS1784: 19 words and the +0x2700 table the driver reads outside the
+    range its set was generated from.
+All storage, each set and its evidence in its header.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-dev184.h   |  66 +++++++
+ hw/arm/nikon-z63-dev1cc.h   |  29 ++-
+ hw/arm/nikon-z63-exs1784.h  |  25 +++
+ hw/arm/nikon-z63-isp-apb.h  |  11 ++
+ hw/arm/nikon-z63-sensorif.h |  32 +++-
+ hw/arm/nikon-z63-z9lab.c    |  45 ++++-
+ hw/arm/nikon-z63.c          | 343 +++++++++++++++++++++++++++++++++---
+ z63-tools/import_z9lab.py   |  71 +++++++-
+ z63-tools/z9lab_attach.c.in |   7 +-
+ 9 files changed, 594 insertions(+), 35 deletions(-)
+ create mode 100644 hw/arm/nikon-z63-dev184.h
+
+diff --git a/hw/arm/nikon-z63-dev184.h b/hw/arm/nikon-z63-dev184.h
+new file mode 100644
+index 0000000..b7dc7fe
+--- /dev/null
++++ b/hw/arm/nikon-z63-dev184.h
+@@ -0,0 +1,66 @@
++/*
++ * Nikon Z 6III -- device 0x184 at 0x15280000, a four-channel engine.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * sub_40C75178 stores 0x15280000 at 0xa0280f220, registers the descriptor
++ * 0xa0280f218 as device 0x184 (sub_40C001C4) and line 0x137 with the
++ * handler sub_40C751CC. Its one user is the job sub_40CC13FC (from
++ * sub_40CC12E0 and sub_4100232c): start (sub_40C75404), program the
++ * channels that are enabled (sub_40C757C4, channel 0..3), arm them
++ * (sub_40C756E4), then wait on event 79 with a timeout (sub_40CC174C),
++ * read each finished channel's results back (sub_40C7599C) and stop
++ * (sub_40C75610), or abort (sub_40C75A44) on the timeout. No machine run
++ * has reached it; the static sweep of the image found the base unmapped.
++ *
++ * The register set, from the driver's functions 0x40c751cc-0x40c75a60
++ * (handle_offsets.py --field 8 over that range, then each function read,
++ * because the channel and result bases are computed):
++ *
++ *   +0x000 +0x004 +0x008     start/stop words (15, 1/2/4/8 per channel)
++ *   +0x020 +0x024 +0x028     sub_40C756D8 / 756CC / 756C0
++ *   +0x030                   status, read and written back by the
++ *                            handler (0x40c751d4/0x40c751d8), bits 0..3
++ *                            one per channel
++ *   +0x110..+0x120           sub_40C75750, the job's parameters
++ *   +0x124..+0x134           the same five words again, sub_40C757B8
++ *   +0x400n + 0x040..0x10c   channel n's 52 setup words (sub_40C757C4:
++ *                            v4 = base + 0x40 + 0x400n, words 0..51)
++ *   +0x400n + 0x200..0x29c   channel n's results, read only, by
++ *   +0x400n + 0x300..0x39c   sub_40C7599C (v4 + 0x1c0 and v4 + 0x2c0,
++ *                            8 x 20 bytes each)
++ *   +0xfc0 +0xfc4 +0xfc8 +0xfcc   control words the start, stop, arm,
++ *                            abort and handler paths write (0x1f, 0)
++ *
++ * The power-down dump copies 0xfd0 bytes from the base, which agrees with
++ * the highest register being +0xfcc.
++ *
++ * Storage, declared: nothing here finishes a channel, so a job that is
++ * started waits out its timeout and takes the abort path; the result words
++ * read what they hold, 0.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_DEV184_H
++#define HW_ARM_NIKON_Z63_DEV184_H
++
++#define Z63_DEV184_BASE     0x15280000ULL
++#define Z63_DEV184_SIZE     0x1000
++#define Z63_DEV184_CHANNELS 4
++#define Z63_DEV184_CHAN_STRIDE 0x400
++
++/* Fixed words, relative to the base. */
++static const uint16_t z63_dev184_offsets[] = {
++    0x0000, 0x0004, 0x0008, 0x0020, 0x0024, 0x0028, 0x0030,
++    0x0110, 0x0114, 0x0118, 0x011c, 0x0120,
++    0x0124, 0x0128, 0x012c, 0x0130, 0x0134,
++    0x0fc0, 0x0fc4, 0x0fc8, 0x0fcc,
++};
++
++/* Word ranges [first, last] of each channel, relative to its 0x400n. */
++static const uint16_t z63_dev184_chan_ranges[][2] = {
++    { 0x0040, 0x010c },     /* setup, sub_40C757C4 */
++    { 0x0200, 0x029c },     /* results, sub_40C7599C */
++    { 0x0300, 0x039c },
++};
++
++#endif /* HW_ARM_NIKON_Z63_DEV184_H */
+diff --git a/hw/arm/nikon-z63-dev1cc.h b/hw/arm/nikon-z63-dev1cc.h
+index 0935215..1c7d41a 100644
+--- a/hw/arm/nikon-z63-dev1cc.h
++++ b/hw/arm/nikon-z63-dev1cc.h
+@@ -30,9 +30,10 @@
+  * 0x40c0a000-0x40c0d000, by z63-tools/handle_offsets.py --field 8: a forward
+  * dataflow over the basic-block graph.
+  *
+- * The window is 0x1000, which the table constrains from above -- 0x15180000
+- * and 0x15182000 are only 0x2000 apart -- and the highest offset in the set
+- * is well inside it.
++ * The window is 0x2000, the most the table allows -- 0x15180000 and
++ * 0x15182000 are only 0x2000 apart -- because the per-channel registers
++ * below run to +0x1c00 + 0x21c. They were 0x1000 while only the harvested
++ * set was known.
+  *
+  * What is a declared choice
+  * -------------------------
+@@ -48,7 +49,7 @@
+ #ifndef HW_ARM_NIKON_Z63_DEV1CC_H
+ #define HW_ARM_NIKON_Z63_DEV1CC_H
+ 
+-#define Z63_DEV1CC_SIZE  0x01000
++#define Z63_DEV1CC_SIZE  0x02000
+ 
+ static const struct {
+     const char *name;
+@@ -74,6 +75,26 @@ static const uint16_t z63_dev1cc_offsets[] = {
+     0x0490, 0x0494,
+ };
+ 
++/*
++ * Eight channels, two groups of four, which the harvest cannot see because
++ * the base is computed: the loop at 0x40c0b048-0x40c0b0f0 runs i < 2,
++ * j < 4 over base + 0x1000 * i + 0x400 * j and writes +0x144 (0x40c0b084)
++ * and +0x15c/+0x160 (0x40c0b0ac/0x40c0b0b4), then calls three helpers with
++ * (i, j) that build the same base: sub_40C0B354 (+0x154..+0x1bc),
++ * sub_40C0B4C4 (+0x1c0..+0x1e0) and sub_40C0B524 (+0x200..+0x21c). The
++ * helpers are also called from 0x40c0b1e4, 0x40c0b260 and 0x40c94c60..
++ * 0x40c94d30. The set below is one channel's, relative to its base, and
++ * is applied at all eight. Storage, written only.
++ */
++static const uint16_t z63_dev1cc_chan_offsets[] = {
++    0x0144, 0x0154, 0x0158, 0x015c, 0x0160, 0x0164, 0x0168, 0x016c,
++    0x0170, 0x0174, 0x0178, 0x017c, 0x0180, 0x0184, 0x0188, 0x018c,
++    0x0190, 0x0198, 0x019c, 0x01a0, 0x01a4, 0x01a8, 0x01ac, 0x01b0,
++    0x01b4, 0x01b8, 0x01bc, 0x01c0, 0x01c4, 0x01c8, 0x01cc, 0x01d0,
++    0x01d4, 0x01d8, 0x01dc, 0x01e0, 0x0200, 0x0204, 0x0208, 0x020c,
++    0x0210, 0x0214, 0x0218, 0x021c,
++};
++
+ /* Only ever read by the firmware -- the declared choice above. */
+ static const uint16_t z63_dev1cc_status_offsets[] = {
+     0x0010, 0x0038, 0x003c, 0x0334, 0x0338, 0x033c, 0x0340, 0x0344,
+diff --git a/hw/arm/nikon-z63-exs1784.h b/hw/arm/nikon-z63-exs1784.h
+index 7b3142f..a794f30 100644
+--- a/hw/arm/nikon-z63-exs1784.h
++++ b/hw/arm/nikon-z63-exs1784.h
+@@ -56,6 +56,31 @@ static const uint16_t z63_exs1784_offsets[] = {
+     0x2808, 0x280c, 0x2810, 0x2840, 0x2848,
+ };
+ 
++/*
++ * The same driver's accesses the generated set above misses, from a
++ * sweep of every absolute address the image materialises: code past
++ * 0x40c6023c (0x40c60318-0x40c603b0: +0x618, +0x658), code IDA has outside
++ * any function (0x40c5f674-0x40c5f9d8), and two computed ranges --
++ * 0x40c5ff18-0x40c5ff2c copies the 64 words at +0x2700 out (X9 = 0..0xfc),
++ * and 0x40c5ff38-0x40c5ff4c reads +0x2844 + 4 * i for i = 0, 1 (+0x2848 is
++ * already above). Every other word here is a plain store or load from
++ * 0x40c5ea9c-0x40c600c8; +0x5c, +0x78, +0x22c, +0x230, +0x654 and the
++ * +0x2700 table are only read (the declared choice above).
++ */
++static const uint16_t z63_exs1784_more_offsets[] = {
++    0x0040, 0x0048, 0x0050, 0x0054, 0x0058, 0x005c, 0x0068, 0x0074,
++    0x0078, 0x00b4, 0x0190, 0x0224, 0x022c, 0x0230, 0x0258, 0x0618,
++    0x0654, 0x0658, 0x2844,
++    0x2700, 0x2704, 0x2708, 0x270c, 0x2710, 0x2714, 0x2718, 0x271c,
++    0x2720, 0x2724, 0x2728, 0x272c, 0x2730, 0x2734, 0x2738, 0x273c,
++    0x2740, 0x2744, 0x2748, 0x274c, 0x2750, 0x2754, 0x2758, 0x275c,
++    0x2760, 0x2764, 0x2768, 0x276c, 0x2770, 0x2774, 0x2778, 0x277c,
++    0x2780, 0x2784, 0x2788, 0x278c, 0x2790, 0x2794, 0x2798, 0x279c,
++    0x27a0, 0x27a4, 0x27a8, 0x27ac, 0x27b0, 0x27b4, 0x27b8, 0x27bc,
++    0x27c0, 0x27c4, 0x27c8, 0x27cc, 0x27d0, 0x27d4, 0x27d8, 0x27dc,
++    0x27e0, 0x27e4, 0x27e8, 0x27ec, 0x27f0, 0x27f4, 0x27f8, 0x27fc,
++};
++
+ /* Only ever read by the firmware -- the declared choice above. */
+ static const uint16_t z63_exs1784_status_offsets[] = {
+     0x0220, 0x0614, 0x2848,
+diff --git a/hw/arm/nikon-z63-isp-apb.h b/hw/arm/nikon-z63-isp-apb.h
+index 8bf995e..f605756 100644
+--- a/hw/arm/nikon-z63-isp-apb.h
++++ b/hw/arm/nikon-z63-isp-apb.h
+@@ -118,4 +118,15 @@ static const uint16_t z63_isp_apb_status_offsets[] = {
+     0x03a0, 0x03a4,
+ };
+ 
++/*
++ * Device 0x1a0's acknowledge words, reached only through the base its
++ * driver keeps at 0xa0280d6b0 (set by sub_40C1F978), so the harvest above
++ * cannot see them: sub_40C1FBC8 reads +0x2dc, +0x2e8 and +0x2f4 and writes
++ * each back (0x40c1fbf4..0x40c1fc0c), as sub_40C1FB40 does for +0x294..
++ * +0x2d0, which the harvest has. Storage.
++ */
++static const uint16_t z63_isp_apb_1a0_ack_offsets[] = {
++    0x02dc, 0x02e8, 0x02f4,
++};
++
+ #endif /* HW_ARM_NIKON_Z63_ISP_APB_H */
+diff --git a/hw/arm/nikon-z63-sensorif.h b/hw/arm/nikon-z63-sensorif.h
+index 9a121b1..9969d65 100644
+--- a/hw/arm/nikon-z63-sensorif.h
++++ b/hw/arm/nikon-z63-sensorif.h
+@@ -96,7 +96,7 @@
+ #define HW_ARM_NIKON_Z63_SENSORIF_H
+ 
+ #define Z63_SENSORIF_BASE   0x15080000ULL
+-#define Z63_SENSORIF_SIZE   0x5000
++#define Z63_SENSORIF_SIZE   0x5800 /* to device 0x190's 0x15085400 bank */
+ 
+ static const uint16_t z63_sensorif_offsets[] = {
+     0x0000, 0x0004, 0x0008, 0x000c, 0x0010, 0x0014, 0x0018, 0x001c,
+@@ -222,4 +222,34 @@ static const uint16_t z63_sensorif_dev190_bank1_offsets[] = {
+     0x010c, 0x0110, 0x0114, 0x0118, 0x013c, 0x0144,
+ };
+ 
++/*
++ * Device 0x18e (descriptor 0xa0280d8c8, base +8 = 0x15080000): two words
++ * its interrupt handlers acknowledge through the base the driver keeps at
++ * 0xa0280d8d0, which no [X0,#8] harvest sees: +0x54, read and written back
++ * by sub_40C2B4C8 for line 255 (0x40c2b4f8/0x40c2b514, the status whose
++ * enable is +0x50), and +0x60, by sub_40C2B5D4 (0x40c2b5ec). Storage.
++ */
++static const uint16_t z63_sensorif_dev18e_ack_offsets[] = {
++    0x0054, 0x0060,
++};
++
++/*
++ * Device 0x190's third and fourth bases, descriptor +24 = 0x15085000 and
++ * +32 = 0x15085400, the pages the power-down dump also copies (0x300 bytes
++ * each, see z63_ramdmp_load). No handle-based function applies an offset
++ * to either (handle_offsets.py --field 24 / 32 over 0x40c29000-0x40c2c000
++ * finds none); the only code that touches them is four interrupt handlers
++ * that load the base out of 0xa0280d898 (+24) and 0xa0280d8a0 (+32) and
++ * write back what they read -- acknowledge words:
++ *
++ *   sub_40C29C98 / sub_40C29D34   +0x108
++ *   sub_40C29CCC / sub_40C29D68   +0x24, +0x110, +0x118, +0x11c, the four
++ *                                 values then handed to the callback
++ *
++ * Storage: a word reads what was last written, 0 until then.
++ */
++static const uint16_t z63_sensorif_dev190_bank34_offsets[] = {
++    0x0024, 0x0108, 0x0110, 0x0118, 0x011c,
++};
++
+ #endif /* HW_ARM_NIKON_Z63_SENSORIF_H */
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index d3e4436..1034d1e 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -12237,6 +12237,27 @@ static uint32_t engine1542_mask(unsigned i, unsigned off)
+     return 0;
+ }
+ 
++/* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): the words the live
++ * view's histogram writes to the RSZ E unit (instance 14, 0x15430100) --
++ * sub_40C2767C's geometry (from sub_40C26618, base + 0x10100) and the
++ * start 0x40c27670 (sub_40C2614C) -- with the bits each store can set. */
++static uint32_t z63_e_histogram_mask(unsigned off)
++{
++    switch (off) {
++    case 0x00: return 1;            /* start */
++    case 0x04: return 0xf3;         /* 2 + 4 bits */
++    case 0x08: return 0xf;          /* four enables */
++    case 0x0c: return 0x7f7f;       /* two 7-bit fields */
++    case 0x10: return 0xfff;        /* byte | byte << 4 | 3 bits << 8 */
++    case 0x20: case 0x24: case 0x28: case 0x2c:
++        return 0x07ff07ff;          /* 11-bit pairs */
++    case 0x30: return 0x7ff;
++    case 0x40: return 0x1fff1fff;   /* 13-bit pair */
++    case 0x44: return 0x1fff;
++    default: return 0;
++    }
++}
++
+ static bool engine1542_read(NikonZ9State *s, hwaddr addr, unsigned size,
+                             uint64_t *value)
+ {
+@@ -12245,6 +12266,10 @@ static bool engine1542_read(NikonZ9State *s, hwaddr addr, unsigned size,
+     if (i < 0) {
+         return false;
+     }
++    if (s->raw_pipeline_output_done && i == 14 && z63_e_histogram_mask(off)) {
++        *value = s->engine1542_config[i][off / 4];
++        return true;
++    }
+     if (off == engine1542_status(i)) {
+         *value = s->engine1542_pending[i];
+         return true;
+@@ -12518,6 +12543,19 @@ static bool engine1542_write(NikonZ9State *s, hwaddr addr, uint64_t value,
+             unknown_access(s, addr, value, size, true); return true;
+         }
+     }
++    if (s->raw_pipeline_output_done && i == 14 && z63_e_histogram_mask(off)) {
++        /* z63-lv-frame-done: a start arms E's next frame end, as its
++         * enable does; storage otherwise. */
++        if (value & ~(uint64_t)z63_e_histogram_mask(off)) {
++            unknown_access(s, addr, value, size, true);
++            return true;
++        }
++        s->engine1542_config[i][off / 4] = value;
++        if (off == 0 && value == 1) {
++            s->z63_e_armed = true;
++        }
++        return true;
++    }
+     uint32_t mask = engine1542_mask(i, off);
+     if (!mask) {
+         return false;
+@@ -18622,7 +18660,12 @@ static bool z63_z9lab_lane0_ack_on;
+  * z63-lv-frame-done (default on) raises the others with the frame's
+  * bits: B0..B2 bit 12; FRECT_LV, while its gate is open, bit 27 and, on
+  * the third frame since the gate opened and every fourth after, bit 29;
+- * E bit 0 at the first frame after it is enabled. And it makes its frames
++ * E bit 0 at the first frame after it is enabled or started. E is the
++ * live view's histogram: the second DISP press configures it through
++ * sub_40C2767C (+0x04..+0x44 of 0x15430100, admitted as storage with the
++ * bits each store can set) and starts it each frame (+0x00 = 1 at
++ * 0x40c27670, from 0x40e65368), and on bit 0 sub_40C2662C reads its bins
++ * from 0x15c00000 (the board's RSZ-HIST window). And it makes its frames
+  * on the capture tick of the sensor's frame timing -- the tick that also
+  * delivers the frame's statistics and engine 0x150c's bit 2 -- instead of
+  * on a 33.3 ms clock of its own: the sensor-mode cycle below turns capture
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index e9b4b3a..c7c311b 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -35,6 +35,7 @@
+ #include "qemu/error-report.h"
+ #include "system/reset.h"
+ #include "system/runstate.h"
++#include "target/arm/arm-powerctl.h"
+ #include "hw/boards.h"
+ #include "hw/arm/machines-qom.h"
+ #include "hw/arm/boot.h"
+@@ -235,6 +236,8 @@
+  *   +0x248 clock control: plain storage (the GPU helper read-modify-writes it) */
+ #define Z63_RELEASE_BASE    0x0D154000ULL
+ #define Z63_RELEASE_SIZE    0x400
++#define Z63_CPUSTAT_BASE    0x0C86A000ULL /* the cores' WFI status page */
++#define Z63_CPUSTAT_SIZE    0x1000
+ 
+ #define Z63_IMAGE_WINDOW_BASE 0x40000000ULL /* RTOS image window (boot header) */
+ #define Z63_IMAGE_WINDOW_SIZE (128 * MiB)   /* header declares 0x08200000 */
+@@ -553,6 +556,7 @@ typedef struct Z63Win {
+ #define Z63_BLK_INST        5
+ #define Z63_BLK_WINDOW      0x10000 /* highest register seen is +0xf018 */
+ #define Z63_BLK_CAP         0x02c   /* capability word: tested only for zero */
++#define Z63_DDR_CHANNELS    4       /* instances 0..3; 4 writes to all */
+ 
+ /* Driver upload window at 0x14c00000. */
+ #define Z63_UPK_BASE        0x14C00000ULL
+@@ -587,6 +591,7 @@ static const hwaddr z63_dma_bases[Z63_DMA_BANKS] = {
+ #include "hw/arm/nikon-z63-dev1cf.h"
+ #include "hw/arm/nikon-z63-codec.h"
+ #include "hw/arm/nikon-z63-dev1cc.h"
++#include "hw/arm/nikon-z63-dev184.h"
+ #include "hw/arm/nikon-z63-noc.h"
+ #include "hw/arm/nikon-z63-xdmac.h"
+ #include "hw/arm/nikon-z63-nand.h"
+@@ -705,6 +710,9 @@ typedef struct NikonZ63State {
+      * window: [0..2] = clear window 0x0D154240 + 4*i, [3..5] = set window
+      * 0x0D154340 + 4*i. See the comment above z63_reset_masks. */
+     uint32_t reset_word[6];
++    MemoryRegion cpustat;        /* 0x0c86a000, see z63_cpustat_read */
++    uint32_t cpustat_last;       /* last status read, for the log */
++    unsigned cpustat_logged;
+     ARMCPU *cpu[Z63_NUM_CPU];
+     CPUClusterState a53_cluster;     /* cluster 0; the body MCU is 1 */
+ 
+@@ -761,6 +769,8 @@ typedef struct NikonZ63State {
+     Z63RegWindow dev1cf;
+     Z63RegWindow codec;
+     Z63RegWindow dev1cc[ARRAY_SIZE(z63_dev1cc)];
++    Z63RegWindow dev184;         /* nikon-z63-dev184.h */
++    Z63RegWindow rszhist;        /* 0x15c00000, see its creation */
+     Z63XdmacCtrl xdmac[Z63_XDMAC_CTRLS];
+ 
+     Z63Win emio[3];
+@@ -781,6 +791,7 @@ typedef struct NikonZ63State {
+ 
+     MemoryRegion sib_region;
+     uint32_t sib[Z63_BLK_INST][Z63_BLK_WINDOW / 4];
++    bool ddr_req_busy[Z63_DDR_CHANNELS]; /* see z63_ddr_broadcast */
+ 
+     MemoryRegion upk_region;
+     uint32_t upk[Z63_UPK_SIZE / 4];
+@@ -826,6 +837,7 @@ typedef struct NikonZ63State {
+     char *z9_capture_raw;
+     char *mcu_keys;              /* held keys, nikon-z63-mcu.h */
+     char *mcu_rtc;               /* the MCU's calendar at power-on */
++    char *power_off;             /* power-hold dropped: shutdown|continue */
+     QEMUTimer *li_wait_timer;
+     Z63Hdmi hdmi;              /* HDMI transmitter, 0x15496000 */
+     Z63Usb usb;                /* DWC3 USB device, 0x17880000 */
+@@ -2134,6 +2146,47 @@ static uint64_t z63_gpio_read(void *opaque, hwaddr addr, unsigned size)
+     return s->gpio_config[addr / 0x100][(addr % 0x100) / 4];
+ }
+ 
++/*
++ * The EXPEED's power-hold line: port 3 bit 11. The pin setup drives it
++ * high at boot -- sub_41187B00 writes 0x0d15100c = 0xffff0800 from its
++ * table (0x44b17708), as the loader's sub_40003794 does -- and each of the
++ * image's three ways to switch the body off drives it low and nothing
++ * else does: the standby power-down sub_4019502C as its last store before
++ * WFI (0x401952e8, 0x0d15100c = 0x08000000: mask bit 11, value 0), the
++ * loader's power-off sub_4009360C (0x40093628, after waiting on port 9's
++ * input) and the emergency power-off in sub_40C07EB8 (0x40c08020, through
++ * sub_40C15BB8 after ten bad readings of an input), each followed by a
++ * spin or WFI. The body MCU watches it (its power manager cuts the
++ * EXPEED's rails when the input it polls after the power-off frame reads
++ * low, sub_803C6A8 -> sub_803C7F4, keeping one rail, DRAM's, for a
++ * standby), so it is the EXPEED's "keep my power on".
++ *
++ * What the MCU does with the line is not modelled (it is not in the
++ * default mcu-wires=), nor is the wake: the MCU powering the EXPEED back
++ * up on a key, which the EXPEED's start-up takes as a resume when port 3
++ * bit 6 reads high (the DRAM init's mode 3; sub_40D6F7F0 at 0x40d6f844).
++ * The power-off property decides what the machine does: shutdown (the
++ * default) asks QEMU for a guest shutdown, as a camera that switched
++ * itself off -- -action shutdown=pause keeps the VM for inspection;
++ * continue only logs, leaving the EXPEED in its WFI and the MCU running.
++ */
++#define Z63_POWER_HOLD_WORD     0x00c   /* port 3 */
++#define Z63_POWER_HOLD_BIT      (1u << 11)
++
++static void z63_power_hold_dropped(NikonZ63State *s)
++{
++    bool shutdown = !s->power_off || !strcmp(s->power_off, "shutdown");
++
++    error_report("Z63_POWER: the EXPEED dropped its power-hold line (GPIO "
++                 "port 3 bit 11, pc=0x%" PRIx64 ") -- %s", z63_current_pc(),
++                 shutdown ? "the camera switched itself off; shutting down "
++                            "(power-off=shutdown)"
++                          : "power-off=continue, the EXPEED idles");
++    if (shutdown) {
++        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++    }
++}
++
+ static void z63_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+                            unsigned size)
+ {
+@@ -2160,6 +2213,10 @@ static void z63_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+     if (addr == Z63_AUDIO_CS_PORT * 4) {
+         z63_audio_cs(&s->audio, *config);
+     }
++    if (addr == Z63_POWER_HOLD_WORD && (mask & Z63_POWER_HOLD_BIT) &&
++        !(value & Z63_POWER_HOLD_BIT)) {
++        z63_power_hold_dropped(s);
++    }
+ }
+ 
+ static const MemoryRegionOps z63_gpio_ops = {
+@@ -2879,6 +2936,46 @@ static const MemoryRegionOps z63_vpipe_ops = {
+ /* and a write there stops rather than being absorbed.                  */
+ /* ------------------------------------------------------------------ */
+ 
++/*
++ * Instances 0..3 are the four DDR channels and instance 4 writes to all of
++ * them: the two routines that take DRAM through self-refresh program
++ * 0x138xxxxx only and wait on the same offsets of 0x11800000, 0x12000000,
++ * 0x12800000 and 0x13000000. They are the frequency change sub_418422B8
++ * and the standby power-down sub_4019502C (from 0x401951c0):
++ *
++ *   +0x7800 = 0x100  enter      channels' +0x7940 reads 0x10
++ *                               (sub_418422B8 waits == 0x10, the
++ *                               power-down for bit 4)
++ *   +0x7800 = 0x200  leave      +0x7940 reads 0 (0x41842560..80)
++ *   +0x7458 bit 16   request    the frequency change waits for the
++ *                               channels' +0x7458 == 0x80010001 after
++ *                               writing 0x80010000; the power-down
++ *                               writes (old | 0x80010000), waits for
++ *                               bit 0 clear, drops bit 16 and waits for
++ *                               bit 0 set
++ *
++ * So bit 0 of a channel's +0x7458 is an acknowledge that goes down while
++ * a request is taken and up when it is done. DECLARED: every handshake
++ * completes at once -- +0x7940 answers the 0x7800 command on the write,
++ * and +0x7458 reads the written word with bit 0 = bit 31 (enable), except
++ * that the first read of each channel after a write with bit 16 set shows
++ * bit 0 clear. +0x7d20 and +0x7900, which the same routines wait to read
++ * 0, read what they hold, 0. Nothing else is copied to the channels.
++ */
++static void z63_ddr_broadcast(NikonZ63State *s, hwaddr off, uint32_t value)
++{
++    for (unsigned ch = 0; ch < Z63_DDR_CHANNELS; ch++) {
++        if (off == 0x7800 && value == 0x100) {
++            s->sib[ch][0x7940 / 4] = 0x10;
++        } else if (off == 0x7800 && value == 0x200) {
++            s->sib[ch][0x7940 / 4] = 0;
++        } else if (off == 0x7458) {
++            s->sib[ch][0x7458 / 4] = (value & ~1u) | (value >> 31);
++            s->ddr_req_busy[ch] = value & 0x10000;
++        }
++    }
++}
++
+ static uint64_t z63_sib_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     NikonZ63State *s = opaque;
+@@ -2899,6 +2996,10 @@ static uint64_t z63_sib_read(void *opaque, hwaddr addr, unsigned size)
+         z63_stop_read("SIBLING", Z63_BLK_BASE + addr, size);
+         return 0;
+     }
++    if (inst < Z63_DDR_CHANNELS && off == 0x7458 && s->ddr_req_busy[inst]) {
++        s->ddr_req_busy[inst] = false;
++        return s->sib[inst][off / 4] & ~1u;
++    }
+     return s->sib[inst][off / 4];
+ }
+ 
+@@ -2925,6 +3026,9 @@ static void z63_sib_write(void *opaque, hwaddr addr, uint64_t value,
+         return;
+     }
+     s->sib[inst][off / 4] = value;
++    if (inst == Z63_DDR_CHANNELS) {
++        z63_ddr_broadcast(s, off, value);
++    }
+ }
+ 
+ static const MemoryRegionOps z63_sib_ops = {
+@@ -3086,17 +3190,28 @@ static void z63_release_write(void *opaque, hwaddr offset, uint64_t value,
+ 
+     if (win == 1) {
+         /* Writing a core bit in the set window holds that core in reset.
+-         * No image path does it and the model does not implement it, so
+-         * report rather than silently swallow it. The core bits are bits
+-         * 1..3 of the offset-4 word only: the same bits of words 0 and 2
+-         * are other routes of the table at 0x4184BD5C (word 0 bit 1 is
+-         * route 1), which are latched like every other route. */
+-        if (idx == 1 && (value & UINT64_C(0x0e))) {
+-            error_report("Z63_RESET: core reset asserted with 0x%" PRIx64
+-                         " at +0x%" PRIx64 " -- not modelled, stopping",
+-                         value, (uint64_t)offset);
+-            qemu_system_shutdown_request_with_code(SHUTDOWN_CAUSE_GUEST_PANIC,
+-                                                   3);
++         * Two paths do, each after 0x0c86a010 shows the core in WFI (see
++         * z63_cpustat_read): the power-down sub_4019502C holds cores 1 and
++         * 2 (0x40195170, 0xf0007fb6) and the CPU3 off routine at
++         * 0x40179f50 holds core 3 (0x40179f80, 8). The core is switched
++         * off as PSCI CPU_OFF does, and its release bit drops, so a later
++         * clear of the same bit starts it afresh from the mailbox. The
++         * core bits are bits 1..3 of the offset-4 word only: the same bits
++         * of words 0 and 2 are other routes of the table at 0x4184BD5C
++         * (word 0 bit 1 is route 1), which are latched like every other
++         * route. */
++        for (i = 1; idx == 1 && i < Z63_NUM_CPU; i++) {
++            if (!(value & (1U << i)) || !s->cpu[i] ||
++                s->cpu[i]->power_state == PSCI_OFF) {
++                continue;
++            }
++            error_report("Z63_RESET: CPU%u held in reset (+0x%" PRIx64
++                         " = 0x%" PRIx64 ", pc=0x%" PRIx64 ")%s", i,
++                         (uint64_t)offset, value, z63_current_pc(),
++                         CPU(s->cpu[i])->halted ? ", from WFI" :
++                         " while running");
++            arm_set_cpu_off(i);
++            s->release_status &= ~(1U << i);
+         }
+         return;
+     }
+@@ -3204,6 +3319,70 @@ static const MemoryRegionOps z63_release_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
++/* ------------------------------------------------------------------ */
++/* The cores' WFI status at 0x0c86a010                                  */
++/*                                                                    */
++/* The image reads one word of this page, from two places, and both    */
++/* are about to cut a core's power:                                    */
++/*                                                                    */
++/*   40179f60  the CPU3 off routine (0x40179f50, w0 = core): ldr, tbnz */
++/*             bit 3 -- holds core 3 in reset (0x0d154344 = 8) only     */
++/*             when the bit is up, and returns -1 otherwise             */
++/*   401950a0  the power-down that standby copies to WorkSRAM           */
++/*             (sub_4019502C): spins until bits 1 and 2 are both up,    */
++/*             then gates the clocks and holds cores 1 and 2            */
++/*                                                                    */
++/* Bit n is core n standing by in WFI -- what a cluster's STANDBYWFI    */
++/* lines give -- the one reading under which both are right to pull     */
++/* the core's reset as soon as it is set. ../z9-qemu answers the same   */
++/* word with a constant 6.                                             */
++/*                                                                    */
++/* Modelled from the vCPUs: bit n is set while core n is halted (in     */
++/* WFI with nothing pending) or switched off, which includes a core     */
++/* never released. Read-only; no other offset of the page is named by   */
++/* the image, so any other access stops.                               */
++/* ------------------------------------------------------------------ */
++
++#define Z63_CPUSTAT_WFI     0x010
++#define Z63_CPUSTAT_LOGGED  16 /* changes reported before going quiet */
++
++static uint64_t z63_cpustat_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NikonZ63State *s = opaque;
++    uint32_t value = 0;
++
++    if (addr != Z63_CPUSTAT_WFI || size != 4) {
++        z63_stop_read("CPUSTAT", Z63_CPUSTAT_BASE + addr, size);
++        return 0;
++    }
++    for (unsigned i = 0; i < Z63_NUM_CPU; i++) {
++        if (!s->cpu[i] || qatomic_read(&CPU(s->cpu[i])->halted) ||
++            s->cpu[i]->power_state == PSCI_OFF) {
++            value |= 1U << i;
++        }
++    }
++    if (value != s->cpustat_last && s->cpustat_logged < Z63_CPUSTAT_LOGGED) {
++        s->cpustat_logged++;
++        error_report("Z63_CPUSTAT: cores in WFI or off = 0x%x (pc=0x%" PRIx64
++                     ")", value, z63_current_pc());
++    }
++    s->cpustat_last = value;
++    return value;
++}
++
++static void z63_cpustat_write(void *opaque, hwaddr addr, uint64_t value,
++                              unsigned size)
++{
++    z63_stop_write("CPUSTAT", Z63_CPUSTAT_BASE + addr, size, value);
++}
++
++static const MemoryRegionOps z63_cpustat_ops = {
++    .read = z63_cpustat_read,
++    .write = z63_cpustat_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8 },
++};
++
+ /* ------------------------------------------------------------------ */
+ /* The LI (Linux) payload                                              */
+ /*                                                                     */
+@@ -4206,6 +4385,9 @@ static void z63_init(MachineState *machine)
+     memory_region_init_io(&s->cpu_release, OBJECT(machine), &z63_release_ops, s,
+                           "z63-cpu-release", Z63_RELEASE_SIZE);
+     memory_region_add_subregion(sysmem, Z63_RELEASE_BASE, &s->cpu_release);
++    memory_region_init_io(&s->cpustat, OBJECT(machine), &z63_cpustat_ops, s,
++                          "z63-cpustat", Z63_CPUSTAT_SIZE);
++    memory_region_add_subregion(sysmem, Z63_CPUSTAT_BASE, &s->cpustat);
+ 
+     /* Bootstrap latches (see the note by z63_int_latch_write). */
+     memory_region_init_io(&s->int_latch, OBJECT(machine), &z63_int_latch_ops,
+@@ -4276,7 +4458,10 @@ static void z63_init(MachineState *machine)
+         size_t n0 = ARRAY_SIZE(z63_sensorif_offsets);
+         size_t n1 = ARRAY_SIZE(z63_sensorif_dev190_offsets);
+         size_t n2 = ARRAY_SIZE(z63_sensorif_dev190_bank1_offsets);
+-        g_autofree uint16_t *offs = g_new(uint16_t, n0 + n1 + n2);
++        size_t n3 = ARRAY_SIZE(z63_sensorif_dev190_bank34_offsets);
++        size_t n4 = ARRAY_SIZE(z63_sensorif_dev18e_ack_offsets);
++        g_autofree uint16_t *offs = g_new(uint16_t,
++                                          n0 + n1 + n2 + 2 * n3 + n4);
+ 
+         memcpy(offs, z63_sensorif_offsets, sizeof(z63_sensorif_offsets));
+         for (size_t i = 0; i < n1; i++) {
+@@ -4285,14 +4470,32 @@ static void z63_init(MachineState *machine)
+         for (size_t i = 0; i < n2; i++) {
+             offs[n0 + n1 + i] = 0x4000 + z63_sensorif_dev190_bank1_offsets[i];
+         }
++        for (size_t i = 0; i < n3; i++) {
++            offs[n0 + n1 + n2 + i] =
++                0x5000 + z63_sensorif_dev190_bank34_offsets[i];
++            offs[n0 + n1 + n2 + n3 + i] =
++                0x5400 + z63_sensorif_dev190_bank34_offsets[i];
++        }
++        memcpy(offs + n0 + n1 + n2 + 2 * n3, z63_sensorif_dev18e_ack_offsets,
++               sizeof(z63_sensorif_dev18e_ack_offsets));
+         z63_regwindow_init(OBJECT(machine), sysmem, &s->sensorif,
+                            "SENSOR-IF", Z63_SENSORIF_BASE, Z63_SENSORIF_SIZE,
+-                           offs, n0 + n1 + n2);
++                           offs, n0 + n1 + n2 + 2 * n3 + n4);
++    }
++    {
++        /* The harvested family set plus device 0x1a0's acknowledge
++         * words (the comment above z63_isp_apb_1a0_ack_offsets). */
++        size_t n0 = ARRAY_SIZE(z63_isp_apb_offsets);
++        size_t n1 = ARRAY_SIZE(z63_isp_apb_1a0_ack_offsets);
++        g_autofree uint16_t *offs = g_new(uint16_t, n0 + n1);
++
++        memcpy(offs, z63_isp_apb_offsets, sizeof(z63_isp_apb_offsets));
++        memcpy(offs + n0, z63_isp_apb_1a0_ack_offsets,
++               sizeof(z63_isp_apb_1a0_ack_offsets));
++        z63_regwindow_init(OBJECT(machine), sysmem, &s->isp_apb_1a0,
++                           "ISP-APB-DEV-0x1A0", Z63_ISP_APB_1A0_BASE,
++                           Z63_ISP_APB_DEV_SIZE, offs, n0 + n1);
+     }
+-    z63_regwindow_init(OBJECT(machine), sysmem, &s->isp_apb_1a0,
+-                       "ISP-APB-DEV-0x1A0", Z63_ISP_APB_1A0_BASE,
+-                       Z63_ISP_APB_DEV_SIZE, z63_isp_apb_offsets,
+-                       ARRAY_SIZE(z63_isp_apb_offsets));
+ 
+     /* The two windows docs/storage-registers.md section 8 separates from the
+      * SD HAL. They were left unmapped on purpose until the crank reached
+@@ -4300,10 +4503,19 @@ static void z63_init(MachineState *machine)
+      * controller, whose COMP bit a register file could never set; see
+      * nikon-z63-nand.h. */
+     z63_nand_init(OBJECT(machine), sysmem, s->gic, &s->nand, s->nand_file);
+-    z63_regwindow_init(OBJECT(machine), sysmem, &s->exs1784, "EXS1784",
+-                       Z63_EXS1784_BASE, Z63_EXS1784_SIZE,
+-                       z63_exs1784_offsets,
+-                       ARRAY_SIZE(z63_exs1784_offsets));
++    {
++        /* The generated set plus z63_exs1784_more_offsets. */
++        size_t n0 = ARRAY_SIZE(z63_exs1784_offsets);
++        size_t n1 = ARRAY_SIZE(z63_exs1784_more_offsets);
++        g_autofree uint16_t *offs = g_new(uint16_t, n0 + n1);
++
++        memcpy(offs, z63_exs1784_offsets, sizeof(z63_exs1784_offsets));
++        memcpy(offs + n0, z63_exs1784_more_offsets,
++               sizeof(z63_exs1784_more_offsets));
++        z63_regwindow_init(OBJECT(machine), sysmem, &s->exs1784, "EXS1784",
++                           Z63_EXS1784_BASE, Z63_EXS1784_SIZE, offs,
++                           n0 + n1);
++    }
+     z63_regwindow_init(OBJECT(machine), sysmem, &s->blk15d8, "BLK-0x15D8",
+                        Z63_BLK15D8_BASE, Z63_BLK15D8_SIZE,
+                        z63_exs15d8_offsets,
+@@ -4515,13 +4727,64 @@ static void z63_init(MachineState *machine)
+ 
+     /* Devices 0x1cc, 0x1cd and 0x1ce, one table group with one register
+      * set. See nikon-z63-dev1cc.h. */
+-    for (size_t i = 0; i < ARRAY_SIZE(z63_dev1cc); i++) {
+-        z63_regwindow_init(OBJECT(machine), sysmem, &s->dev1cc[i],
+-                           z63_dev1cc[i].name, z63_dev1cc[i].base,
+-                           Z63_DEV1CC_SIZE, z63_dev1cc_offsets,
+-                           ARRAY_SIZE(z63_dev1cc_offsets));
++    {
++        /* The harvested set plus the eight channels' registers (the
++         * comment above z63_dev1cc_chan_offsets). */
++        size_t n0 = ARRAY_SIZE(z63_dev1cc_offsets);
++        size_t n1 = ARRAY_SIZE(z63_dev1cc_chan_offsets);
++        g_autofree uint16_t *offs = g_new(uint16_t, n0 + 8 * n1);
++
++        memcpy(offs, z63_dev1cc_offsets, sizeof(z63_dev1cc_offsets));
++        for (size_t ch = 0; ch < 8; ch++) {
++            for (size_t k = 0; k < n1; k++) {
++                offs[n0 + ch * n1 + k] = 0x1000 * (ch / 4) +
++                                         0x400 * (ch % 4) +
++                                         z63_dev1cc_chan_offsets[k];
++            }
++        }
++        for (size_t i = 0; i < ARRAY_SIZE(z63_dev1cc); i++) {
++            z63_regwindow_init(OBJECT(machine), sysmem, &s->dev1cc[i],
++                               z63_dev1cc[i].name, z63_dev1cc[i].base,
++                               Z63_DEV1CC_SIZE, offs, n0 + 8 * n1);
++        }
+     }
+ 
++    /* Device 0x184's four channels. See nikon-z63-dev184.h. */
++    {
++        GArray *offs = g_array_new(false, false, sizeof(uint16_t));
++
++        g_array_append_vals(offs, z63_dev184_offsets,
++                            ARRAY_SIZE(z63_dev184_offsets));
++        for (unsigned ch = 0; ch < Z63_DEV184_CHANNELS; ch++) {
++            for (size_t r = 0; r < ARRAY_SIZE(z63_dev184_chan_ranges); r++) {
++                for (unsigned o = z63_dev184_chan_ranges[r][0];
++                     o <= z63_dev184_chan_ranges[r][1]; o += 4) {
++                    uint16_t off = ch * Z63_DEV184_CHAN_STRIDE + o;
++
++                    g_array_append_val(offs, off);
++                }
++            }
++        }
++        z63_regwindow_init(OBJECT(machine), sysmem, &s->dev184,
++                           "DEV-0x184", Z63_DEV184_BASE, Z63_DEV184_SIZE,
++                           (const uint16_t *)offs->data, offs->len);
++        g_array_free(offs, true);
++    }
++
++    /*
++     * The histogram RAM of device 0x1f9 (the resizer): sub_40C25C7C puts
++     * 0x15420000 at descriptor +8 and 0x15c00000 at +16 (0xa02dc4888), and
++     * sub_40C2662C copies the bins out of +16 -- 256 words, or three runs
++     * of 256 at +0x000/+0x400/+0x800, each masked to 24 bits -- after the
++     * RSZ E unit's frame end (nikon-z63-z9lab.h, z63-lv-frame-done). The
++     * firmware only reads it. A RAM the unit fills, so the whole 0xc00 is
++     * storage (dense, see nikon-z63-regwindow.h). DECLARED: nothing
++     * computes the bins, so they read 0, an empty histogram.
++     */
++    z63_regwindow_init(OBJECT(machine), sysmem, &s->rszhist, "RSZ-HIST",
++                       0x15c00000ULL, 0xc00, NULL, 0);
++    s->rszhist.dense = true;
++
+     /* ../z9-qemu's capture models, asked before the windows above where
+      * they cover the same addresses. Opt-in; see nikon-z63-z9lab.h. */
+     if (s->z9_capture &&
+@@ -4792,6 +5055,7 @@ static void z63_machine_instance_init(Object *obj)
+      * would say is a separate matter. Overridable with mcu-pins=. */
+     s->mcu_pins = g_strdup("D13=1");
+     s->mcu_rtc = g_strdup("host");
++    s->power_off = g_strdup("shutdown");
+     /* Write-only serial devices (nikon-z63-sio.h): 9 is the rear panel;
+      * 8 is the image sensor's control port -- logical serial channel 6
+      * (sub_4115B8FC: sub_40C0040C(6)), chip select on the GPIO behind
+@@ -5074,6 +5338,25 @@ static char *z63_prop_get_mcu_keys(Object *obj, Error **errp)
+     return g_strdup(NIKON_Z63(obj)->mcu_keys ? NIKON_Z63(obj)->mcu_keys : "");
+ }
+ 
++static char *z63_prop_get_power_off(Object *obj, Error **errp)
++{
++    return g_strdup(NIKON_Z63(obj)->power_off);
++}
++
++static void z63_prop_set_power_off(Object *obj, const char *value,
++                                   Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    if (strcmp(value, "shutdown") && strcmp(value, "continue")) {
++        error_setg(errp, "power-off: '%s' is not shutdown or continue",
++                   value);
++        return;
++    }
++    g_free(s->power_off);
++    s->power_off = g_strdup(value);
++}
++
+ static char *z63_prop_get_mcu_rtc(Object *obj, Error **errp)
+ {
+     return g_strdup(NIKON_Z63(obj)->mcu_rtc);
+@@ -5474,6 +5757,14 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "The posture sensor's input, x:y:z in milligravity; default 0:0:1000, "
+         "a body at rest. Settable at run time with qom-set. See "
+         "nikon-z63-imu.h.");
++    object_class_property_add_str(oc, "power-off", z63_prop_get_power_off,
++                                  z63_prop_set_power_off);
++    object_class_property_set_description(oc, "power-off",
++        "What the EXPEED dropping its power-hold line (GPIO port 3 bit 11: "
++        "standby after the standby timer, or a power-off) does: shutdown "
++        "(the default; a guest shutdown, so -action shutdown=pause keeps "
++        "the VM) or continue (log it; the EXPEED idles in WFI and the MCU "
++        "runs on).");
+     object_class_property_add_str(oc, "mcu-rtc", z63_prop_get_mcu_rtc,
+                                   z63_prop_set_mcu_rtc);
+     object_class_property_set_description(oc, "mcu-rtc",
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index 20e838d..5cd2638 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -35,8 +35,9 @@ The edits, each asserted to match exactly once (or the stated count):
+      while capture group 0 alone is off, statistics and the RAW pipeline's
+      frame on the frame clock's capture tick, +0x210 bit 31 admitted to
+      engine 0x150c's W1C, FRECT_LV's frame count reset when its gate opens,
+-     the RSZ E unit's arming -- and in nikon-z9-pixels.h the frame's other
+-     completions. With every switch off the models behave as ../z9-qemu's;
++     the RSZ E unit's arming, by its enable or by the live-view histogram's
++     start, and that histogram's geometry words -- and in nikon-z9-pixels.h
++     the frame's other completions. With every switch off the models behave as ../z9-qemu's;
+   8. the Z 6III's still-capture edits, behind z63-still-capture (documented
+      in the attachment): engine 0x150c's bounded reset, idle stops and the
+      restart of a unit whose direct-stop cause is unacknowledged admitted
+@@ -285,6 +286,72 @@ edit("""    s->engine1542_config[i][off / 4] = value;
+     }
+     if (s->engine1542_ram_input_model && i == 2) {
+ """)
++# The RSZ E unit as the live-view histogram (z63-lv-frame-done): its
++# geometry setter and its start, which ../z9-qemu's E has no route for.
++edit("""static bool engine1542_read(NikonZ9State *s, hwaddr addr, unsigned size,
++                            uint64_t *value)
++{
++    unsigned off;
++    int i = engine1542_instance(s, addr, size, &off);
++    if (i < 0) {
++        return false;
++    }
++""", """/* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): the words the live
++ * view's histogram writes to the RSZ E unit (instance 14, 0x15430100) --
++ * sub_40C2767C's geometry (from sub_40C26618, base + 0x10100) and the
++ * start 0x40c27670 (sub_40C2614C) -- with the bits each store can set. */
++static uint32_t z63_e_histogram_mask(unsigned off)
++{
++    switch (off) {
++    case 0x00: return 1;            /* start */
++    case 0x04: return 0xf3;         /* 2 + 4 bits */
++    case 0x08: return 0xf;          /* four enables */
++    case 0x0c: return 0x7f7f;       /* two 7-bit fields */
++    case 0x10: return 0xfff;        /* byte | byte << 4 | 3 bits << 8 */
++    case 0x20: case 0x24: case 0x28: case 0x2c:
++        return 0x07ff07ff;          /* 11-bit pairs */
++    case 0x30: return 0x7ff;
++    case 0x40: return 0x1fff1fff;   /* 13-bit pair */
++    case 0x44: return 0x1fff;
++    default: return 0;
++    }
++}
++
++static bool engine1542_read(NikonZ9State *s, hwaddr addr, unsigned size,
++                            uint64_t *value)
++{
++    unsigned off;
++    int i = engine1542_instance(s, addr, size, &off);
++    if (i < 0) {
++        return false;
++    }
++    if (s->raw_pipeline_output_done && i == 14 && z63_e_histogram_mask(off)) {
++        *value = s->engine1542_config[i][off / 4];
++        return true;
++    }
++""")
++edit("""    uint32_t mask = engine1542_mask(i, off);
++    if (!mask) {
++        return false;
++    }
++    /* 40c2719c programs lowbits2;""", """    if (s->raw_pipeline_output_done && i == 14 && z63_e_histogram_mask(off)) {
++        /* z63-lv-frame-done: a start arms E's next frame end, as its
++         * enable does; storage otherwise. */
++        if (value & ~(uint64_t)z63_e_histogram_mask(off)) {
++            unknown_access(s, addr, value, size, true);
++            return true;
++        }
++        s->engine1542_config[i][off / 4] = value;
++        if (off == 0 && value == 1) {
++            s->z63_e_armed = true;
++        }
++        return true;
++    }
++    uint32_t mask = engine1542_mask(i, off);
++    if (!mask) {
++        return false;
++    }
++    /* 40c2719c programs lowbits2;""")
+ 
+ # 8. The Z 6III's still capture (z63-still-capture, documented in
+ # z9lab_attach.c.in): engine 0x150c's bounded reset, its stops and its
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 047b842..50db88d 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -401,7 +401,12 @@ static bool z63_z9lab_lane0_ack_on;
+  * z63-lv-frame-done (default on) raises the others with the frame's
+  * bits: B0..B2 bit 12; FRECT_LV, while its gate is open, bit 27 and, on
+  * the third frame since the gate opened and every fourth after, bit 29;
+- * E bit 0 at the first frame after it is enabled. And it makes its frames
++ * E bit 0 at the first frame after it is enabled or started. E is the
++ * live view's histogram: the second DISP press configures it through
++ * sub_40C2767C (+0x04..+0x44 of 0x15430100, admitted as storage with the
++ * bits each store can set) and starts it each frame (+0x00 = 1 at
++ * 0x40c27670, from 0x40e65368), and on bit 0 sub_40C2662C reads its bins
++ * from 0x15c00000 (the board's RSZ-HIST window). And it makes its frames
+  * on the capture tick of the sensor's frame timing -- the tick that also
+  * delivers the frame's statistics and engine 0x150c's bit 2 -- instead of
+  * on a 33.3 ms clock of its own: the sensor-mode cycle below turns capture
+-- 
+2.55.0
+

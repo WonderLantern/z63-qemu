@@ -1,0 +1,283 @@
+From 0d45ccbd8e9606e575fc6065f663fe39f4143aad Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 15:42:38 +0000
+Subject: [PATCH 35/47] Z 6III: -machine scanout-live -- every composed frame,
+ in a file a viewer maps
+
+scanout-dump writes a PPM about once a second, which is enough to look at
+but not to use the camera by: this build has no window and no VNC, and the
+desktop UI (the z63ui repository, a separate process -- QEMU stays a child
+there so that a refusal or a rebuild does not take the windows with it)
+needs every frame as it is composed.
+
+scanout-live=<file> keeps the last composed frame in a file both processes
+map (nikon-z63-scanout.h):
+
+  0     magic "Z63LIVE1", written last at open
+  8     u32 header bytes (4096), u32 pixel capacity in bytes
+  16    u64 sequence, a seqlock: odd while a write is under way, bumped by
+        two for each change of picture, size or note
+  24    u32 width, u32 height
+  32    u64 frames composed so far (liveness, outside the seqlock)
+  40    i64 host wall-clock ns of the last change
+  48    note: why there is no frame (what z63_scanout_refuse says)
+  4096  width x height u32 0x00RRGGBB, rows packed
+
+A frame identical to the last moves nothing but the frame count, so a
+reader wakes only for a new picture. The opener, z63_live_open(), takes
+the capacity, so another output can publish the same way. Host-side
+only; nothing the guest observes changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-scanout.h | 131 ++++++++++++++++++++++++++++++++++++-
+ hw/arm/nikon-z63.c         |  25 ++++++-
+ 2 files changed, 154 insertions(+), 2 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-scanout.h b/hw/arm/nikon-z63-scanout.h
+index 239a517..fa98782 100644
+--- a/hw/arm/nikon-z63-scanout.h
++++ b/hw/arm/nikon-z63-scanout.h
+@@ -99,6 +99,8 @@
+ #ifndef HW_ARM_NIKON_Z63_SCANOUT_H
+ #define HW_ARM_NIKON_Z63_SCANOUT_H
+ 
++#include <sys/mman.h>
++
+ #define Z63_DISP_R_OUTMODE   0x15cc
+ #define Z63_DISP_R_W0        0x132c
+ #define Z63_DISP_R_H0        0x1328
+@@ -146,6 +148,46 @@
+  */
+ #define Z63_SCANOUT_PERIOD_NS   (NANOSECONDS_PER_SECOND / 30)
+ 
++/*
++ * -machine scanout-live=<file>: the last composed frame, kept in a file the
++ * host maps, for a viewer outside QEMU (the z63ui repository). Host-side only,
++ * like scanout-dump, but every frame rather than once a second, and without
++ * a window or VNC in this build. The layout is fixed so another process can
++ * read it:
++ *
++ *   0     magic "Z63LIVE1", written last at open
++ *   8     u32 header bytes (4096), u32 pixel capacity in bytes
++ *   16    u64 sequence: odd while a write is under way, bumped by two for
++ *         each change of picture, size or note (a seqlock)
++ *   24    u32 width, u32 height
++ *   32    u64 frames composed so far (liveness; outside the seqlock)
++ *   40    i64 host wall-clock ns of the last change
++ *   48    note: why there is no frame, NUL-terminated; empty with a frame
++ *   4096  width x height little-endian u32 0x00RRGGBB, rows packed
++ *
++ * A frame identical to the last one does not move the sequence, so a reader
++ * only wakes for a new picture. Little-endian host only, which is every
++ * host this board is run on.
++ */
++#define Z63_LIVE_HEADER      4096u
++#define Z63_LIVE_CAPACITY    (2048u * 2048u * 4u)
++
++typedef struct Z63LiveHeader {
++    char magic[8];
++    uint32_t header_bytes;
++    uint32_t capacity;
++    uint64_t seq;
++    uint32_t width;
++    uint32_t height;
++    uint64_t frames;
++    int64_t host_ns;
++    char note[200];
++} Z63LiveHeader;
++
++QEMU_BUILD_BUG_ON(offsetof(Z63LiveHeader, seq) != 16);
++QEMU_BUILD_BUG_ON(offsetof(Z63LiveHeader, note) != 48);
++QEMU_BUILD_BUG_ON(sizeof(Z63LiveHeader) > Z63_LIVE_HEADER);
++
+ typedef struct Z63Scanout {
+     QemuConsole *con;
+     QEMUTimer *timer;
+@@ -160,6 +202,8 @@ typedef struct Z63Scanout {
+     uint64_t frames_video;      /* frames composed over the direct input */
+     unsigned unit;              /* the unit being shown */
+     char *dump;                 /* -machine scanout-dump: a PPM, host-side */
++    Z63LiveHeader *live;        /* -machine scanout-live: the mapped file */
++    bool live_too_big_reported;
+     uint64_t frames;
+     uint64_t frames_fetched;    /* frames composed from guest planes */
+     /* The slot registers as latched at the last frame boundary. */
+@@ -169,6 +213,82 @@ typedef struct Z63Scanout {
+     size_t back_size;
+ } Z63Scanout;
+ 
++/* The live file's seqlock, as qemu/seqlock.h writes one. */
++static void z63_live_begin(Z63LiveHeader *l)
++{
++    qatomic_set(&l->seq, l->seq + 1);
++    smp_wmb();
++}
++
++static void z63_live_end(Z63LiveHeader *l)
++{
++    l->host_ns = g_get_real_time() * 1000;
++    smp_wmb();
++    qatomic_set(&l->seq, l->seq + 1);
++}
++
++/* A composed frame: published only if it differs from the last one. */
++static void z63_scanout_live(Z63Scanout *s, const uint32_t *px,
++                             unsigned w, unsigned h)
++{
++    Z63LiveHeader *l = s->live;
++    uint32_t *dst;
++    size_t bytes = (size_t)w * h * 4;
++
++    if (!l) {
++        return;
++    }
++    qatomic_set(&l->frames, s->frames_fetched);
++    if (bytes > Z63_LIVE_CAPACITY) {
++        if (!s->live_too_big_reported) {
++            s->live_too_big_reported = true;
++            error_report("Z63_SCANOUT: a %ux%u frame does not fit scanout-live's "
++                         "%u bytes; the file keeps the last one that did",
++                         w, h, Z63_LIVE_CAPACITY);
++        }
++        return;
++    }
++    dst = (uint32_t *)((uint8_t *)l + Z63_LIVE_HEADER);
++    if (l->width == w && l->height == h && !l->note[0] &&
++        !memcmp(dst, px, bytes)) {
++        return;
++    }
++    z63_live_begin(l);
++    l->width = w;
++    l->height = h;
++    l->note[0] = 0;
++    memcpy(dst, px, bytes);
++    z63_live_end(l);
++}
++
++/* Make and map a live file with room for `capacity` bytes of pixels. */
++static Z63LiveHeader *z63_live_open(const char *path, uint32_t capacity,
++                                    const char *option)
++{
++    size_t size = Z63_LIVE_HEADER + capacity;
++    Z63LiveHeader *l;
++    int fd;
++
++    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
++    if (fd < 0 || ftruncate(fd, size) < 0) {
++        error_report("%s: cannot make '%s': %s", option, path,
++                     strerror(errno));
++        exit(1);
++    }
++    l = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    close(fd);
++    if (l == MAP_FAILED) {
++        error_report("%s: cannot map '%s': %s", option, path,
++                     strerror(errno));
++        exit(1);
++    }
++    l->header_bytes = Z63_LIVE_HEADER;
++    l->capacity = capacity;
++    smp_wmb();
++    memcpy(l->magic, "Z63LIVE1", 8);
++    return l;
++}
++
+ static void z63_scanout_refuse(Z63Scanout *s, const char *fmt, ...)
+ {
+     va_list ap;
+@@ -184,6 +304,11 @@ static void z63_scanout_refuse(Z63Scanout *s, const char *fmt, ...)
+         g_free(s->refused);
+         s->refused = msg;
+         error_report("Z63_SCANOUT: no frame -- %s", msg);
++        if (s->live) {
++            z63_live_begin(s->live);
++            pstrcpy(s->live->note, sizeof(s->live->note), msg);
++            z63_live_end(s->live);
++        }
+     } else {
+         g_free(msg);
+     }
+@@ -604,6 +729,7 @@ static void z63_scanout_update(void *opaque)
+         s->frames_fetched++;
+         memcpy(surface_data(surf), dst, (size_t)w * h * 4);
+         z63_scanout_dump(s, dst, w, h);
++        z63_scanout_live(s, dst, w, h);
+         dpy_gfx_update_full(s->con);
+     }
+ }
+@@ -644,10 +770,13 @@ static const GraphicHwOps z63_scanout_ops = {
+ };
+ 
+ static void z63_scanout_init(Z63Display *disp, Z63Scanout *s,
+-                             const char *dump)
++                             const char *dump, const char *live)
+ {
+     s->disp = disp;
+     s->dump = g_strdup(dump);
++    if (live && *live) {
++        s->live = z63_live_open(live, Z63_LIVE_CAPACITY, "scanout-live");
++    }
+     /* No DeviceState: this board builds its blocks as plain memory regions
+      * rather than as qdev devices, and the console does not need one. */
+     s->con = graphic_console_init(NULL, 0, &z63_scanout_ops, s);
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 0ed8244..5d2ed48 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -814,6 +814,7 @@ typedef struct NikonZ63State {
+     bool storage_caps_stub;      /* SD capability words, declared values */
+     bool gfx_skip_unmodelled;    /* nikon-z63-gfx.h, skip_unmodelled */
+     char *scanout_dump;          /* host-side PPM of the scanout */
++    char *scanout_live;          /* host-side live frame file, ditto */
+     char *sio_sink;              /* write-only serial sinks, nikon-z63-sio.h */
+     bool audio_codec;            /* nikon-z63-audio.h */
+     bool z9_capture;             /* nikon-z63-z9lab.h */
+@@ -4352,7 +4353,8 @@ static void z63_init(MachineState *machine)
+     z63_display_init(OBJECT(machine), sysmem, s->gic, &s->display);
+     /* The consumer for that register file: see nikon-z63-scanout.h for the
+      * register meanings and for what it refuses to do. */
+-    z63_scanout_init(&s->display, &s->scanout, s->scanout_dump);
++    z63_scanout_init(&s->display, &s->scanout, s->scanout_dump,
++                     s->scanout_live);
+ 
+     /* HDMI transmitter: DDC/E-DDC master, packet slots, PHY page.
+      * See docs/hdmi-registers.md. */
+@@ -4923,6 +4925,20 @@ static void z63_prop_set_scanout_dump(Object *obj, const char *value,
+     s->scanout_dump = g_strdup(value);
+ }
+ 
++static char *z63_prop_get_scanout_live(Object *obj, Error **errp)
++{
++    return g_strdup(NIKON_Z63(obj)->scanout_live);
++}
++
++static void z63_prop_set_scanout_live(Object *obj, const char *value,
++                                      Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    g_free(s->scanout_live);
++    s->scanout_live = g_strdup(value);
++}
++
+ static bool z63_prop_get_camctl(Object *obj, Error **errp)
+ {
+     return NIKON_Z63(obj)->mcu.camctl_reply;
+@@ -5343,6 +5359,13 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "Write the composed scanout frame to this file as a binary PPM about "
+         "once a second -- a host-side debugging aid for builds without a "
+         "window or screendump. Nothing the guest observes changes.");
++    object_class_property_add_str(oc, "scanout-live",
++                                  z63_prop_get_scanout_live,
++                                  z63_prop_set_scanout_live);
++    object_class_property_set_description(oc, "scanout-live",
++        "Keep the composed scanout frame, every frame, in this file for a "
++        "viewer in another process to map (layout in nikon-z63-scanout.h; "
++        "the z63ui repository reads it). Host-side only, like scanout-dump.");
+     object_class_property_add_bool(oc, "mcu-camctl-reply",
+                                    z63_prop_get_camctl, z63_prop_set_camctl);
+     object_class_property_set_description(oc, "mcu-camctl-reply",
+-- 
+2.55.0
+

@@ -1,0 +1,175 @@
+From 203840a05fa7c553b1b7ce7170af7a769447adbe Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Tue, 13 Oct 2026 05:57:30 +0000
+Subject: [PATCH 45/47] Z 6III: the touch panel -- a drag no longer lifts the
+ finger half-way
+
+A drag in the menus ended as a tap on the item it started on, unless it
+was a quick flick. The menu's list handler (sub_403E9E08) scrolls only
+after a slide starts and takes a release without one as a tap
+(sub_403EC848 on the item); TPIS starts a slide once the finger is more
+than 42 px (parameter +8 of 0x42b73fec) from the touch-down point, at any
+speed. What broke it was the model: logged at the list handler, one drag
+arrived as a touch-down, a release and a second touch-down.
+
+The driver's task (sub_40CC1BA8) services one interrupt edge per report
+and here takes longer than the 16 ms between reports. The model lowered
+the line for each report even while the last one was unread, making a
+second edge on an unread report; the driver then read 0x10 again after
+the records had been taken, found no finger, and handed TPIS a release
+mid-drag. A fast flick crossed 42 px before the first such release; a
+slower drag did not.
+
+Now register 0x10 answers the panel as it is at the read -- the fingers
+down then -- and its records are that snapshot; the line is lowered again
+16 ms after a report only once the last one has been read, so reports go
+at the driver's pace. A lift first reports the finger's last position if
+it was not reported (TPIS's release carries the last point it saw), then
+the release, once.
+
+Checked in the Setup menu, with the z63ui event sequence: a brisk drag,
+a slow one (205 px in 2.5 s) and touch-hold-0.6 s-then-drag all scroll
+the list and arrive as one touch-down each; a tap still opens its item.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-touch.h | 71 ++++++++++++++++++++++++++++++----------
+ 1 file changed, 53 insertions(+), 18 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-touch.h b/hw/arm/nikon-z63-touch.h
+index 81b375c..0076ee0 100644
+--- a/hw/arm/nikon-z63-touch.h
++++ b/hw/arm/nikon-z63-touch.h
+@@ -47,9 +47,18 @@
+  * after power comes on it raises the boot interrupt (S1 bit 7), and
+  * repeats the edge every 100 ms until 0x10 has been read, so a line not
+  * yet installed does not lose it. The interrupt line idles high and goes
+- * low for each report, released when the report has been read (0x10
+- * with no finger, or the last record). While a finger is down a report
+- * is made every 16 ms; the release makes one more. S1 bit 7 stays set
++ * low when there is something to read, released when it has been read
++ * (0x10 with no finger, or the last record). Register 0x10 answers the
++ * panel as it is at that read -- the fingers down now -- and the records
++ * that follow are that snapshot. While a finger is down the line is
++ * lowered again 16 ms after each report, but never while a report is
++ * still unread: the driver services one edge per report (sub_40CC1BA8
++ * runs well below 62.5 reports a second here), and an edge stacked on an
++ * unread one made it read 0x10 a second time, find no record, and pass
++ * TPIS a release in the middle of a drag -- which the menus then took as
++ * a tap. A lift reports the finger's last position first, if it was not
++ * yet reported (TPIS's release carries the last point it saw), then the
++ * release, once. S1 bit 7 stays set
+  * after the boot (a "ready" flag nothing else tests). Touches are made
+  * only while registers 1 and 2 both hold 1 (scanning). The version reads
+  * 1.00.00. Fingers come from QEMU's multi-touch input (input-send-event
+@@ -94,9 +103,12 @@ typedef struct Z63Touch {
+     unsigned fingers;           /* down now */
+     uint16_t x[Z63_TOUCH_FINGERS], y[Z63_TOUCH_FINGERS];
+     bool release_pending;       /* one report with no finger owed */
++    bool final_pending;         /* the lifted finger's last point, unreported */
++    uint16_t final_x, final_y;
+     unsigned report_n;          /* fingers in the report being read */
+     unsigned records_left;
+     uint16_t rx_x[Z63_TOUCH_FINGERS], rx_y[Z63_TOUCH_FINGERS];
++    uint16_t last_x, last_y;    /* finger 0 as last reported */
+     uint64_t reports, boot_edges, dropped;
+     bool drop_named;            /* this touch's drop already reported */
+     /* QEMU multi-touch input, per slot until the sync */
+@@ -116,23 +128,39 @@ static void z63_touch_int(Z63Touch *t, bool low)
+     z63_extint_set(t->extint, Z63_TOUCH_INT_LINE, !low);
+ }
+ 
+-/* A report: the fingers as they are now, latched for the reads. */
++/* Something to report: lower the line, unless a report is still unread
++ * (its read will answer the panel as it is by then). */
+ static void z63_touch_report(Z63Touch *t)
+ {
+-    t->report_n = t->fingers;
+-    for (unsigned i = 0; i < t->fingers; i++) {
+-        t->rx_x[i] = t->x[i];
+-        t->rx_y[i] = t->y[i];
++    if (!t->int_low) {
++        t->reports++;
++        z63_touch_int(t, true);
+     }
+-    t->records_left = t->report_n;
+-    if (!t->fingers) {
++}
++
++/* Register 0x10 read: the snapshot the records are read from. */
++static void z63_touch_snapshot(Z63Touch *t)
++{
++    if (t->fingers) {
++        t->report_n = t->fingers;
++        for (unsigned i = 0; i < t->fingers; i++) {
++            t->rx_x[i] = t->x[i];
++            t->rx_y[i] = t->y[i];
++        }
++    } else if (t->final_pending) {
++        t->final_pending = false;
++        t->report_n = 1;
++        t->rx_x[0] = t->final_x;
++        t->rx_y[0] = t->final_y;
++    } else {
+         t->release_pending = false;
++        t->report_n = 0;
+     }
+-    t->reports++;
+-    if (t->int_low) {
+-        z63_touch_int(t, false);        /* make an edge for this one */
++    if (t->report_n) {
++        t->last_x = t->rx_x[0];
++        t->last_y = t->rx_y[0];
+     }
+-    z63_touch_int(t, true);
++    t->records_left = t->report_n;
+ }
+ 
+ static void z63_touch_tick(void *opaque)
+@@ -155,10 +183,8 @@ static void z63_touch_tick(void *opaque)
+     if (!z63_touch_scanning(t)) {
+         return;
+     }
+-    if (t->fingers || t->release_pending) {
++    if (t->fingers || t->final_pending || t->release_pending) {
+         z63_touch_report(t);
+-    }
+-    if (t->fingers) {
+         timer_mod(t->timer, now + Z63_TOUCH_FRAME_NS);
+     }
+ }
+@@ -174,6 +200,7 @@ static void z63_touch_power(Z63Touch *t, bool on)
+     t->boot_pending = on;
+     t->records_left = 0;
+     t->report_n = 0;
++    t->final_pending = t->release_pending = false;
+     t->regs[0x01] = t->regs[0x02] = 0;
+     z63_touch_int(t, false);
+     if (on) {
+@@ -203,6 +230,9 @@ static void z63_touch_apply(Z63Touch *t, unsigned n, const uint16_t *x,
+         t->drop_named = false;
+         if (t->fingers) {
+             t->release_pending = true;
++            t->final_x = t->x[0];
++            t->final_y = t->y[0];
++            t->final_pending = t->x[0] != t->last_x || t->y[0] != t->last_y;
+         }
+     }
+     t->fingers = n;
+@@ -332,7 +362,12 @@ static bool z63_touch_start(Z63Touch *t, bool receive)
+     memset(t->rx, 0, sizeof(t->rx));
+     switch (t->pointer) {
+     case 0x10:
+-        t->rx[0] = t->boot_pending ? 0 : t->report_n;
++        if (t->boot_pending) {
++            t->report_n = t->records_left = 0;
++        } else {
++            z63_touch_snapshot(t);
++        }
++        t->rx[0] = t->report_n;
+         t->rx[1] = (t->boot_pending || t->booted) ? 0x80 : 0;
+         t->rx_len = 2;
+         if (t->boot_pending) {
+-- 
+2.55.0
+

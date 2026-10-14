@@ -1,0 +1,444 @@
+From 40183db08366e97a2a5874e1ffa7e8e3d0870253 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 06:54:41 +0000
+Subject: [PATCH 20/47] Z 6III: the shutter mechanism -- the MCU answers
+ capture sync, mode changes complete
+
+Leaving the menu restarted live view and ended in camera error 0x35: the
+mode-change request sub_40F34EC8 -> sub_40F41324 waits for flag 8 on
+0xa03d74928, which only event 0x3030004 sets, and that is produced from
+one edge. sub_4117D340 pulses pin 43 (port 3 bit 12, the MCU's PF4) and
+arms EXT_INT_7 (port 3 bit 7, the MCU's PD7); the pin-38 callback
+sub_4117D560 turns a rising edge there into 0x3030024, which the worker
+sub_4117C9A4 hands on as 0x3030004 (the only other source is
+sub_40F34EC8's busy shortcut). Even boot's mode-0 request never completed;
+it only went unnoticed until the next one waited.
+
+The MCU raises PD7 (sub_803B194 -> sub_803A820) once its shutter has moved.
+A mode frame (family 9 kind 2, sub_803B1E4 -> bit 8) arms EXTI4 on PF4
+(sub_803B404); the PF4 edge timestamps the move (sub_803B088 ->
+sub_803AC14, Mech state 5); the motor task powers the motor (PA11) and
+drives it -- TIM2 PWM, CH1 (PA15) forward, CH3 (PB10) reverse,
+sub_803AA48 -- and follows two position sensors, PC6 and PC7, through
+TIM3 input capture (TI1, TI2), a debounce on a TIM3 compare and a re-read
+of the pins, stepping a quadrature count against the table at 0x8058670
+(0 HH, 1 LH, 2 LL, 3 HL for PC6, PC7). After the last step it brakes,
+waits, and reports 0x2080002, which Mech takes to sub_80398DC and PD7.
+Nothing moved the sensors, so every move ran into its ~110 ms drive
+timeout.
+
+hw/arm/nikon-z63-stm32.h now has the mechanism: while PA11 is high and one
+TIM2 channel has duty, the shutter advances one quadrature position per
+10 ms, forward on CH1 and back on CH3, and each step changes one sensor
+pin, an edge on that TIM3 input. DECLARED: the start position (2, both
+low, which sub_8041C54 requires before a move from closed) and the step
+time; duty is not speed, and there is no inertia, bounce or brake.
+
+Four things in QEMU's STM32 models stood between that and the firmware:
+- stm32f2xx_timer had no input capture. stm32f2xx_timer_input() latches
+  CNT into CCRx on the edge CCxP/CCxNP select for a channel whose CCxS
+  maps that input, with CCxIF/CCxOF and CCxIE.
+- EGR's CC1G..CC4G were ignored. The debounce, finding its 15-tick
+  deadline already past, fires it by software (sub_803A438 ->
+  sub_804D908, EGR = CC3G).
+- A flag set while its enable was clear never interrupted: the request is
+  SR & DIER, and the firmware sets CC3IF by EGR and only then enables
+  CC3IE (sub_804DC68). A DIER write that enables a pending flag now
+  raises it.
+- stm32f4xx_exti pulsed the NVIC on any level change of an unmasked line.
+  Only a selected edge is an event; PF4's falling edge ran the
+  rising-edge handler again, and the second timestamp undid the first.
+
+Verified (z63log mcall= hooks): at boot the mode-0 request completes for
+the first time -- PF4 pulse, one timestamp, two steps to position 0,
+0x2080002, PD7 rises, sub_4117D560, 0x3030024 -- and so does the one at
+the live-view restart after the menu: no error 0x35. smoke.sh passes.
+
+Where it stands: that restart now ends in camera error 0x40 instead
+(CaptureSequence result 9 from stop bit 0x100, byte 0xa03d76270).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-stm32.h           | 118 +++++++++++++++++++++++
+ hw/misc/stm32f4xx_exti.c           |  18 +++-
+ hw/timer/stm32f2xx_timer.c         | 148 ++++++++++++++++++++++++++---
+ include/hw/timer/stm32f2xx_timer.h |   3 +
+ 4 files changed, 270 insertions(+), 17 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-stm32.h b/hw/arm/nikon-z63-stm32.h
+index d1d49fa..f1be7f4 100644
+--- a/hw/arm/nikon-z63-stm32.h
++++ b/hw/arm/nikon-z63-stm32.h
+@@ -152,6 +152,14 @@ struct Z63Stm32 {
+     OrIRQState tim_or[2];               /* vectors 25 and 44 are shared */
+     STM32F2XXUsartState usart[6];       /* USART1-3, UART4-5, USART6 */
+     STM32F4xxExtiState exti;            /* QEMU's model, lines 0..15 */
++    struct {                            /* z63_stm32_shutter_tick */
++        QEMUTimer *timer;
++        uint8_t pos;                    /* 0..3, the table at 0x8058670 */
++        int8_t dir;                     /* +1 forward, -1 reverse, 0 */
++        int64_t driven_ns;              /* drive since the last step */
++        uint64_t steps;
++        unsigned named;
++    } shutter;
+     MemoryRegion syscfg_mr;
+     uint32_t syscfg[0x30 / 4];          /* MEMRMP PMC EXTICR1-4 .. CMPCR, +0x24.. */
+     Z63Stm32Spi spi[Z63_STM32_SPI_N];
+@@ -2454,6 +2462,108 @@ static void z63_stm32_debug(void *opaque)
+ /* Build the MCU and load its image (a raw dump of flash from 0x08000000).
+  * The core starts at reset, from the vector table at 0 -- the flash alias,
+  * BOOT0 low. */
++/*
++ * The shutter mechanism: a motor the MCU drives and the two position
++ * sensors it reads back. The live-view start (and every mode change) waits
++ * on it: the EXPEED's capture-sync request (pin 43, PF4 here) is answered
++ * on PD7 only once the shutter has moved (sub_803B194 -> sub_803A820), and
++ * without a mechanism the motor ran into its drive timeout at every
++ * request and the EXPEED's mode-0 request never completed (error 0x35 on
++ * the next one).
++ *
++ * What the firmware does, all on this image:
++ *   - power: PA11 high before a move (sub_8042864's caller, byte 0x2001a407
++ *     ticks of settling);
++ *   - drive: TIM2, PWM mode 1 on CH1 (PA15, AF1) and CH3 (PB10, AF1), ARR
++ *     0x897; sub_803AA48 puts the duty on one channel and 0 on the other,
++ *     or 0 on both to stop. At the live-view start CCR1 = 0x1b8, CCR3 = 0,
++ *     the move sub_8042B0C counts as +1: CH1 is forward;
++ *   - sensors: PC6 and PC7 (AF2, TIM3 TI1 and TI2), read as a two-bit
++ *     position through the table at 0x8058670 -- 0 HH, 1 LH, 2 LL, 3 HL,
++ *     (PC6, PC7) -- a quadrature pair, one bit changing per step. The MCU
++ *     arms an input capture on the sensor the next step will change
++ *     (TIM3 CCMR1 0x101, CCER 0x121 for PC6 rising), debounces, re-reads
++ *     the pins and steps its own count (sub_80421A0 -> sub_8042654).
++ *     sub_8041C54 wants position 2, both low, before a move from closed.
++ *
++ * So: while the motor has power and one channel has duty, the shutter
++ * advances one position per Z63_SHUTTER_STEP_NS of drive, forward on CH1
++ * and back on CH3, and each step changes one sensor pin, which is an edge
++ * on that TIM3 input (stm32f2xx_timer_input). It stops where it is when the
++ * drive stops. DECLARED: the start at position 2 and the step time -- 10 ms,
++ * inside the firmware's own drive timeout (~110 ms for a two-step move at
++ * the live-view start); the duty is not modelled as speed, nor inertia,
++ * bounce or the brake. A body would replace both numbers.
++ */
++#define Z63_SHUTTER_TICK_NS     (500 * SCALE_US)
++#define Z63_SHUTTER_STEP_NS     (10 * SCALE_MS)
++#define Z63_SHUTTER_START       2
++#define Z63_SHUTTER_NAMED       24
++
++static const uint8_t z63_shutter_pins[4] = {
++    3, 2, 0, 1,         /* bit 0 PC6, bit 1 PC7: HH LH LL HL */
++};
++
++static void z63_stm32_shutter_pins(Z63Stm32 *m, bool edges)
++{
++    Z63Stm32Gpio *c = &m->gpio[2];
++
++    for (unsigned b = 0; b < 2; b++) {
++        bool level = (z63_shutter_pins[m->shutter.pos] >> b) & 1;
++
++        if (edges && ((c->level >> (6 + b)) & 1) == level) {
++            continue;
++        }
++        z63_stm32_gpio_drive(c, 6 + b, level);
++        if (edges) {
++            stm32f2xx_timer_input(&m->tim[1], b, level);   /* TIM3 TI1/2 */
++        }
++    }
++}
++
++static void z63_stm32_shutter_tick(void *opaque)
++{
++    Z63Stm32 *m = opaque;
++    STM32F2XXTimerState *pwm = &m->tim[0];             /* TIM2 */
++    bool run = (m->gpio[0].odr & (1u << 11)) &&         /* PA11 */
++               (pwm->tim_cr1 & TIM_CR1_CEN);
++    int dir = !run ? 0 :
++              (pwm->tim_ccer & 0x001) && pwm->tim_ccr1 && !pwm->tim_ccr3 ? 1 :
++              (pwm->tim_ccer & 0x100) && pwm->tim_ccr3 && !pwm->tim_ccr1 ? -1 :
++              0;
++
++    if (dir != m->shutter.dir) {
++        m->shutter.dir = dir;
++        m->shutter.driven_ns = 0;
++        if (m->shutter.named < Z63_SHUTTER_NAMED) {
++            m->shutter.named++;
++            error_report("Z63_SHUTTER: motor %s at position %u (TIM2 CCR1 "
++                         "%u, CCR3 %u)", dir > 0 ? "forward" :
++                         dir < 0 ? "reverse" : "stopped", m->shutter.pos,
++                         pwm->tim_ccr1, pwm->tim_ccr3);
++        }
++    }
++    if (dir) {
++        m->shutter.driven_ns += Z63_SHUTTER_TICK_NS;
++        if (m->shutter.driven_ns >= Z63_SHUTTER_STEP_NS) {
++            m->shutter.driven_ns = 0;
++            m->shutter.pos = (m->shutter.pos + dir) & 3;
++            m->shutter.steps++;
++            z63_stm32_shutter_pins(m, true);
++            if (m->shutter.named < Z63_SHUTTER_NAMED) {
++                m->shutter.named++;
++                error_report("Z63_SHUTTER: position %u (PC6 %u, PC7 %u), "
++                             "step %" PRIu64, m->shutter.pos,
++                             z63_shutter_pins[m->shutter.pos] & 1,
++                             z63_shutter_pins[m->shutter.pos] >> 1,
++                             m->shutter.steps);
++            }
++        }
++    }
++    timer_mod(m->shutter.timer,
++              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + Z63_SHUTTER_TICK_NS);
++}
++
+ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+                            Chardev **serial, Error **errp)
+ {
+@@ -2700,6 +2810,14 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+     z63_stm32_reset(m);
+     qemu_register_reset(z63_stm32_reset, m);
+ 
++    /* The shutter keeps its position through an MCU reset; it is a
++     * mechanism, not a register. */
++    m->shutter.pos = Z63_SHUTTER_START;
++    z63_stm32_shutter_pins(m, false);
++    m->shutter.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                    z63_stm32_shutter_tick, m);
++    timer_mod(m->shutter.timer, Z63_SHUTTER_TICK_NS);
++
+     /* TEMPORARY PROBE (remove): where the core is and what it has armed. */
+     if (getenv("Z63_STM32_DEBUG")) {
+         m->dbg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_stm32_debug, m);
+diff --git a/hw/misc/stm32f4xx_exti.c b/hw/misc/stm32f4xx_exti.c
+index 0688e6e..8dacb24 100644
+--- a/hw/misc/stm32f4xx_exti.c
++++ b/hw/misc/stm32f4xx_exti.c
+@@ -45,17 +45,31 @@ static void stm32f4xx_exti_set_irq(void *opaque, int irq, int level)
+ {
+     STM32F4xxExtiState *s = opaque;
+ 
++    bool edge = false;
++
+     trace_stm32f4xx_exti_set_irq(irq, level);
+ 
+     if (((1 << irq) & s->exti_rtsr) && level) {
+         /* Rising Edge */
+-        s->exti_pr |= 1 << irq;
++        edge = true;
+     }
+ 
+     if (((1 << irq) & s->exti_ftsr) && !level) {
+         /* Falling Edge */
+-        s->exti_pr |= 1 << irq;
++        edge = true;
++    }
++
++    /*
++     * Only a selected edge is an event (RM0386, EXTI): the other edge of
++     * a line that triggers on one must not interrupt. Pulsing on every
++     * change ran a rising-edge handler again on the falling edge -- the
++     * Z 6III body MCU's capture-sync line (PF4, a 2 ms pulse) answered
++     * twice, and its second answer undid the first.
++     */
++    if (!edge) {
++        return;
+     }
++    s->exti_pr |= 1 << irq;
+ 
+     if (!((1 << irq) & s->exti_imr)) {
+         /* Interrupt is masked */
+diff --git a/hw/timer/stm32f2xx_timer.c b/hw/timer/stm32f2xx_timer.c
+index 9ff0118..68bb1fd 100644
+--- a/hw/timer/stm32f2xx_timer.c
++++ b/hw/timer/stm32f2xx_timer.c
+@@ -277,6 +277,75 @@ static void stm32f2xx_timer_reset(DeviceState *dev)
+     s->tick_offset = stm32f2xx_ns_to_ticks(s, now);
+ }
+ 
++/* The counter runs 0..ARR and wraps (RM0386 18.3.2), so that is what it
++ * reads: the firmware's delays are CCRx = CNT + n, and an unwrapped count
++ * put them anywhere in the 16-bit range. */
++static uint32_t stm32f2xx_timer_cnt(STM32F2XXTimerState *s)
++{
++    int64_t c = stm32f2xx_ns_to_ticks(s,
++                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) - s->tick_offset;
++    int64_t period = (int64_t)s->tim_arr + 1;
++
++    if (!s->tim_arr) {
++        return c;
++    }
++    c %= period;
++    return c < 0 ? c + period : c;
++}
++
++/*
++ * Input capture (RM0386 18.3.5): the board reports a level change on
++ * timer input TIn (ti = 0..3 for TI1..TI4). A channel in input mode whose
++ * CCxS selects that input (01: its own, 10: its pair's; 11, TRC, is not
++ * modelled), whose CCxE is set and whose CCxP/CCxNP edge it is (00
++ * rising, 01 falling, 11 both) latches CNT into CCRx and sets CCxIF --
++ * CCxOF as well if CCxIF was still set -- and interrupts if CCxIE is set.
++ * The input filter and prescaler (ICxF, ICxPSC) are not modelled: every
++ * edge the board reports is one clean capture. The Z 6III body MCU reads
++ * its shutter's position sensors this way.
++ */
++void stm32f2xx_timer_input(STM32F2XXTimerState *s, unsigned ti, bool level)
++{
++    bool irq = false;
++
++    for (unsigned ch = 0; ch < 4; ch++) {
++        uint32_t ccmr = ch < 2 ? s->tim_ccmr1 : s->tim_ccmr2;
++        unsigned ccs = (ccmr >> (8 * (ch & 1))) & 3;
++        unsigned ccer = s->tim_ccer >> (4 * ch);
++        bool p = ccer & 2, np = ccer & 8;
++
++        if (ccs == 0 || ccs == 3 || (ccs == 1 ? ch : ch ^ 1) != ti ||
++            !(ccer & 1)) {
++            continue;
++        }
++        if (!(p && np) && level == p) {
++            continue;                       /* not the edge it waits for */
++        }
++        switch (ch) {
++        case 0:
++            s->tim_ccr1 = stm32f2xx_timer_cnt(s);
++            break;
++        case 1:
++            s->tim_ccr2 = stm32f2xx_timer_cnt(s);
++            break;
++        case 2:
++            s->tim_ccr3 = stm32f2xx_timer_cnt(s);
++            break;
++        default:
++            s->tim_ccr4 = stm32f2xx_timer_cnt(s);
++            break;
++        }
++        if (s->tim_sr & (2u << ch)) {
++            s->tim_sr |= 0x200u << ch;          /* CCxOF */
++        }
++        s->tim_sr |= 2u << ch;                  /* CCxIF */
++        irq |= s->tim_dier & (2u << ch);        /* CCxIE */
++    }
++    if (irq) {
++        qemu_irq_pulse(s->cc_irq ? s->cc_irq : s->irq);
++    }
++}
++
+ static uint64_t stm32f2xx_timer_read(void *opaque, hwaddr offset,
+                            unsigned size)
+ {
+@@ -304,20 +373,8 @@ static uint64_t stm32f2xx_timer_read(void *opaque, hwaddr offset,
+         return s->tim_ccmr2;
+     case TIM_CCER:
+         return s->tim_ccer;
+-    case TIM_CNT: {
+-        /* The counter runs 0..ARR and wraps (RM0386 18.3.2), so that is
+-         * what it reads: the firmware's delays are CCRx = CNT + n, and an
+-         * unwrapped count put them anywhere in the 16-bit range. */
+-        int64_t c = stm32f2xx_ns_to_ticks(s,
+-                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) - s->tick_offset;
+-        int64_t period = (int64_t)s->tim_arr + 1;
+-
+-        if (!s->tim_arr) {
+-            return c;
+-        }
+-        c %= period;
+-        return c < 0 ? c + period : c;
+-    }
++    case TIM_CNT:
++        return stm32f2xx_timer_cnt(s);
+     case TIM_PSC:
+         return s->tim_psc;
+     case TIM_ARR:
+@@ -363,15 +420,76 @@ static void stm32f2xx_timer_write_reg(STM32F2XXTimerState *s, hwaddr offset,
+     case TIM_SMCR:
+         s->tim_smcr = value;
+         return;
+-    case TIM_DIER:
++    case TIM_DIER: {
++        /* The request is a level, SR & DIER (RM0386 18.4.4, 18.4.5):
++         * enabling a source whose flag is already set requests at once.
++         * This model raises requests as pulses at the event, so a flag set
++         * while its enable was clear gets its pulse here. The Z 6III body
++         * MCU sets CC3IF by software (EGR CC3G, sub_804D908) and only then
++         * enables CC3IE (sub_804DC68); without this its shutter-sensor
++         * debounce never ended. */
++        uint32_t newly;
++
++        stm32f2xx_timer_cc_sync(s, now);
++        newly = value & ~s->tim_dier & s->tim_sr;
+         s->tim_dier = value;
++        if (newly & 1) {
++            qemu_irq_pulse(s->irq);
++        }
++        if (newly & 0x1e) {
++            qemu_irq_pulse(s->cc_irq ? s->cc_irq : s->irq);
++        }
+         return;
++    }
+     case TIM_SR:
+         /* This is set by hardware and cleared by software */
+         s->tim_sr &= value;
+         return;
+     case TIM_EGR:
+         s->tim_egr = value;
++        if (value & 0x1e) {
++            /* CC1G..CC4G (RM0386 18.4.6): a capture/compare event by
++             * software -- CCxIF, CCxOF if it was still set, an input
++             * channel's CCRx takes CNT, and CCxIE interrupts. Firmware
++             * that finds a compare deadline already past fires it this
++             * way (the Z 6III body MCU's sub_803A438 -> sub_804D908, its
++             * shutter-sensor debounce); ignored, that event never came. */
++            bool irq = false;
++
++            for (unsigned ch = 0; ch < 4; ch++) {
++                uint32_t ccmr = ch < 2 ? s->tim_ccmr1 : s->tim_ccmr2;
++
++                if (!(value & (2u << ch))) {
++                    continue;
++                }
++                if ((ccmr >> (8 * (ch & 1))) & 3) {
++                    uint32_t cnt = stm32f2xx_timer_cnt(s);
++
++                    switch (ch) {
++                    case 0:
++                        s->tim_ccr1 = cnt;
++                        break;
++                    case 1:
++                        s->tim_ccr2 = cnt;
++                        break;
++                    case 2:
++                        s->tim_ccr3 = cnt;
++                        break;
++                    default:
++                        s->tim_ccr4 = cnt;
++                        break;
++                    }
++                }
++                if (s->tim_sr & (2u << ch)) {
++                    s->tim_sr |= 0x200u << ch;          /* CCxOF */
++                }
++                s->tim_sr |= 2u << ch;                  /* CCxIF */
++                irq |= s->tim_dier & (2u << ch);        /* CCxIE */
++            }
++            if (irq) {
++                qemu_irq_pulse(s->cc_irq ? s->cc_irq : s->irq);
++            }
++        }
+         if (s->tim_egr & TIM_EGR_UG) {
+             timer_val = 0;
+             break;
+diff --git a/include/hw/timer/stm32f2xx_timer.h b/include/hw/timer/stm32f2xx_timer.h
+index f188186..22daee6 100644
+--- a/include/hw/timer/stm32f2xx_timer.h
++++ b/include/hw/timer/stm32f2xx_timer.h
+@@ -112,4 +112,7 @@ struct STM32F2XXTimerState {
+     uint32_t tim_or;
+ };
+ 
++/* An edge on timer input TIn (ti 0..3), for input capture. */
++void stm32f2xx_timer_input(STM32F2XXTimerState *s, unsigned ti, bool level);
++
+ #endif /* HW_STM32F2XX_TIMER_H */
+-- 
+2.55.0
+

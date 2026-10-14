@@ -1,0 +1,96 @@
+From 7507082665ea08cf32b5494b96732b690ee2601a Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 13:35:20 +0000
+Subject: [PATCH 28/47] Z 6III: the DSPs' bus windows reach all of DRAM -- live
+ view no longer stalls
+
+Live view ran for some seconds and then stopped, later with camera error
+0x40. The chain, traced back from the stall:
+
+  - the per-frame records (sub_40F675C0, allocator type 17 via
+    sub_410414F0) stopped being released (sub_40F7EB80) about 13 s in;
+    some 20 frames later the pool was empty and every allocation failed;
+  - they were held by the photometry stage, which waited, with its lock,
+    on a DSP 1 job that sub_40C90630 never sent: DSP 1's queue 0 had a
+    count of 2 and a NULL head, so the peek returned nothing;
+  - the queue was linked through its own lock word. Every completion of
+    a photometry job (0x1a/0x1b) runs sub_40C90118, which translates the
+    job's parameter block back from DSP to ARM addresses (sub_40C907E0)
+    and writes through the result: 0xa02faf820, DSP 1's queue-0 lock;
+  - that address was stale stack. sub_40C910D0 and sub_40C907E0 look the
+    address up in DSP 1's windows (ids 56..63 of the table at
+    0xa02814458) and, finding none that covers it, return an
+    uninitialised local -- the jobs went out with bus address 0xa;
+  - all eight of DSP 1's windows had the same target, DRAM's first
+    128 MiB: the RTOS (sub_41187344) only adds its 0x200000000 bias to
+    each target, and the targets the loader would have set are 0 here.
+
+nikon-z63-noc.h now provisions targets for the three DSPs' groups (3, 4,
+5 -- the {first, last} id pairs in sub_40C90B24): read window k and its
+write sibling reach DRAM + k * 128 MiB, so DSP 0's and DSP 1's eight
+windows tile the 1 GiB below the RTOS's limit exactly. DECLARED, like
+the starts and sizes already there; the other groups keep target 0,
+since their drivers retarget what they use. The photometry jobs now
+carry real bus addresses (0x1a: 0x7493fe40, 0x7493f600), and a 66 s
+live-view run completes 684 frame jobs, releases 686 records, has no
+allocation failure and no camera error, until the standby timer turns
+the camera off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-noc.h | 32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/nikon-z63-noc.h b/hw/arm/nikon-z63-noc.h
+index d9b8323..94778fa 100644
+--- a/hw/arm/nikon-z63-noc.h
++++ b/hw/arm/nikon-z63-noc.h
+@@ -37,7 +37,33 @@
+  * that: sub_40CAA5FC and sub_402EEF20 register 0x20000000-byte ranges),
+  * 1 GiB at 0x80000000 for group 16, and bit 4 set in each bank-0 start so
+  * that sub_411877B0 reads bank 1 -- except group 16 and group 1's first
+- * four slots, which have only bank 0. Targets are left for the RTOS.
++ * four slots, which have only bank 0.
++ *
++ * Targets, too, are the loader's, and also DECLARED here. At start-up the
++ * RTOS adds its own bias to every target the loader left below 1 GiB
++ * (sub_41187344: +0x10 |= 0x200000000, stopping at the first slot with any
++ * of bits 30..35 set), which puts a target of 0 at DRAM's start,
++ * 0xa00000000. Left at 0, all eight of DSP 1's 128 MiB apertures
++ * (window ids 56..63, bus 0x40000000..0xb0000000) alias DRAM's first
++ * 128 MiB, so the DSP driver's own translation (sub_40C910D0, then
++ * sub_40C907E0 on completion) finds no window for any buffer above that
++ * and uses an uninitialised local: the photometry jobs 0x1a/0x1b went out
++ * with bus address 0xa, and each completion wrote its translated-back
++ * "address" -- stale stack, 0xa02faf820 -- over DSP 1's queue-0 lock word
++ * and then linked the queue through it (head lost, sub_40C90630 never
++ * sending again), so the photometry stage waited for ever with its lock
++ * held, live-view frame records (allocator type 17) were never released
++ * and the camera stalled.
++ *
++ * The DSP driver looks only at the read windows of its DSP's group -- ids
++ * 40..47 (group 3, DSP 0), 56..63 (group 4, DSP 1), 72..77 (group 5,
++ * DSP 2), the {first, last} pairs in sub_40C90B24 -- which sit at bus
++ * 0x40000000 + k * 0x10000000; the write windows of each pair sit 128 MiB
++ * above. So for those three groups only, read window k and its write
++ * sibling are given target k * 128 MiB: DSP 0's and DSP 1's eight windows
++ * tile the 1 GiB below the RTOS's limit exactly, DSP 2's six the first
++ * 768 MiB. The other groups' targets stay 0, as before: their drivers
++ * retarget the windows they use (sub_40CB8098).
+  */
+ 
+ #ifndef HW_ARM_NIKON_Z63_NOC_H
+@@ -108,6 +134,10 @@ static void z63_noc_provision(Z63Noc *n)
+                 w[1] = start >> 32;
+                 w[2] = (uint32_t)-size;
+                 w[3] = (-size >> 32) & 0xf;        /* a 36-bit field */
++                if (g >= 3 && g <= 5) {         /* the DSPs' windows */
++                    w[4] = (((start & ~0x3fULL) - 0x40000000) >> 28) << 27;
++                    w[5] = 0;
++                }
+             }
+         }
+     }
+-- 
+2.55.0
+

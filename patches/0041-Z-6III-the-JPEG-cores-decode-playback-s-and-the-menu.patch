@@ -1,0 +1,1017 @@
+From 1bb08e968dfd92947040e70a8bedbcb4bc06a3c4 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Tue, 13 Oct 2026 02:29:00 +0000
+Subject: [PATCH 41/47] Z 6III: the JPEG cores decode -- playback's and the
+ menus' pictures, z63-jpeg-decode
+
+Playback (PLAY) and Setup > monitor colour balance stopped at once on
+  Z63_UNMAPPED write addr=0x015e21000 size=4 value=0x39 pc=0x040c0d4c4
+the decode job (sub_40C9B4CC) putting a JPEG core in decode mode:
+sub_40C0D4B8 writes mode 0x39 -- bit 3 decode, bits 0..2 the 4:2:2 the
+encoder takes as 0x31 -- the input (+0x440 << 4; +0x458 its length in
+512-byte blocks, 0 for playback: to the EOI), the scale steps (+0x400/
++0x404 bits 2..3) and the output planes (+0x430/+0x434 << 4), and
+sub_40C0D614 starts it (+0x004 |= 1, +0x404 = 0x4000). ../z9-qemu's
+JPEG model only encodes, and its configuration model refuses the mode.
+
+The handler sub_40C0C774 takes a decoding core through two stops: the
+header (status 0x08000000|0x02000000), where it reads the size (+0x1c,
+and +0x3c or +0x18), checks the stream's sampling in +0x000 bits 0..2,
+programs the output (pitches +0x410/+0x414, size +0x418/+0x41c, a source
+window +0x420..+0x428), starts the output DMA (+0x400 = 0x4000) and,
+while +0x038 is non-zero, continues the core (+0x004 |= 2); and the end,
+as the encoder's (0x0800c000 with +0x02c bit 31), whose 0x60001 the
+job's callback sub_40C9BADC takes as done, with the size the header left
+in the job.
+
+New z9-capture switch z63-jpeg-decode (on in the board's default props):
+a core written a mode with bit 3 belongs to the decode model until a
+mode without it. It decodes the stream as it is in RAM with libjpeg
+(hw/arm/nikon-z63-jpegdec.h) and gives the handler both stops, writing
+NV16 (NV12 for a 4:2:0 stream) into the planes the handler programmed.
+DECLARED: both stops immediate; the header stop also sets status bit 12,
+which +0x484 enables and the handler ignores in decode mode, so that the
+line rises; +0x038 reads 1 between the stops, +0x030/+0x034 read 0; a
+stream libjpeg refuses ends in status 0x20400000, which the handler
+takes as an error.
+
+Checked: PLAY decodes the newest picture's 1620x1080 preview (JPEG_1,
+y=0xa3769d380 pitch 1632); monitor colour balance opens and decodes the
+same, no stop (its picture area stays black: it is drawn by a YUV path
+the GFX model skips). Releases still write DSC_nnnn.JPG.
+
+Playback now stops one step later, where the resizer scales the decoded
+picture from RAM: A1 (0x15421100) +4 = 0x5001, pc 0x40c27448, with the
+coefficient banks 0x15427000/0x15428000 and output instance 0x15432000.
+../z9-qemu models RAM input only for the thumbnail route (A2 -> F4 ->
+B4). That route is the next step for playback.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-jpegdec.h  | 132 ++++++++++++++
+ hw/arm/nikon-z63-z9lab.c    | 328 ++++++++++++++++++++++++++++++++++-
+ hw/arm/nikon-z63-z9lab.h    |   4 +-
+ z63-tools/import_z9lab.py   | 334 ++++++++++++++++++++++++++++++++++++
+ z63-tools/z9lab_attach.c.in |  26 +++
+ 5 files changed, 822 insertions(+), 2 deletions(-)
+ create mode 100644 hw/arm/nikon-z63-jpegdec.h
+
+diff --git a/hw/arm/nikon-z63-jpegdec.h b/hw/arm/nikon-z63-jpegdec.h
+new file mode 100644
+index 0000000..2cd1bbc
+--- /dev/null
++++ b/hw/arm/nikon-z63-jpegdec.h
+@@ -0,0 +1,132 @@
++/*
++ * Nikon Z 6III -- a JPEG stream decoded with libjpeg, for the JPEG cores'
++ * decode mode (z63-jpeg-decode in z63-tools/z9lab_attach.c.in).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Two calls, no device state: the frame header (size and the chroma
++ * sampling, in the cores' format numbering -- 1 = 4:2:2, the NV16 that
++ * engine 0x15e2 encodes from (mode 0x31), 2 = 4:2:0), and the whole image
++ * as interleaved full-resolution YCbCr, scaled down by 2^hs across and
++ * 2^vs down: libjpeg's DCT scaling for the smaller of the two, nearest
++ * pixel for what remains. A stream libjpeg rejects is a failure, never a
++ * partial image. Uses the libjpeg API the capture models already link
++ * (nikon-z9-jpeg.h).
++ */
++
++#ifndef HW_ARM_NIKON_Z63_JPEGDEC_H
++#define HW_ARM_NIKON_Z63_JPEGDEC_H
++
++#include <setjmp.h>
++#include <jpeglib.h>
++
++typedef struct Z63JpegDecError {
++    struct jpeg_error_mgr api;
++    jmp_buf jump;
++} Z63JpegDecError;
++
++static void z63_jpegdec_error(j_common_ptr codec)
++{
++    longjmp(((Z63JpegDecError *)codec->err)->jump, 1);
++}
++
++static void z63_jpegdec_quiet(j_common_ptr codec, int level)
++{
++}
++
++/* The frame header: width, height and the sampling of a three-component
++ * stream, 1 for 2x1 luma (4:2:2) and 2 for 2x2 (4:2:0). Anything else --
++ * greyscale, 4:4:4, progressive -- is refused: nothing here says what the
++ * cores report for it. */
++static bool z63_jpegdec_info(const uint8_t *in, size_t len, unsigned *width,
++                             unsigned *height, unsigned *format)
++{
++    struct jpeg_decompress_struct d;
++    Z63JpegDecError err;
++    volatile bool ok = false;
++
++    d.err = jpeg_std_error(&err.api);
++    err.api.error_exit = z63_jpegdec_error;
++    err.api.emit_message = z63_jpegdec_quiet;
++    if (setjmp(err.jump)) {
++        jpeg_destroy_decompress(&d);
++        return false;
++    }
++    jpeg_create_decompress(&d);
++    jpeg_mem_src(&d, (unsigned char *)in, len);
++    if (jpeg_read_header(&d, TRUE) == JPEG_HEADER_OK &&
++        d.num_components == 3 && !d.progressive_mode &&
++        d.comp_info[1].h_samp_factor == 1 && d.comp_info[1].v_samp_factor == 1 &&
++        d.comp_info[2].h_samp_factor == 1 && d.comp_info[2].v_samp_factor == 1 &&
++        d.comp_info[0].h_samp_factor == 2 &&
++        (d.comp_info[0].v_samp_factor == 1 || d.comp_info[0].v_samp_factor == 2)) {
++        *width = d.image_width;
++        *height = d.image_height;
++        *format = d.comp_info[0].v_samp_factor;
++        ok = true;
++    }
++    jpeg_destroy_decompress(&d);
++    return ok;
++}
++
++/* The image as width * height * 3 bytes of Y, Cb, Cr, scaled; the caller
++ * frees it with g_free. NULL when libjpeg refuses the stream. */
++static uint8_t *z63_jpegdec_ycc(const uint8_t *in, size_t len, unsigned hs,
++                                unsigned vs, unsigned *width,
++                                unsigned *height)
++{
++    struct jpeg_decompress_struct d;
++    Z63JpegDecError err;
++    uint8_t *volatile full = NULL;
++    uint8_t *out;
++    unsigned dw, dh, fx, fy, ow, oh;
++
++    d.err = jpeg_std_error(&err.api);
++    err.api.error_exit = z63_jpegdec_error;
++    err.api.emit_message = z63_jpegdec_quiet;
++    if (setjmp(err.jump)) {
++        jpeg_destroy_decompress(&d);
++        g_free(full);
++        return NULL;
++    }
++    jpeg_create_decompress(&d);
++    jpeg_mem_src(&d, (unsigned char *)in, len);
++    jpeg_read_header(&d, TRUE);
++    d.out_color_space = JCS_YCbCr;
++    d.scale_num = 1;
++    d.scale_denom = 1u << MIN(hs, vs);
++    jpeg_start_decompress(&d);
++    dw = d.output_width;
++    dh = d.output_height;
++    full = g_malloc((size_t)dw * dh * 3);
++    while (d.output_scanline < dh) {
++        JSAMPROW row = full + (size_t)d.output_scanline * dw * 3;
++
++        jpeg_read_scanlines(&d, &row, 1);
++    }
++    jpeg_finish_decompress(&d);
++    jpeg_destroy_decompress(&d);
++
++    fx = 1u << (hs - MIN(hs, vs));
++    fy = 1u << (vs - MIN(hs, vs));
++    if (fx == 1 && fy == 1) {
++        *width = dw;
++        *height = dh;
++        return full;
++    }
++    ow = (dw + fx - 1) / fx;
++    oh = (dh + fy - 1) / fy;
++    out = g_malloc((size_t)ow * oh * 3);
++    for (unsigned y = 0; y < oh; y++) {
++        for (unsigned x = 0; x < ow; x++) {
++            memcpy(out + ((size_t)y * ow + x) * 3,
++                   full + ((size_t)y * fy * dw + (size_t)x * fx) * 3, 3);
++        }
++    }
++    g_free(full);
++    *width = ow;
++    *height = oh;
++    return out;
++}
++
++#endif /* HW_ARM_NIKON_Z63_JPEGDEC_H */
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index 1034d1e..1875486 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -503,6 +503,11 @@ struct NikonZ9State {
+     qemu_irq engine15e2_jpeg_irq;
+     qemu_irq engine15e2_jpeg_irq1;          /* z63-still-capture: JPEG_1 */
+     unsigned engine15e2_jpeg_bank;          /* the core that owns the job */
++    bool z63_jdec_on;                       /* z63-jpeg-decode */
++    bool z63_jdec_active[2], z63_jdec_start[2], z63_jdec_go[2];
++    unsigned z63_jdec_phase[2];             /* 0 idle, 1 at the header, 2 done */
++    uint32_t z63_jdec_pending[2], z63_jdec_core[2], z63_jdec_hold[2];
++    uint64_t z63_jdec_jobs, z63_jdec_errors;
+     uint32_t engine15e2_jpeg_pending, engine15e2_jpeg_core;
+     uint64_t engine15e2_jpeg_requests, engine15e2_jpeg_jobs, engine15e2_jpeg_bytes;
+     uint64_t engine15e2_jpeg_input_bytes, engine15e2_jpeg_acks, engine15e2_jpeg_core_acks;
+@@ -13319,7 +13324,8 @@ static void engine15e2_jpeg_irq_update(NikonZ9State *s)
+                                               s->engine15e2_jpeg_irq;
+     if (line) {
+         qemu_set_irq(line,
+-            !!(s->engine15e2_jpeg_pending & s->engine15e2_config[s->engine15e2_jpeg_bank][0x484 / 4]));
++            !!((s->engine15e2_jpeg_pending | s->z63_jdec_pending[s->engine15e2_jpeg_bank]) &
++               s->engine15e2_config[s->engine15e2_jpeg_bank][0x484 / 4]));
+     }
+ }
+ 
+@@ -13779,11 +13785,304 @@ static bool engine15e2_zero_field(unsigned off)
+            (off >= 0x4c0 && off <= 0x4d4 && !(off & 3));
+ }
+ 
++/*
++ * Z 6III (z63-jpeg-decode, z9lab_attach.c.in): a core in decode mode.
++ * Playback and the menus' sample pictures decode on the same two cores
++ * that encode the stills. sub_40C9B4CC runs the job: sub_40C0D0F4 resets
++ * the core (+0x004 bit 31, +0x488 bit 31 polled clear), sub_40C0D4B8
++ * writes mode 0x39 (bit 3: decode; bits 0..2: 1, the 4:2:2 the encoder
++ * takes) and the job -- input +0x440 << 4 and its length in 512-byte
++ * blocks at +0x458, scale steps at +0x400/+0x404 bits 2..3, the two
++ * output planes at +0x430/+0x434 << 4 -- and sub_40C0D614 starts it:
++ * +0x004 |= 1, then +0x404 = 0x4000 (input DMA). The handler
++ * sub_40C0C774 takes the core through two stops:
++ *
++ *   status 0x08000000|0x02000000, the header: it reads the size at +0x1c
++ *   (width) and +0x3c, or +0x18 when +0x3c is 0 (height), checks the
++ *   stream's sampling in +0x000 bits 0..2 against the job's (else 0x2800,
++ *   the job retried), programs the output -- pitches +0x410/+0x414,
++ *   width/height +0x418/+0x41c, a source window +0x420..+0x428 -- sets
++ *   +0x400 = 0x4000 (output DMA) and, while +0x038 reads non-zero,
++ *   continues the core with +0x004 |= 2;
++ *
++ *   status 0x0800c000 with +0x02c bit 31, the end, as the encoder's: flags
++ *   1, 0x20000 and 0x40000, whose 0x60001 the job's callback
++ *   (sub_40C9BADC) takes as done, with the width and height the header
++ *   stop left in the job.
++ *
++ * Modelled with libjpeg (nikon-z63-jpegdec.h) on the input as it is in
++ * RAM: the header stop when the start and the input DMA are both set,
++ * the image written as NV16 (or NV12 for a 4:2:0 stream: luma plane, then
++ * Cb/Cr pairs, Cb first, as the encoder reads them) when the continue
++ * and the output DMA are. DECLARED: both stops are immediate; the header
++ * stop also sets status bit 12, which the handler ignores in decode mode
++ * but +0x484 enables, so that the line rises (bits 25/27 are not enabled
++ * there); +0x038 reads 1 between the stops; +0x030/+0x034 read 0; a
++ * stream libjpeg refuses (or that is outside RAM) ends with status
++ * 0x20400000, which the handler takes as an error (flag 0x40). The core
++ * leaves decode mode when +0x000 is written without bit 3.
++ */
++#include "nikon-z63-jpegdec.h"
++
++static void z63_jdec_irq_update(NikonZ9State *s, unsigned b)
++{
++    qemu_irq line = b ? s->engine15e2_jpeg_irq1 : s->engine15e2_jpeg_irq;
++    uint32_t pending = s->z63_jdec_pending[b];
++
++    if (b == s->engine15e2_jpeg_bank) {
++        pending |= s->engine15e2_jpeg_pending;
++    }
++    if (line) {
++        qemu_set_irq(line, !!(pending & s->engine15e2_config[b][0x484 / 4]));
++    }
++}
++
++static void z63_jdec_fail(NikonZ9State *s, unsigned b, const char *why)
++{
++    s->z63_jdec_phase[b] = 0;
++    s->z63_jdec_hold[b] = 0;
++    s->z63_jdec_core[b] = 0;
++    s->z63_jdec_pending[b] |= 0x20400000;
++    s->z63_jdec_errors++;
++    fprintf(stderr, "Z63_JPEG_DECODE core=%u: %s; error status\n", b, why);
++    z63_jdec_irq_update(s, b);
++}
++
++/* The input, read as it is: the blocks +0x458 counts and one more, for the
++ * tail a whole-block count leaves out. The playback job leaves +0x458 at 0
++ * (sub_40C0D4B8 writes 0 for a zero length: the core reads to the EOI);
++ * then up to 32 MiB of RAM from the start. Either way libjpeg stops at the
++ * EOI and the rest is unread. */
++static uint8_t *z63_jdec_input(NikonZ9State *s, unsigned b, size_t *len)
++{
++    const uint32_t *c = s->engine15e2_config[b];
++    uint64_t in = (uint64_t)c[0x440 / 4] << 4;
++    size_t n = c[0x458 / 4] ? ((size_t)c[0x458 / 4] + 1) * 512 : 32 * MiB;
++    size_t least = c[0x458 / 4] ? (size_t)c[0x458 / 4] * 512 : 64 * KiB;
++    uint8_t *buf;
++
++    if (n > 128 * MiB) {
++        return NULL;
++    }
++    while (!dma_ram_range(s, in, n)) {
++        n = c[0x458 / 4] ? n - 512 : n / 2;
++        if (n < least) {
++            return NULL;
++        }
++    }
++    buf = g_malloc(n);
++    if (address_space_read(&address_space_memory, in, MEMTXATTRS_UNSPECIFIED,
++                           buf, n) != MEMTX_OK) {
++        g_free(buf);
++        return NULL;
++    }
++    *len = n;
++    return buf;
++}
++
++static void z63_jdec_header(NikonZ9State *s, unsigned b)
++{
++    uint32_t *c = s->engine15e2_config[b];
++    unsigned hs = (c[0x400 / 4] >> 2) & 3, vs = (c[0x404 / 4] >> 2) & 3;
++    unsigned w, h, format;
++    size_t len;
++    uint8_t *in;
++    bool ok;
++
++    s->z63_jdec_start[b] = false;
++    in = z63_jdec_input(s, b, &len);
++    if (!in) {
++        fprintf(stderr, "Z63_JPEG_DECODE core=%u input %" PRIx64 ", %u blocks\n",
++                b, (uint64_t)c[0x440 / 4] << 4, c[0x458 / 4]);
++        z63_jdec_fail(s, b, "input outside RAM");
++        return;
++    }
++    ok = z63_jpegdec_info(in, len, &w, &h, &format);
++    g_free(in);
++    if (!ok) {
++        z63_jdec_fail(s, b, "not a baseline 4:2:2/4:2:0 JPEG");
++        return;
++    }
++    c[0] = (c[0] & ~7u) | format;
++    c[0x1c / 4] = (w + (1u << hs) - 1) >> hs;
++    c[0x18 / 4] = (h + (1u << vs) - 1) >> vs;
++    c[0x3c / 4] = 0;
++    s->z63_jdec_core[b] = 0;
++    s->z63_jdec_hold[b] = 1;
++    s->z63_jdec_phase[b] = 1;
++    s->z63_jdec_pending[b] |= 0x0a001000;
++    fprintf(stderr, "Z63_JPEG_DECODE core=%u header %ux%u format %u scale 1/%u x 1/%u"
++            " -> %ux%u\n", b, w, h, format, 1u << hs, 1u << vs,
++            c[0x1c / 4], c[0x18 / 4]);
++    z63_jdec_irq_update(s, b);
++}
++
++static void z63_jdec_run(NikonZ9State *s, unsigned b)
++{
++    uint32_t *c = s->engine15e2_config[b];
++    unsigned hs = (c[0x400 / 4] >> 2) & 3, vs = (c[0x404 / 4] >> 2) & 3;
++    unsigned yp = c[0x410 / 4], cp = c[0x414 / 4];
++    unsigned ow = c[0x418 / 4], oh = c[0x41c / 4];
++    unsigned x0 = c[0x420 / 4] ? c[0x424 / 4] : 0;
++    unsigned y0 = c[0x420 / 4] ? c[0x428 / 4] : 0;
++    unsigned format = c[0] & 7, dw, dh, crows;
++    uint64_t ya = (uint64_t)c[0x430 / 4] << 4, ca = (uint64_t)c[0x434 / 4] << 4;
++    uint8_t *in, *img, *yrow, *crow;
++    size_t len;
++
++    s->z63_jdec_go[b] = false;
++    s->z63_jdec_hold[b] = 0;
++    crows = format == 2 ? (oh + 1) / 2 : oh;
++    if (!ow || !oh || ow > 16384 || oh > 16384 || yp < ow || cp < ((ow + 1) & ~1u) ||
++        yp > 32768 || cp > 32768 || (format != 1 && format != 2) ||
++        !dma_ram_range(s, ya, (uint64_t)yp * (oh - 1) + ow) ||
++        !dma_ram_range(s, ca, (uint64_t)cp * (crows - 1) + ((ow + 1) & ~1u))) {
++        z63_jdec_fail(s, b, "output geometry outside RAM");
++        return;
++    }
++    in = z63_jdec_input(s, b, &len);
++    if (!in) {
++        z63_jdec_fail(s, b, "input outside RAM");
++        return;
++    }
++    img = z63_jpegdec_ycc(in, len, hs, vs, &dw, &dh);
++    g_free(in);
++    if (!img) {
++        z63_jdec_fail(s, b, "libjpeg refused the stream");
++        return;
++    }
++    yrow = g_malloc(ow);
++    crow = g_malloc((ow + 1) & ~1u);
++    for (unsigned r = 0; r < oh; r++) {
++        const uint8_t *src = img + (size_t)MIN(y0 + r, dh - 1) * dw * 3;
++
++        for (unsigned x = 0; x < ow; x++) {
++            yrow[x] = src[(size_t)MIN(x0 + x, dw - 1) * 3];
++        }
++        address_space_write(&address_space_memory, ya + (uint64_t)r * yp,
++                            MEMTXATTRS_UNSPECIFIED, yrow, ow);
++        if (format == 2 && (r & 1)) {
++            continue;
++        }
++        for (unsigned x = 0; x < ow; x += 2) {
++            const uint8_t *p = src + (size_t)MIN(x0 + x, dw - 1) * 3;
++
++            crow[x] = p[1];
++            crow[x + 1] = p[2];
++        }
++        address_space_write(&address_space_memory,
++                            ca + (uint64_t)(format == 2 ? r / 2 : r) * cp,
++                            MEMTXATTRS_UNSPECIFIED, crow, (ow + 1) & ~1u);
++    }
++    g_free(yrow);
++    g_free(crow);
++    g_free(img);
++    c[0x470 / 4] = oh;
++    s->z63_jdec_core[b] = 0x80000000;
++    s->z63_jdec_pending[b] |= 0x0800c000;
++    s->z63_jdec_phase[b] = 2;
++    s->z63_jdec_jobs++;
++    fprintf(stderr, "Z63_JPEG_DECODE core=%u image %ux%u at (%u,%u) of %ux%u -> y=%"
++            PRIx64 "/%u c=%" PRIx64 "/%u format %u\n", b, ow, oh, x0, y0, dw, dh,
++            ya, yp, ca, cp, format);
++    z63_jdec_irq_update(s, b);
++}
++
++static bool z63_jdec_read(NikonZ9State *s, unsigned b, unsigned off,
++                          unsigned size, uint64_t *value)
++{
++    if (!s->z63_jdec_on || b > 1 || !s->z63_jdec_active[b]) {
++        return false;
++    }
++    if (size != 4 || (off & 3)) {
++        unknown_access(s, (b ? 0x15e21000 : 0x15e20000) + off, 0, size, false);
++        *value = 0;
++        return true;
++    }
++    switch (off) {
++    case 0x02c: *value = s->z63_jdec_core[b]; break;
++    case 0x030: case 0x034: case 0x488: *value = 0; break;
++    case 0x038: *value = s->z63_jdec_hold[b]; break;
++    case 0x480: *value = s->z63_jdec_pending[b]; break;
++    default: *value = s->engine15e2_config[b][off / 4]; break;
++    }
++    return true;
++}
++
++static bool z63_jdec_write(NikonZ9State *s, unsigned b, unsigned off,
++                           uint64_t value, unsigned size)
++{
++    uint32_t *c = s->engine15e2_config[b];
++
++    if (!s->z63_jdec_on || b > 1) {
++        return false;
++    }
++    if (off == 0) {
++        if (size != 4 || !(value & 8) || (value & ~0xffull)) {
++            s->z63_jdec_active[b] = false;      /* back to the encoder */
++            return false;
++        }
++        if (!s->z63_jdec_active[b]) {
++            s->z63_jdec_active[b] = true;
++            s->z63_jdec_phase[b] = 0;
++            s->z63_jdec_start[b] = s->z63_jdec_go[b] = false;
++            s->z63_jdec_pending[b] = s->z63_jdec_core[b] = s->z63_jdec_hold[b] = 0;
++        }
++        c[0] = value;
++        return true;
++    }
++    if (!s->z63_jdec_active[b]) {
++        return false;
++    }
++    if (size != 4 || (off & 3) || off >= 0x500) {
++        unknown_access(s, (b ? 0x15e21000 : 0x15e20000) + off, value, size, true);
++        return true;
++    }
++    switch (off) {
++    case 0x004:
++        if (value & 0x80000000) {               /* reset */
++            s->z63_jdec_phase[b] = 0;
++            s->z63_jdec_start[b] = s->z63_jdec_go[b] = false;
++            s->z63_jdec_hold[b] = s->z63_jdec_core[b] = 0;
++            c[1] = 0;
++            break;
++        }
++        if (value & 1) {
++            s->z63_jdec_start[b] = true;
++        }
++        if ((value & 2) && s->z63_jdec_phase[b] == 1) {
++            s->z63_jdec_go[b] = true;
++        }
++        c[1] = value & ~3u;
++        break;
++    case 0x02c:
++        s->z63_jdec_core[b] &= value;           /* the handler writes ~bits */
++        break;
++    case 0x480:
++        s->z63_jdec_pending[b] &= ~value;
++        break;
++    default:
++        c[off / 4] = value;
++        break;
++    }
++    if (s->z63_jdec_start[b] && s->z63_jdec_phase[b] != 1 &&
++        (c[0x404 / 4] & 0xc000) == 0x4000) {
++        z63_jdec_header(s, b);
++    }
++    if (s->z63_jdec_go[b] && s->z63_jdec_phase[b] == 1 &&
++        (c[0x400 / 4] & 0xc000) == 0x4000) {
++        z63_jdec_run(s, b);
++    }
++    z63_jdec_irq_update(s, b);
++    return true;
++}
++
+ static bool engine15e2_config_read(NikonZ9State *s, hwaddr addr,
+                                  unsigned size, uint64_t *value)
+ {
+     unsigned b, off; uint32_t mask; bool readable;
+     if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
++    if (z63_jdec_read(s, b, off, size, value)) { return true; }
+     if (engine15e2_jpeg_read(s, b, off, size, value)) { return true; }
+     if (s->engine15e2_jpeg_model && (b == 0 || (s->z63_still && b == 1)) &&
+         (off == 0x484 || off == 0x490 || off == 0x494)) {
+@@ -13809,6 +14108,7 @@ static bool engine15e2_config_write(NikonZ9State *s, hwaddr addr,
+ {
+     unsigned b, off; uint32_t mask; bool readable;
+     if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
++    if (z63_jdec_write(s, b, off, value, size)) { return true; }
+     if (engine15e2_jpeg_write(s, b, off, value, size)) { return true; }
+     if (s->engine15e2_jpeg_model && b == s->engine15e2_jpeg_bank &&
+         (s->engine15e2_jpeg_requested || s->engine15e2_jpeg_pending) && off != 0x484) {
+@@ -18781,6 +19081,17 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+  * missing parameter; that a reset keeps submitted parameters; that a held
+  * capture instance has stopped. The edits are in import_z9lab.py (section
+  * 8), nikon-z9-d980.h and nikon-z9-capture-nv16.h.
++ *
++ * z63-jpeg-decode (off by default; needs engine15e2-jpeg-model and
++ * engine15e2-config-model): the JPEG cores' decode mode, which playback
++ * and the menus' sample pictures (Setup > monitor colour balance) use on
++ * the cores that encode the stills -- mode 0x39 written by sub_40C0D4B8,
++ * which the encoder's configuration model refuses. A core written a mode
++ * with bit 3 belongs to the decode model until a mode without it; the
++ * model decodes the stream in RAM with libjpeg and gives the handler
++ * sub_40C0C774 its two stops, the header and the end. The protocol, and
++ * what is DECLARED about it, is above z63_jdec_irq_update (import_z9lab.py
++ * section 9, nikon-z63-jpegdec.h).
+  */
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+@@ -18805,6 +19116,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     bool sensor_vd = false;
+     bool lane0_ack = false;
+     bool still = false;
++    bool jpeg_decode = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -18863,6 +19175,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             still = !strcmp(kv[1], "on");
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-jpeg-decode")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-jpeg-decode wants on or off");
++                goto fail;
++            }
++            jpeg_decode = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-sensor-vd")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-sensor-vd wants on or off");
+@@ -19027,6 +19347,12 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         goto fail;
+     }
+     s->z63_still = still;
++    if (jpeg_decode && (!s->engine15e2_jpeg_model || !s->engine15e2_config_model)) {
++        error_setg(errp, "z9-capture: z63-jpeg-decode needs "
++                   "engine15e2-jpeg-model and engine15e2-config-model");
++        goto fail;
++    }
++    s->z63_jdec_on = jpeg_decode;
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index a6ef476..e8bea69 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -194,7 +194,9 @@ static const char z63_z9lab_default_props[] =
+     "capture-nv16-pipeline-model=on;"
+     "engine1542-ram-input-control-model=on;"
+     "capture-thumbnail-nv16-model=on;"
+-    "z63-still-capture=on";
++    "z63-still-capture=on;"
++    /* Playback: the JPEG cores' decode mode (attachment section). */
++    "z63-jpeg-decode=on";
+ 
+ #define Z63_Z9LAB_LO 0x15000000ULL
+ #define Z63_Z9LAB_HI 0x16100000ULL
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index 5cd2638..b1a2884 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -45,6 +45,10 @@ The edits, each asserted to match exactly once (or the stated count):
+      and in nikon-z9-d980.h the single still frame made at the front's
+      request while the frame timing runs, the periodic path held off, and
+      the upper unit's frame end with it. Off, the models behave as before.
++  9. the JPEG cores' decode mode, behind z63-jpeg-decode (documented in the
++     attachment and above z63_jdec_irq_update): a core written a decode
++     mode is decoded with libjpeg (hw/arm/nikon-z63-jpegdec.h, the board's
++     own) and given the handler's header and end stops. Off, as before.
+ 
+ Nothing else in the files is changed. Re-run after updating ../z9-qemu and
+ review the diff; a failed assertion means the source moved under an edit.
+@@ -520,6 +524,336 @@ edit("""        s->primary_reset_previous_units &= ~value;
+         if (s->primary_d980_single_model && (value & 0x4000)) {
+ """)
+ 
++# The JPEG cores' decode mode (z63-jpeg-decode, 9): playback and the menus'
++# sample pictures decode with the same cores, mode 0x39 (sub_40C0D4B8).
++edit("    unsigned engine15e2_jpeg_bank;          /* the core that owns the job */\n",
++     "    unsigned engine15e2_jpeg_bank;          /* the core that owns the job */\n"
++     "    bool z63_jdec_on;                       /* z63-jpeg-decode */\n"
++     "    bool z63_jdec_active[2], z63_jdec_start[2], z63_jdec_go[2];\n"
++     "    unsigned z63_jdec_phase[2];             /* 0 idle, 1 at the header, 2 done */\n"
++     "    uint32_t z63_jdec_pending[2], z63_jdec_core[2], z63_jdec_hold[2];\n"
++     "    uint64_t z63_jdec_jobs, z63_jdec_errors;\n")
++edit("""        qemu_set_irq(line,
++            !!(s->engine15e2_jpeg_pending & s->engine15e2_config[s->engine15e2_jpeg_bank][0x484 / 4]));
++    }
++}
++""", """        qemu_set_irq(line,
++            !!((s->engine15e2_jpeg_pending | s->z63_jdec_pending[s->engine15e2_jpeg_bank]) &
++               s->engine15e2_config[s->engine15e2_jpeg_bank][0x484 / 4]));
++    }
++}
++""")
++edit("""static bool engine15e2_config_read(NikonZ9State *s, hwaddr addr,
++                                 unsigned size, uint64_t *value)
++{
++    unsigned b, off; uint32_t mask; bool readable;
++    if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
++""", """/*
++ * Z 6III (z63-jpeg-decode, z9lab_attach.c.in): a core in decode mode.
++ * Playback and the menus' sample pictures decode on the same two cores
++ * that encode the stills. sub_40C9B4CC runs the job: sub_40C0D0F4 resets
++ * the core (+0x004 bit 31, +0x488 bit 31 polled clear), sub_40C0D4B8
++ * writes mode 0x39 (bit 3: decode; bits 0..2: 1, the 4:2:2 the encoder
++ * takes) and the job -- input +0x440 << 4 and its length in 512-byte
++ * blocks at +0x458, scale steps at +0x400/+0x404 bits 2..3, the two
++ * output planes at +0x430/+0x434 << 4 -- and sub_40C0D614 starts it:
++ * +0x004 |= 1, then +0x404 = 0x4000 (input DMA). The handler
++ * sub_40C0C774 takes the core through two stops:
++ *
++ *   status 0x08000000|0x02000000, the header: it reads the size at +0x1c
++ *   (width) and +0x3c, or +0x18 when +0x3c is 0 (height), checks the
++ *   stream's sampling in +0x000 bits 0..2 against the job's (else 0x2800,
++ *   the job retried), programs the output -- pitches +0x410/+0x414,
++ *   width/height +0x418/+0x41c, a source window +0x420..+0x428 -- sets
++ *   +0x400 = 0x4000 (output DMA) and, while +0x038 reads non-zero,
++ *   continues the core with +0x004 |= 2;
++ *
++ *   status 0x0800c000 with +0x02c bit 31, the end, as the encoder's: flags
++ *   1, 0x20000 and 0x40000, whose 0x60001 the job's callback
++ *   (sub_40C9BADC) takes as done, with the width and height the header
++ *   stop left in the job.
++ *
++ * Modelled with libjpeg (nikon-z63-jpegdec.h) on the input as it is in
++ * RAM: the header stop when the start and the input DMA are both set,
++ * the image written as NV16 (or NV12 for a 4:2:0 stream: luma plane, then
++ * Cb/Cr pairs, Cb first, as the encoder reads them) when the continue
++ * and the output DMA are. DECLARED: both stops are immediate; the header
++ * stop also sets status bit 12, which the handler ignores in decode mode
++ * but +0x484 enables, so that the line rises (bits 25/27 are not enabled
++ * there); +0x038 reads 1 between the stops; +0x030/+0x034 read 0; a
++ * stream libjpeg refuses (or that is outside RAM) ends with status
++ * 0x20400000, which the handler takes as an error (flag 0x40). The core
++ * leaves decode mode when +0x000 is written without bit 3.
++ */
++#include "nikon-z63-jpegdec.h"
++
++static void z63_jdec_irq_update(NikonZ9State *s, unsigned b)
++{
++    qemu_irq line = b ? s->engine15e2_jpeg_irq1 : s->engine15e2_jpeg_irq;
++    uint32_t pending = s->z63_jdec_pending[b];
++
++    if (b == s->engine15e2_jpeg_bank) {
++        pending |= s->engine15e2_jpeg_pending;
++    }
++    if (line) {
++        qemu_set_irq(line, !!(pending & s->engine15e2_config[b][0x484 / 4]));
++    }
++}
++
++static void z63_jdec_fail(NikonZ9State *s, unsigned b, const char *why)
++{
++    s->z63_jdec_phase[b] = 0;
++    s->z63_jdec_hold[b] = 0;
++    s->z63_jdec_core[b] = 0;
++    s->z63_jdec_pending[b] |= 0x20400000;
++    s->z63_jdec_errors++;
++    fprintf(stderr, "Z63_JPEG_DECODE core=%u: %s; error status\\n", b, why);
++    z63_jdec_irq_update(s, b);
++}
++
++/* The input, read as it is: the blocks +0x458 counts and one more, for the
++ * tail a whole-block count leaves out. The playback job leaves +0x458 at 0
++ * (sub_40C0D4B8 writes 0 for a zero length: the core reads to the EOI);
++ * then up to 32 MiB of RAM from the start. Either way libjpeg stops at the
++ * EOI and the rest is unread. */
++static uint8_t *z63_jdec_input(NikonZ9State *s, unsigned b, size_t *len)
++{
++    const uint32_t *c = s->engine15e2_config[b];
++    uint64_t in = (uint64_t)c[0x440 / 4] << 4;
++    size_t n = c[0x458 / 4] ? ((size_t)c[0x458 / 4] + 1) * 512 : 32 * MiB;
++    size_t least = c[0x458 / 4] ? (size_t)c[0x458 / 4] * 512 : 64 * KiB;
++    uint8_t *buf;
++
++    if (n > 128 * MiB) {
++        return NULL;
++    }
++    while (!dma_ram_range(s, in, n)) {
++        n = c[0x458 / 4] ? n - 512 : n / 2;
++        if (n < least) {
++            return NULL;
++        }
++    }
++    buf = g_malloc(n);
++    if (address_space_read(&address_space_memory, in, MEMTXATTRS_UNSPECIFIED,
++                           buf, n) != MEMTX_OK) {
++        g_free(buf);
++        return NULL;
++    }
++    *len = n;
++    return buf;
++}
++
++static void z63_jdec_header(NikonZ9State *s, unsigned b)
++{
++    uint32_t *c = s->engine15e2_config[b];
++    unsigned hs = (c[0x400 / 4] >> 2) & 3, vs = (c[0x404 / 4] >> 2) & 3;
++    unsigned w, h, format;
++    size_t len;
++    uint8_t *in;
++    bool ok;
++
++    s->z63_jdec_start[b] = false;
++    in = z63_jdec_input(s, b, &len);
++    if (!in) {
++        fprintf(stderr, "Z63_JPEG_DECODE core=%u input %" PRIx64 ", %u blocks\\n",
++                b, (uint64_t)c[0x440 / 4] << 4, c[0x458 / 4]);
++        z63_jdec_fail(s, b, "input outside RAM");
++        return;
++    }
++    ok = z63_jpegdec_info(in, len, &w, &h, &format);
++    g_free(in);
++    if (!ok) {
++        z63_jdec_fail(s, b, "not a baseline 4:2:2/4:2:0 JPEG");
++        return;
++    }
++    c[0] = (c[0] & ~7u) | format;
++    c[0x1c / 4] = (w + (1u << hs) - 1) >> hs;
++    c[0x18 / 4] = (h + (1u << vs) - 1) >> vs;
++    c[0x3c / 4] = 0;
++    s->z63_jdec_core[b] = 0;
++    s->z63_jdec_hold[b] = 1;
++    s->z63_jdec_phase[b] = 1;
++    s->z63_jdec_pending[b] |= 0x0a001000;
++    fprintf(stderr, "Z63_JPEG_DECODE core=%u header %ux%u format %u scale 1/%u x 1/%u"
++            " -> %ux%u\\n", b, w, h, format, 1u << hs, 1u << vs,
++            c[0x1c / 4], c[0x18 / 4]);
++    z63_jdec_irq_update(s, b);
++}
++
++static void z63_jdec_run(NikonZ9State *s, unsigned b)
++{
++    uint32_t *c = s->engine15e2_config[b];
++    unsigned hs = (c[0x400 / 4] >> 2) & 3, vs = (c[0x404 / 4] >> 2) & 3;
++    unsigned yp = c[0x410 / 4], cp = c[0x414 / 4];
++    unsigned ow = c[0x418 / 4], oh = c[0x41c / 4];
++    unsigned x0 = c[0x420 / 4] ? c[0x424 / 4] : 0;
++    unsigned y0 = c[0x420 / 4] ? c[0x428 / 4] : 0;
++    unsigned format = c[0] & 7, dw, dh, crows;
++    uint64_t ya = (uint64_t)c[0x430 / 4] << 4, ca = (uint64_t)c[0x434 / 4] << 4;
++    uint8_t *in, *img, *yrow, *crow;
++    size_t len;
++
++    s->z63_jdec_go[b] = false;
++    s->z63_jdec_hold[b] = 0;
++    crows = format == 2 ? (oh + 1) / 2 : oh;
++    if (!ow || !oh || ow > 16384 || oh > 16384 || yp < ow || cp < ((ow + 1) & ~1u) ||
++        yp > 32768 || cp > 32768 || (format != 1 && format != 2) ||
++        !dma_ram_range(s, ya, (uint64_t)yp * (oh - 1) + ow) ||
++        !dma_ram_range(s, ca, (uint64_t)cp * (crows - 1) + ((ow + 1) & ~1u))) {
++        z63_jdec_fail(s, b, "output geometry outside RAM");
++        return;
++    }
++    in = z63_jdec_input(s, b, &len);
++    if (!in) {
++        z63_jdec_fail(s, b, "input outside RAM");
++        return;
++    }
++    img = z63_jpegdec_ycc(in, len, hs, vs, &dw, &dh);
++    g_free(in);
++    if (!img) {
++        z63_jdec_fail(s, b, "libjpeg refused the stream");
++        return;
++    }
++    yrow = g_malloc(ow);
++    crow = g_malloc((ow + 1) & ~1u);
++    for (unsigned r = 0; r < oh; r++) {
++        const uint8_t *src = img + (size_t)MIN(y0 + r, dh - 1) * dw * 3;
++
++        for (unsigned x = 0; x < ow; x++) {
++            yrow[x] = src[(size_t)MIN(x0 + x, dw - 1) * 3];
++        }
++        address_space_write(&address_space_memory, ya + (uint64_t)r * yp,
++                            MEMTXATTRS_UNSPECIFIED, yrow, ow);
++        if (format == 2 && (r & 1)) {
++            continue;
++        }
++        for (unsigned x = 0; x < ow; x += 2) {
++            const uint8_t *p = src + (size_t)MIN(x0 + x, dw - 1) * 3;
++
++            crow[x] = p[1];
++            crow[x + 1] = p[2];
++        }
++        address_space_write(&address_space_memory,
++                            ca + (uint64_t)(format == 2 ? r / 2 : r) * cp,
++                            MEMTXATTRS_UNSPECIFIED, crow, (ow + 1) & ~1u);
++    }
++    g_free(yrow);
++    g_free(crow);
++    g_free(img);
++    c[0x470 / 4] = oh;
++    s->z63_jdec_core[b] = 0x80000000;
++    s->z63_jdec_pending[b] |= 0x0800c000;
++    s->z63_jdec_phase[b] = 2;
++    s->z63_jdec_jobs++;
++    fprintf(stderr, "Z63_JPEG_DECODE core=%u image %ux%u at (%u,%u) of %ux%u -> y=%"
++            PRIx64 "/%u c=%" PRIx64 "/%u format %u\\n", b, ow, oh, x0, y0, dw, dh,
++            ya, yp, ca, cp, format);
++    z63_jdec_irq_update(s, b);
++}
++
++static bool z63_jdec_read(NikonZ9State *s, unsigned b, unsigned off,
++                          unsigned size, uint64_t *value)
++{
++    if (!s->z63_jdec_on || b > 1 || !s->z63_jdec_active[b]) {
++        return false;
++    }
++    if (size != 4 || (off & 3)) {
++        unknown_access(s, (b ? 0x15e21000 : 0x15e20000) + off, 0, size, false);
++        *value = 0;
++        return true;
++    }
++    switch (off) {
++    case 0x02c: *value = s->z63_jdec_core[b]; break;
++    case 0x030: case 0x034: case 0x488: *value = 0; break;
++    case 0x038: *value = s->z63_jdec_hold[b]; break;
++    case 0x480: *value = s->z63_jdec_pending[b]; break;
++    default: *value = s->engine15e2_config[b][off / 4]; break;
++    }
++    return true;
++}
++
++static bool z63_jdec_write(NikonZ9State *s, unsigned b, unsigned off,
++                           uint64_t value, unsigned size)
++{
++    uint32_t *c = s->engine15e2_config[b];
++
++    if (!s->z63_jdec_on || b > 1) {
++        return false;
++    }
++    if (off == 0) {
++        if (size != 4 || !(value & 8) || (value & ~0xffull)) {
++            s->z63_jdec_active[b] = false;      /* back to the encoder */
++            return false;
++        }
++        if (!s->z63_jdec_active[b]) {
++            s->z63_jdec_active[b] = true;
++            s->z63_jdec_phase[b] = 0;
++            s->z63_jdec_start[b] = s->z63_jdec_go[b] = false;
++            s->z63_jdec_pending[b] = s->z63_jdec_core[b] = s->z63_jdec_hold[b] = 0;
++        }
++        c[0] = value;
++        return true;
++    }
++    if (!s->z63_jdec_active[b]) {
++        return false;
++    }
++    if (size != 4 || (off & 3) || off >= 0x500) {
++        unknown_access(s, (b ? 0x15e21000 : 0x15e20000) + off, value, size, true);
++        return true;
++    }
++    switch (off) {
++    case 0x004:
++        if (value & 0x80000000) {               /* reset */
++            s->z63_jdec_phase[b] = 0;
++            s->z63_jdec_start[b] = s->z63_jdec_go[b] = false;
++            s->z63_jdec_hold[b] = s->z63_jdec_core[b] = 0;
++            c[1] = 0;
++            break;
++        }
++        if (value & 1) {
++            s->z63_jdec_start[b] = true;
++        }
++        if ((value & 2) && s->z63_jdec_phase[b] == 1) {
++            s->z63_jdec_go[b] = true;
++        }
++        c[1] = value & ~3u;
++        break;
++    case 0x02c:
++        s->z63_jdec_core[b] &= value;           /* the handler writes ~bits */
++        break;
++    case 0x480:
++        s->z63_jdec_pending[b] &= ~value;
++        break;
++    default:
++        c[off / 4] = value;
++        break;
++    }
++    if (s->z63_jdec_start[b] && s->z63_jdec_phase[b] != 1 &&
++        (c[0x404 / 4] & 0xc000) == 0x4000) {
++        z63_jdec_header(s, b);
++    }
++    if (s->z63_jdec_go[b] && s->z63_jdec_phase[b] == 1 &&
++        (c[0x400 / 4] & 0xc000) == 0x4000) {
++        z63_jdec_run(s, b);
++    }
++    z63_jdec_irq_update(s, b);
++    return true;
++}
++
++static bool engine15e2_config_read(NikonZ9State *s, hwaddr addr,
++                                 unsigned size, uint64_t *value)
++{
++    unsigned b, off; uint32_t mask; bool readable;
++    if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
++    if (z63_jdec_read(s, b, off, size, value)) { return true; }
++""")
++edit("""    if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
++    if (engine15e2_jpeg_write(s, b, off, value, size)) { return true; }
++""", """    if (!engine15e2_config_register(s, addr, &b, &off, &mask, &readable)) { return false; }
++    if (z63_jdec_write(s, b, off, value, size)) { return true; }
++    if (engine15e2_jpeg_write(s, b, off, value, size)) { return true; }
++""")
++
+ # nikon-z9-pixels.h, with its own z63 edits (7).
+ pixels = (src / "nikon-z9-pixels.h").read_text()
+ 
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 50db88d..8c8fe9a 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -522,6 +522,17 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+  * missing parameter; that a reset keeps submitted parameters; that a held
+  * capture instance has stopped. The edits are in import_z9lab.py (section
+  * 8), nikon-z9-d980.h and nikon-z9-capture-nv16.h.
++ *
++ * z63-jpeg-decode (off by default; needs engine15e2-jpeg-model and
++ * engine15e2-config-model): the JPEG cores' decode mode, which playback
++ * and the menus' sample pictures (Setup > monitor colour balance) use on
++ * the cores that encode the stills -- mode 0x39 written by sub_40C0D4B8,
++ * which the encoder's configuration model refuses. A core written a mode
++ * with bit 3 belongs to the decode model until a mode without it; the
++ * model decodes the stream in RAM with libjpeg and gives the handler
++ * sub_40C0C774 its two stops, the header and the end. The protocol, and
++ * what is DECLARED about it, is above z63_jdec_irq_update (import_z9lab.py
++ * section 9, nikon-z63-jpegdec.h).
+  */
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+@@ -546,6 +557,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     bool sensor_vd = false;
+     bool lane0_ack = false;
+     bool still = false;
++    bool jpeg_decode = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -604,6 +616,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             still = !strcmp(kv[1], "on");
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-jpeg-decode")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-jpeg-decode wants on or off");
++                goto fail;
++            }
++            jpeg_decode = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-sensor-vd")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-sensor-vd wants on or off");
+@@ -768,6 +788,12 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         goto fail;
+     }
+     s->z63_still = still;
++    if (jpeg_decode && (!s->engine15e2_jpeg_model || !s->engine15e2_config_model)) {
++        error_setg(errp, "z9-capture: z63-jpeg-decode needs "
++                   "engine15e2-jpeg-model and engine15e2-config-model");
++        goto fail;
++    }
++    s->z63_jdec_on = jpeg_decode;
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,67 @@
+From 4b84a7e0c81629a7f233e1fe16beba7ba796d2d2 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 13:35:20 +0000
+Subject: [PATCH 27/47] Z 6III: a RAW frame owed by a capture tick is delivered
+ after group 0 stops
+
+847c7f4 gated raw_pipeline_tick() on the sensor's capture timing
+(z63-lv-frame-done: no frame while event_timing_active is false). Live
+view's sensor-mode cycle turns 1508 group 0 off right after a capture
+tick -- sub_41169F08 -> sub_4116E6A8(0), every other frame while the
+meter asks for its long-exposure simulation -- so the frame that tick
+owed (z63_raw_owed) reached the gate with the timing already off and was
+dropped. Its frame job then never got its completions, and live view
+stopped after a few seconds.
+
+The owed count is what pairs a capture tick with its frame; the gate
+only repeated it, wrongly, so import_z9lab.py no longer adds it. A tick
+still never produces more than it owes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z9-pixels.h  |  5 -----
+ z63-tools/import_z9lab.py | 12 ------------
+ 2 files changed, 17 deletions(-)
+
+diff --git a/hw/arm/nikon-z9-pixels.h b/hw/arm/nikon-z9-pixels.h
+index f05ef6f..ee0fab8 100644
+--- a/hw/arm/nikon-z9-pixels.h
++++ b/hw/arm/nikon-z9-pixels.h
+@@ -133,11 +133,6 @@ static void raw_pipeline_tick(void *opaque)
+     if (s->primary_stopped_source_reset_model && !s->event_timing_active) {
+         return;
+     }
+-    /* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): the same gate -- a
+-     * frame only while the sensor's capture timing runs. */
+-    if (s->raw_pipeline_output_done && !s->event_timing_active) {
+-        return;
+-    }
+     /* 40c26780 selects one of two banks. 40c26790/26824 then write four
+      * rows at +200 + bank*200. Original40e9b928 refills the other bank
+      * only after C0 bit3, via40e8b0e8. Keep batch ownership until all
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index b4df3eb..f199667 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -303,18 +303,6 @@ pedit("""    if (!s->raw_pipeline_model) { return; }
+         timer_mod(s->raw_pipeline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
+     }
+ """)
+-pedit("""    if (s->primary_stopped_source_reset_model && !s->event_timing_active) {
+-        return;
+-    }
+-""", """    if (s->primary_stopped_source_reset_model && !s->event_timing_active) {
+-        return;
+-    }
+-    /* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): the same gate -- a
+-     * frame only while the sensor's capture timing runs. */
+-    if (s->raw_pipeline_output_done && !s->event_timing_active) {
+-        return;
+-    }
+-""")
+ pedit("""    s->raw_pipeline_frames++;
+     s->raw_pipeline_bytes += total;
+ """, """    /* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): the frame's other
+-- 
+2.55.0
+

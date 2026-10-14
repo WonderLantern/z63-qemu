@@ -1,0 +1,408 @@
+From c6e2ed4c166d7db0a3f1ba8eae54348346cd6d72 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Sat, 10 Oct 2026 10:58:39 +0000
+Subject: [PATCH 03/47] Z 6III: hand Linux over when the RTOS is ready, not at
+ reset
+
+LaMainApp attaches to the share_mem directory the RTOS builds: sub_405B08
+does memcmp(page + 8, "MASTER", 7) and returns NULL on mismatch, at which
+point CIpcPorting_Initialize prints "...[105], error." and the IPC layer is
+dead for the rest of that run.
+
+Linux reaches userspace in about 3 seconds. The emulated RTOS needs minutes.
+The stand-in started Linux at machine reset, so Linux always lost a race the
+body never has -- on a camera the RTOS has published that directory long
+before Linux userspace exists. Proved rather than assumed: killing LaMainApp
+and re-running it once the RTOS was up makes the error disappear.
+
+-machine li-wait-ipc (on by default) now holds CPU3 until that header
+appears, and the hand-off goes through async_run_on_cpu because it can now
+fire from a timer while the machine is running -- writing another vCPU's
+env.pc from the timer thread produced a core fetching from 0x200.
+
+Measured after: Linux still boots to a BusyBox prompt, and
+CIpcPorting_Initialize no longer fails at all.
+
+Also: z63-tools/guest_sh.py, which runs commands in the guest's shell over
+the serial port. That is how all of the above was established -- /proc
+showed LaMainApp with /dev/oscom_memhelper open and exactly one page of
+share_mem mapped at a14c00000, which is what pointed at the attach rather
+than at the mmap or the ioctl.
+
+Correction recorded in plan.md: menu drawing is the RTOS's job, not
+LaMainApp's, so the display path does not run through the Linux application
+and this fix, while real, is not what opens it. The display's own state is
+written up there: sub_402B20EC writes the output size and never runs, while
+the display subsystem's event loop is alive and still entering new blocks at
+99.7% of the way through a run -- progressing, not deadlocked, and simply
+never given a mode-set event.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ docs/plan.md               |  24 +++++++
+ hw/arm/nikon-z63.c         | 125 ++++++++++++++++++++++++++++++++++++-
+ z63-tools/guest_sh.py      |  79 +++++++++++++++++++++++
+ z63-tools/smoke.sh         |   6 +-
+ z63-tools/where_blocked.py |  11 +++-
+ 5 files changed, 240 insertions(+), 5 deletions(-)
+ create mode 100755 z63-tools/guest_sh.py
+
+diff --git a/docs/plan.md b/docs/plan.md
+index a5bb92d..d4861ad 100644
+--- a/docs/plan.md
++++ b/docs/plan.md
+@@ -92,10 +92,34 @@ Exit: the RTOS gets past `sub_402B0300` and new application code executes.
+ >   the only thing that boots Linux today. Finding the real trigger is the
+ >   next structural piece: it is probably the IPC bridge, and
+ >   `nikon-ipc-bridge` has both ends of that path already.
++> * **The IPC hand-off was ordered wrong, and that is fixed.** LaMainApp
++>   attaches to the share_mem directory the RTOS builds -- `sub_405B08`
++>   does `memcmp(page + 8, "MASTER", 7)` and returns NULL on mismatch, at
++>   which point `CIpcPorting_Initialize` prints `...[105], error.` and the
++>   IPC layer is dead for that run. Linux reaches userspace in ~3 s; the
++>   emulated RTOS needs far longer; the stand-in started Linux at machine
++>   reset, so Linux always lost a race the body never has. Proved by
++>   killing LaMainApp and re-running it once the RTOS was up: the error
++>   disappears. `-machine li-wait-ipc` (on by default) now holds CPU3 until
++>   that header appears. **This is not the display's gate** -- see below --
++>   but it was wrong on its own terms.
+ > * **The display still has no frame.** The scanout refuses with `output
+ >   size is 0x0 (mode 0, from +0x132c/+0x1328)` -- unchanged. The crank has
+ >   not yet reached whatever writes it. That is Phase 3 and it is now the
+ >   top of the list.
++>
++>   **Menu drawing is the RTOS's job, not LaMainApp's** (corrected by the
++>   project owner). So the display path does not run through the Linux
++>   application at all, and the IPC fix above, while real, does not open
++>   it. What is known: `sub_402B20EC` writes the output size at +0x132c /
++>   +0x1328 and **never runs**; its call chain tops out after four
++>   functions in handlers that are only reached indirectly; the display
++>   subsystem's own event loop (`sub_402BCEB8`, a three-way dispatch) *is*
++>   alive and has taken all three of its branches; and the subsystem was
++>   still entering blocks it had never entered before at 99.7% of the way
++>   through a 60 s run. So it is progressing, not deadlocked -- it has not
++>   yet been given the event that sets a mode. The open question is which
++>   RTOS task sends it and what that task is waiting for.
+ 
+ 
+ Repeat until the GUI task runs: locate the block, identify what it waits for,
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index bd0266f..f7a5a93 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -346,6 +346,38 @@ static const Z63ImagePlacement z63_image_in_dram[] = {
+ #define Z63_LI_INITRD_ADDR  0x0A09000000ULL  /* above the device tree */
+ #define Z63_LI_BLOCK_SHIFT  11               /* container blocks are 0x800 */
+ 
++/*
++ * share_mem, and why the Linux hand-off waits for it.
++ *
++ * The RTOS and the camera application talk through a reserved DRAM window
++ * the device tree calls `share_mem`. The RTOS builds a named-object
++ * directory at its base, and the application attaches to it by checking
++ * for the header: `sub_405B08` in LaMainApp does
++ * `memcmp(page + 8, "MASTER", 7)` and returns NULL on mismatch, at which
++ * point `CIpcPorting_Initialize` prints `...[105], error.` and the whole
++ * IPC layer is dead for that run. No IPC means no display mode set, no
++ * menus, nothing.
++ *
++ * On the body the RTOS boots first and has published the directory long
++ * before Linux userspace exists. Here the stand-in used to start Linux at
++ * machine reset, so Linux -- which reaches userspace in about 3 seconds --
++ * always lost the race against an emulated RTOS that needs tens of
++ * seconds. Measured: the error appears at 3.1 s, and killing LaMainApp and
++ * re-running it after the RTOS is up makes the error disappear entirely.
++ *
++ * So the hand-off now waits for the firmware's own signal: the appearance
++ * of that header. This is still a stand-in for whatever the body really
++ * does, but it is ordered by the firmware's progress instead of by machine
++ * reset, which is the part that was wrong.
++ *
++ * The address is the device tree's: /reserved-memory/share_mem, which the
++ * li container carries and which a running body confirms at
++ * 0xA14C00000. -machine li-wait-ipc=off restores the old immediate
++ * hand-off.
++ */
++#define Z63_SHARE_MEM_BASE  0x0A14C00000ULL
++#define Z63_SHARE_MEM_POLL_NS  (10 * 1000 * 1000)   /* 10 ms */
++
+ /* The EL3 boot code dereferences a per-CPU pointer table at this address
+  * (ldr x9, [0x40164000 + cpu*8]) to find each redistributor's TYPER, then
+  * zeroes word 0 there to clear ProcessorSleep. The boot ROM patches the table
+@@ -671,6 +703,8 @@ typedef struct NikonZ63State {
+     char *snor_user_file;        /* display complex, 0x1548C000 */
+     char *loader_file;           /* 0x40000000-0x40160000, the loader */
+     bool image_in_dram;          /* place the image where the loader would */
++    bool li_wait_ipc;            /* hand Linux over once share_mem is built */
++    QEMUTimer *li_wait_timer;
+     Z63Hdmi hdmi;              /* HDMI transmitter, 0x15496000 */
+     Z63Usb usb;                /* DWC3 USB device, 0x17880000 */
+ 
+@@ -3128,9 +3162,18 @@ static void z63_gic_release_ppis_to_nonsecure(unsigned cpu)
+                  "non-secure core its own interrupts", cpu);
+ }
+ 
+-static void z63_cpu3_handoff(NikonZ63State *s, int num_cpu)
++/*
++ * The hand-off touches another vCPU's register state, so it has to run in
++ * that vCPU's own context. At machine reset that was free -- nothing was
++ * executing. Now that it can fire from a timer while the RTOS is running
++ * (see z63_li_wait_tick) it must go through async_run_on_cpu, exactly as
++ * the mailbox release path does. Writing env.pc from the timer thread
++ * instead produced a core fetching from 0x200: the state landed while the
++ * vCPU was elsewhere and was partly overwritten.
++ */
++static void z63_cpu3_handoff_on_cpu(CPUState *cs, run_on_cpu_data data)
+ {
+-    CPUState *cs = CPU(s->cpu[3]);
++    NikonZ63State *s = data.host_ptr;
+     ARMCPU *cpu = ARM_CPU(cs);
+ 
+     error_report("Z63_LI_BOOT: handing CPU3 to the LI payload at 0x%"
+@@ -3157,6 +3200,12 @@ static void z63_cpu3_handoff(NikonZ63State *s, int num_cpu)
+     cpu->power_state = PSCI_ON;
+     cs->halted = false;
+     s->release_status |= 1U << 3;
++}
++
++static void z63_cpu3_handoff(NikonZ63State *s, int num_cpu)
++{
++    async_run_on_cpu(CPU(s->cpu[3]), z63_cpu3_handoff_on_cpu,
++                     RUN_ON_CPU_HOST_PTR(s));
+     (void)num_cpu;
+ }
+ 
+@@ -3188,14 +3237,59 @@ static const MemoryRegionOps z63_image_window_ops = {
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+ 
++/*
++ * Wait for the RTOS to publish the share_mem directory, then hand CPU3 to
++ * Linux. See the note by Z63_SHARE_MEM_BASE for why this is not done at
++ * reset any more. Polling is the whole mechanism: it reads eight bytes of
++ * guest DRAM every 10 ms of virtual time and changes nothing until the
++ * firmware has written them.
++ */
++static void z63_li_wait_tick(void *opaque)
++{
++    NikonZ63State *s = opaque;
++    MachineState *machine = MACHINE(s);
++    uint8_t hdr[8] = { 0 };
++
++    cpu_physical_memory_read(Z63_SHARE_MEM_BASE + 8, hdr, sizeof(hdr));
++    if (memcmp(hdr, "MASTER", 7) != 0) {
++        timer_mod(s->li_wait_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  Z63_SHARE_MEM_POLL_NS);
++        return;
++    }
++    error_report("Z63_LI_BOOT: the RTOS has published share_mem's directory "
++                 "at 0x%09" PRIx64 " (\"MASTER\" header present) -- handing "
++                 "CPU3 to Linux now. Waiting for this is what keeps "
++                 "LaMainApp's CIpcPorting_Initialize from failing; see the "
++                 "note by Z63_SHARE_MEM_BASE.",
++                 (uint64_t)Z63_SHARE_MEM_BASE);
++    z63_cpu3_handoff(s, machine->smp.cpus);
++}
++
+ static void z63_machine_reset(MachineState *machine, ResetType type)
+ {
+     NikonZ63State *s = NIKON_Z63(machine);
+ 
+     qemu_devices_reset(type);
+-    if (s->li_ready && s->cpu3_entry != 0 && machine->smp.cpus > 3) {
++    if (!(s->li_ready && s->cpu3_entry != 0 && machine->smp.cpus > 3)) {
++        return;
++    }
++    if (!s->li_wait_ipc) {
+         z63_cpu3_handoff(s, machine->smp.cpus);
++        return;
+     }
++    if (!s->li_wait_timer) {
++        s->li_wait_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                        z63_li_wait_tick, s);
++    }
++    error_report("Z63_LI_BOOT: holding CPU3 until the RTOS publishes "
++                 "share_mem's directory at 0x%09" PRIx64 ". Linux reaches "
++                 "userspace in about 3 s and the emulated RTOS needs far "
++                 "longer, so starting it at reset loses a race the body "
++                 "never has. -machine li-wait-ipc=off starts it at once.",
++                 (uint64_t)Z63_SHARE_MEM_BASE);
++    timer_mod(s->li_wait_timer,
++              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + Z63_SHARE_MEM_POLL_NS);
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -3769,6 +3863,7 @@ static void z63_machine_instance_init(Object *obj)
+ 
+     s->soc_revision = Z63_SOC_REVISION_DEFAULT;
+     s->image_in_dram = true;   /* what the loader does on the body */
++    s->li_wait_ipc = true;     /* the RTOS boots first on the body */
+     s->soc_chip_id = Z63_SOC_CHIP_ID_DEFAULT;
+ }
+ 
+@@ -3881,6 +3976,20 @@ static void z63_prop_set_snor_user(Object *obj, const char *value,
+     s->snor_user_file = g_strdup(value);
+ }
+ 
++static bool z63_prop_get_li_wait_ipc(Object *obj, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    return s->li_wait_ipc;
++}
++
++static void z63_prop_set_li_wait_ipc(Object *obj, bool value, Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    s->li_wait_ipc = value;
++}
++
+ static bool z63_prop_get_image_in_dram(Object *obj, Error **errp)
+ {
+     NikonZ63State *s = NIKON_Z63(obj);
+@@ -4010,6 +4119,16 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "z63-tools/snor_user_extract.py instead takes the real content out "
+         "of a full NOR dump, which is per-unit data from a particular body. "
+         "This board cannot tell the two apart; the tools record which.");
++    object_class_property_add_bool(oc, "li-wait-ipc",
++                                   z63_prop_get_li_wait_ipc,
++                                   z63_prop_set_li_wait_ipc);
++    object_class_property_set_description(oc, "li-wait-ipc",
++        "Hold CPU3 until the RTOS has published the share_mem directory "
++        "(the \"MASTER\" header at its base), instead of starting Linux at "
++        "machine reset. The camera application attaches to that directory "
++        "and gives up for good if it is not there yet, which is what a "
++        "3-second Linux boot racing a much slower emulated RTOS always "
++        "produced. On by default; off restores the immediate hand-off.");
+     object_class_property_add_bool(oc, "image-in-dram",
+                                    z63_prop_get_image_in_dram,
+                                    z63_prop_set_image_in_dram);
+diff --git a/z63-tools/guest_sh.py b/z63-tools/guest_sh.py
+new file mode 100755
+index 0000000..85b7e8e
+--- /dev/null
++++ b/z63-tools/guest_sh.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""Run commands in the guest's BusyBox shell over the serial port.
++
++The RTOS console and the Linux console are the same UART in this machine, so
++this is also how you read what the firmware printed. It boots the machine,
++waits for the shell prompt, sends each command and prints what comes back.
++
++    LOADER=<dump of 0x40000000> z63-tools/guest_sh.py <components-dir> \
++        'ls -l /dev' 'dmesg | tail -20'
++
++Nothing here pokes the guest's memory or pretends a device works: it is the
++same shell a person would get on the body's serial console.
++"""
++import os, socket, subprocess, sys, time, tempfile, signal
++
++d = sys.argv[1]
++cmds = sys.argv[2:] or ['uname -a']
++eg = os.path.join(d, 'eg2010_0200i1.bi')
++li = os.path.join(d, 'li2010_0200i1.bi')
++loader = os.environ.get('LOADER', '')
++qemu = os.environ.get('QEMU', './build/qemu-system-aarch64')
++sock_path = tempfile.mktemp(prefix='/tmp/z63s', suffix='.sock')
++
++opt = 'nikon-z63'
++opt += (',loader=' + loader) if loader and os.path.exists(loader) else ',rom-page-stub=on'
++opt += ',li-image=%s,cpu3-entry=0xa07800000' % li
++p = subprocess.Popen([qemu, '-machine', opt, '-cpu', 'cortex-a53', '-smp', '4',
++                      '-bios', eg, '-serial', 'unix:%s,server=on,wait=off' % sock_path,
++                      '-monitor', 'none', '-display', 'none'],
++                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++try:
++    for _ in range(100):
++        if os.path.exists(sock_path):
++            break
++        time.sleep(0.2)
++    s = socket.socket(socket.AF_UNIX); s.connect(sock_path)
++    s.settimeout(1.0)
++    buf = b''
++    deadline = time.time() + float(os.environ.get('BOOT_WAIT', '90'))
++    while time.time() < deadline:
++        try:
++            chunk = s.recv(65536)
++        except socket.timeout:
++            chunk = b''
++        if chunk:
++            buf += chunk
++        if b'BusyBox' in buf:
++            # let the rest of init settle before typing
++            if time.time() > deadline - 1 or b'# ' in buf[buf.index(b'BusyBox'):]:
++                break
++    sys.stdout.write(buf.decode('utf-8', 'replace'))
++    sys.stdout.write("\n==== shell ====\n")
++    s.sendall(b'\n')
++    time.sleep(1)
++    for c in cmds:
++        s.sendall(c.encode() + b'\n')
++        out = b''
++        end = time.time() + float(os.environ.get('CMD_WAIT', '8'))
++        while time.time() < end:
++            try:
++                chunk = s.recv(65536)
++            except socket.timeout:
++                continue
++            if not chunk:
++                break
++            out += chunk
++            if out.rstrip().endswith(b'#'):
++                break
++        print(out.decode('utf-8', 'replace'))
++finally:
++    p.send_signal(signal.SIGTERM)
++    try:
++        p.wait(timeout=10)
++    except subprocess.TimeoutExpired:
++        p.kill()
++    try:
++        os.unlink(sock_path)
++    except OSError:
++        pass
+diff --git a/z63-tools/smoke.sh b/z63-tools/smoke.sh
+index c51c93a..f83d3d6 100755
+--- a/z63-tools/smoke.sh
++++ b/z63-tools/smoke.sh
+@@ -34,7 +34,11 @@
+ set -e
+ cd "$(dirname "$0")/.."
+ DIR=${1:?usage: smoke.sh <dir holding eg2010_0200i1.bi and li2010_0200i1.bi> [seconds]}
+-WAIT=${2:-180}
++# The Linux check needs much longer than it used to: CPU3 is no longer
++# handed over at reset but when the RTOS publishes share_mem's directory,
++# which an emulated RTOS takes minutes to reach. That wait is the point --
++# see the note by Z63_SHARE_MEM_BASE -- so the budget has to cover it.
++WAIT=${2:-420}
+ EG="$DIR/eg2010_0200i1.bi"
+ LI="$DIR/li2010_0200i1.bi"
+ if [ -n "${LOADER:-}" ] && [ -f "$LOADER" ]; then
+diff --git a/z63-tools/where_blocked.py b/z63-tools/where_blocked.py
+index 9ada852..0b8c6be 100755
+--- a/z63-tools/where_blocked.py
++++ b/z63-tools/where_blocked.py
+@@ -68,7 +68,16 @@ def func_of(port, addr):
+ 
+ 
+ def run(qemu, eg, seconds, log):
+-    cmd = [qemu, '-machine', 'nikon-z63,rom-page-stub=on', '-cpu', 'cortex-a53',
++    # The loader and the LI payload change the answer completely, so honour
++    # the same environment smoke.sh uses rather than measuring a machine
++    # nobody runs.
++    opt = 'nikon-z63'
++    ld = os.environ.get('LOADER')
++    opt += (',loader=' + ld) if ld and os.path.exists(ld) else ',rom-page-stub=on'
++    li = os.environ.get('LI')
++    if li and os.path.exists(li):
++        opt += ',li-image=' + li + ',cpu3-entry=0xa07800000'
++    cmd = [qemu, '-machine', opt, '-cpu', 'cortex-a53',
+            '-smp', '4', '-bios', eg, '-serial', 'null', '-monitor', 'none',
+            '-display', 'none', '-d', 'exec', '-D', log]
+     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+-- 
+2.55.0
+

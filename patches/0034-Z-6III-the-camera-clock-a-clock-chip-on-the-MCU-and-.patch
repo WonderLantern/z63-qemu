@@ -1,0 +1,309 @@
+From 4a44ed8181aa494ee02843c29012db03f6b44cdf Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 14:43:48 +0000
+Subject: [PATCH 34/47] Z 6III: the camera clock -- a clock chip on the MCU,
+ and -machine mcu-rtc
+
+Every start showed the clock as not set and the camera's default date,
+2024-01-01. Followed back:
+
+  - at power-on the MCU reads the time from I2C1 address 0x32
+    (sub_803F714 -> sub_803F3FE -> sub_803EEC4 -> sub_803F090:
+    HAL_I2C_Mem_Read of 7 bytes from register 0x10, BCD seconds, minutes,
+    hours, weekday, day, month, year -- an Epson RX-8010SJ-style clock
+    chip) and sets its own RTC from it (message 0x42040001,
+    sub_803FF9C -> sub_803FA7C event 0x8000000 -> sub_803E8FC). The board
+    had a plain register file there, all zeros, so the MCU set and then
+    reported 2000-00-00 (family 7 kind 1);
+  - the MCU's validity test, sub_803E8B8, also wants a kept backup
+    domain: RCC_BDCR LSEON and RTCEN, RTC_CR.BKP (bit 18) and backup
+    register 19 bits 8..15 non-zero;
+  - that byte of BKP19 is the EXPEED's. It stores 1 there after putting
+    its own default date in the clock (family 7 kind 5) and 2 once a date
+    is set in SETUP > Time zone and date (family 7 kind 3), and reads it
+    back at start-up (sub_803EC00, events 0x40 / 0x20). With 1 it puts its
+    default in again at every start -- traced by setting the date through
+    the menu and watching BKP19 go 0x101 -> 0x201. Nothing reaches the
+    serial NOR for it.
+
+-machine mcu-rtc= (nikon-z63.c) gives the MCU a clock that kept time
+while the camera was off: "host" -- QEMU's RTC time at machine start,
+the default -- or YYYY-MM-DDTHH:MM:SS, both taken as UTC; "unset" keeps
+the old behaviour, a flat clock battery. With a time, the RTC calendar
+starts there with INITS, the backup domain reads as kept (BDCR 0x8101,
+CR.BKP, BKP19 byte 1 = 2), and the chip at I2C1 0x32 answers registers
+0x10..0x16 from the same moment on QEMU's virtual clock, a write there
+setting it. DECLARED: the part, its clock having run, and the "set" flag.
+
+Now the MCU reports the time at start-up (family 7 kind 1: 2026-10-12
+14:35:52 UTC), the EXPEED keeps it, the live-view clock-not-set icon is
+gone and SETUP > Time zone and date shows 2026/10/12 22:35:52 (UTC+8,
+Beijing, the body's setting).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-stm32.h | 140 ++++++++++++++++++++++++++++++++++++++-
+ hw/arm/nikon-z63.c       |  28 ++++++++
+ 2 files changed, 166 insertions(+), 2 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-stm32.h b/hw/arm/nikon-z63-stm32.h
+index 6a93d0c..a20ca11 100644
+--- a/hw/arm/nikon-z63-stm32.h
++++ b/hw/arm/nikon-z63-stm32.h
+@@ -59,6 +59,7 @@
+ #include "hw/misc/stm32f4xx_exti.h"
+ #include "hw/char/stm32f2xx_usart.h"
+ #include "chardev/char.h"
++#include "system/rtc.h"
+ 
+ #define Z63_STM32_FLASH_BASE    0x08000000ULL
+ #define Z63_STM32_FLASH_SIZE    (2 * MiB)
+@@ -173,6 +174,10 @@ struct Z63Stm32 {
+          * levels, 1 = released; logged, the last levels reported. */
+         bool expander;
+         uint32_t inputs, logged;
++        /* The clock chip at I2C1 0x32 (below z63_stm32_i2c_dev_at). */
++        bool clock;
++        int64_t clock_base_s;           /* seconds since 2000 at epoch */
++        int64_t clock_epoch_ns;
+     } i2c_dev[5];
+ 
+     struct Z63Stm32I2c {
+@@ -229,6 +234,8 @@ struct Z63Stm32 {
+     int64_t rtc_epoch_ns;
+     unsigned rtc_wpr;               /* 0, 1 (0xca seen), 2 (unlocked) */
+     bool rtc_named_timer;
++    bool rtc_running;               /* mcu-rtc=: the calendar kept time */
++    int64_t rtc_start_s;            /* ... and read this at power-on */
+ };
+ 
+ /* TIM2..5: general-purpose 32/16-bit timers, QEMU's stm32f2xx model.
+@@ -1032,15 +1039,82 @@ static const MemoryRegionOps z63_stm32_rtc_ops = {
+     .valid = { .min_access_size = 1, .max_access_size = 4 },
+ };
+ 
++/* mcu-rtc=: "host" -- QEMU's RTC time at machine start (the host's clock,
++ * or -rtc base=), "unset", or YYYY-MM-DDTHH:MM:SS, 2000..2099. The
++ * calendar is taken as UTC, as the RTOS's own reports print it. */
++static bool z63_stm32_rtc_option(Z63Stm32 *m, const char *value,
++                                 Error **errp)
++{
++    struct tm t = { 0 };
++
++    if (!value || !strcmp(value, "host")) {
++        qemu_get_timedate(&t, 0);
++    } else if (!strcmp(value, "unset")) {
++        m->rtc_running = false;     /* and the clock chip reads zeros */
++        return true;
++    } else if (sscanf(value, "%d-%d-%dT%d:%d:%d", &t.tm_year, &t.tm_mon,
++                      &t.tm_mday, &t.tm_hour, &t.tm_min, &t.tm_sec) != 6 ||
++               t.tm_year < 2000 || t.tm_year > 2099 || t.tm_mon < 1 ||
++               t.tm_mon > 12 || t.tm_mday < 1 || t.tm_mday > 31 ||
++               t.tm_hour > 23 || t.tm_min > 59 || t.tm_sec > 59) {
++        error_setg(errp, "mcu-rtc: want host, unset or "
++                   "YYYY-MM-DDTHH:MM:SS (2000..2099), not '%s'", value);
++        return false;
++    } else {
++        t.tm_year -= 1900;
++        t.tm_mon -= 1;
++    }
++    if (t.tm_year < 100 || t.tm_year > 199) {
++        error_setg(errp, "mcu-rtc: the MCU's calendar holds 2000..2099");
++        return false;
++    }
++    m->rtc_running = true;
++    m->rtc_start_s = mktimegm(&t) - 946684800;
++    /* The clock chip on I2C1 kept the same time (z63_stm32_clock_regs). */
++    for (unsigned i = 0; i < ARRAY_SIZE(m->i2c_dev); i++) {
++        if (m->i2c_dev[i].bus == 0 && m->i2c_dev[i].addr == 0x32) {
++            m->i2c_dev[i].clock = true;
++            m->i2c_dev[i].clock_base_s = m->rtc_start_s;
++            m->i2c_dev[i].clock_epoch_ns =
++                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        }
++    }
++    return true;
++}
++
+ static void z63_stm32_rtc_reset(Z63Stm32 *m)
+ {
+     /* The backup domain survives a system reset on the part; here a cold
+-     * start is all there is. The calendar starts at 2000-01-01 00:00 and
+-     * INITS stays clear until the firmware sets a date. */
++     * start is all there is. Without mcu-rtc the calendar starts at
++     * 2000-01-01 00:00 and INITS stays clear until the firmware sets a date
++     * -- a body whose clock battery has run down. With it (the board's
++     * default, "host"), the calendar has kept time and reads mcu-rtc's
++     * moment at power-on, INITS set: a body whose clock was set before it
++     * was switched off. DECLARED: which, and when. */
+     memset(m->rtc, 0, sizeof(m->rtc));
+     m->rtc[Z63_RTC_DR / 4] = 0x00002101;        /* reset value: Mon 01-01 */
+     m->rtc[0x10 / 4] = 0x007f00ff;              /* PRER */
+     m->rtc_base_s = 0;
++    if (m->rtc_running) {
++        /* What a kept backup domain looks like to this image's check,
++         * sub_803E8B8 -- the clock counts as lost unless RCC_BDCR has
++         * LSEON (bit 0) and RTCEN (bit 15), RTC_CR has its BKP bit (18)
++         * and backup register 19 has bits 8..15 non-zero. That byte is the
++         * EXPEED's: sub_803EC00 stores it on event 0x40 and hands it back
++         * at start-up on event 0x20 (message 0x42030004). Observed: the
++         * EXPEED stores 1 when it has put its own default date in the
++         * clock (2024-01-01, family 7 kind 5) and 2 once a date has been
++         * set in SETUP > Time zone and date (family 7 kind 3) -- and with
++         * 1 it puts its default in again at the next start. 2 here, a
++         * clock that was set. The RTC clocked from the LSE (RTCSEL 01) is
++         * DECLARED with it. */
++        m->rcc[Z63_RCC_BDCR / 4] = 0x00008101;
++        m->rtc[Z63_RTC_CR / 4] = 1u << 18;
++        m->rtc[(0x50 + 4 * 19) / 4] = 0x00000200;
++        m->rtc_base_s = m->rtc_start_s;
++        z63_stm32_rtc_from_s(m->rtc_start_s, &m->rtc[Z63_RTC_TR / 4],
++                             &m->rtc[Z63_RTC_DR / 4]);
++    }
+     m->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+     m->rtc_wpr = 0;
+ }
+@@ -1149,11 +1223,73 @@ static Z63Stm32I2cDev *z63_stm32_i2c_find(Z63Stm32 *m, unsigned bus,
+     return NULL;
+ }
+ 
++/*
++ * The clock chip. At power-on the MCU's clock task reads the time from
++ * I2C1 address 0x32 -- sub_803F714 -> sub_803F3FE -> sub_803EEC4 ->
++ * sub_803F090: HAL_I2C_Mem_Read of 7 bytes from register 0x10, BCD, the
++ * bytes taken as seconds, minutes, hours, (one skipped), day, month, year
++ * -- and hands it on as message 0x42040001 (sub_803FF9C), which sets the
++ * MCU's own RTC from it (sub_803FA7C, event 0x8000000 -> sub_803EE1C)
++ * and so becomes the time the MCU reports to the EXPEED (family 7 kind
++ * 1). That register map, at that address, is a battery-backed real-time
++ * clock of the Epson RX-8010SJ kind (0x10 SEC .. 0x16 YEAR, 0x13 a
++ * one-hot weekday). As a plain register file it read all zeros, so every
++ * start set the MCU to 2000-00-00, the EXPEED replaced that with its
++ * default (2024-01-01, family 7 kind 5) and showed the clock as not set.
++ * Here registers 0x10..0x16 count from mcu-rtc's moment (nikon-z63.c) on
++ * QEMU's virtual clock, and a write to them sets the count; the rest of
++ * the chip (alarm, timer, flags, control) is still the register file.
++ * DECLARED: the part, and that its clock ran while the camera was off.
++ */
++#define Z63_CLOCK_SEC   0x10
++#define Z63_CLOCK_YEAR  0x16
++
++static void z63_stm32_clock_regs(Z63Stm32I2cDev *d)
++{
++    int64_t s = d->clock_base_s + (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
++                                   d->clock_epoch_ns) / NANOSECONDS_PER_SECOND;
++    time_t tt = s + 946684800;
++    struct tm t;
++
++    gmtime_r(&tt, &t);
++    d->regs[0x10] = z63_bcd(t.tm_sec);
++    d->regs[0x11] = z63_bcd(t.tm_min);
++    d->regs[0x12] = z63_bcd(t.tm_hour);
++    d->regs[0x13] = 1u << t.tm_wday;
++    d->regs[0x14] = z63_bcd(t.tm_mday);
++    d->regs[0x15] = z63_bcd(t.tm_mon + 1);
++    d->regs[0x16] = z63_bcd(t.tm_year - 100);
++}
++
++static void z63_stm32_clock_set(Z63Stm32I2cDev *d)
++{
++    struct tm t = {
++        .tm_sec = z63_unbcd(d->regs[0x10] & 0x7f),
++        .tm_min = z63_unbcd(d->regs[0x11] & 0x7f),
++        .tm_hour = z63_unbcd(d->regs[0x12] & 0x3f),
++        .tm_mday = MAX(z63_unbcd(d->regs[0x14] & 0x3f), 1),
++        .tm_mon = MAX(z63_unbcd(d->regs[0x15] & 0x1f), 1) - 1,
++        .tm_year = 100 + z63_unbcd(d->regs[0x16]),
++    };
++
++    d->clock_base_s = mktimegm(&t) - 946684800;
++    d->clock_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++}
++
+ static void z63_stm32_i2c_dev_write(Z63Stm32I2cDev *d, uint8_t b)
+ {
+     if (!d->ptr_set) {
+         d->ptr = b;
+         d->ptr_set = true;
++        if (d->clock) {
++            z63_stm32_clock_regs(d);    /* one reading per transaction */
++        }
++        return;
++    }
++    if (d->clock && d->ptr >= Z63_CLOCK_SEC && d->ptr <= Z63_CLOCK_YEAR) {
++        d->regs[d->ptr++] = b;
++        z63_stm32_clock_set(d);
++        d->writes++;
+         return;
+     }
+     d->regs[d->ptr++] = b;
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index fab36a9..0ed8244 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -821,6 +821,7 @@ typedef struct NikonZ63State {
+     char *z9_capture_props;
+     char *z9_capture_raw;
+     char *mcu_keys;              /* held keys, nikon-z63-mcu.h */
++    char *mcu_rtc;               /* the MCU's calendar at power-on */
+     QEMUTimer *li_wait_timer;
+     Z63Hdmi hdmi;              /* HDMI transmitter, 0x15496000 */
+     Z63Usb usb;                /* DWC3 USB device, 0x17880000 */
+@@ -4385,6 +4386,10 @@ static void z63_init(MachineState *machine)
+         z63_stm32_init(&s->real_mcu, OBJECT(machine), s->mcu_image, NULL,
+                        &error_fatal);
+         s->real_mcu_built = true;
++        /* Its clock: running and set, by default (nikon-z63-stm32.h). */
++        if (!z63_stm32_rtc_option(&s->real_mcu, s->mcu_rtc, &error_fatal)) {
++            return;
++        }
+         /* The real MCU replaces the synthetic peer, and mcu-peer=on is only
+          * a default: until this line the GPIO block's peer overlay answered
+          * the EXPEED's port reads from an object nothing had initialised,
+@@ -4752,6 +4757,7 @@ static void z63_machine_instance_init(Object *obj)
+      * (error 0x1EA7). Nothing answers on the line itself; what the battery
+      * would say is a separate matter. Overridable with mcu-pins=. */
+     s->mcu_pins = g_strdup("D13=1");
++    s->mcu_rtc = g_strdup("host");
+     /* Write-only serial devices (nikon-z63-sio.h): 9 is the rear panel;
+      * 8 is the image sensor's control port -- logical serial channel 6
+      * (sub_4115B8FC: sub_40C0040C(6)), chip select on the GPIO behind
+@@ -5006,6 +5012,20 @@ static char *z63_prop_get_mcu_keys(Object *obj, Error **errp)
+     return g_strdup(NIKON_Z63(obj)->mcu_keys ? NIKON_Z63(obj)->mcu_keys : "");
+ }
+ 
++static char *z63_prop_get_mcu_rtc(Object *obj, Error **errp)
++{
++    return g_strdup(NIKON_Z63(obj)->mcu_rtc);
++}
++
++static void z63_prop_set_mcu_rtc(Object *obj, const char *value,
++                                 Error **errp)
++{
++    NikonZ63State *s = NIKON_Z63(obj);
++
++    g_free(s->mcu_rtc);
++    s->mcu_rtc = g_strdup(value);
++}
++
+ static void z63_prop_set_mcu_keys(Object *obj, const char *value,
+                                   Error **errp)
+ {
+@@ -5378,6 +5398,14 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "The posture sensor's input, x:y:z in milligravity; default 0:0:1000, "
+         "a body at rest. Settable at run time with qom-set. See "
+         "nikon-z63-imu.h.");
++    object_class_property_add_str(oc, "mcu-rtc", z63_prop_get_mcu_rtc,
++                                  z63_prop_set_mcu_rtc);
++    object_class_property_set_description(oc, "mcu-rtc",
++        "The body MCU's clock at power-on, with mcu-image=: host (QEMU's "
++        "RTC time, the default), YYYY-MM-DDTHH:MM:SS, or unset -- a "
++        "calendar that has stopped, as with a flat clock battery, which "
++        "the camera answers with its default time and the clock-not-set "
++        "warning. See nikon-z63-stm32.h.");
+     object_class_property_add_str(oc, "mcu-keys",
+                                   z63_prop_get_mcu_keys,
+                                   z63_prop_set_mcu_keys);
+-- 
+2.55.0
+

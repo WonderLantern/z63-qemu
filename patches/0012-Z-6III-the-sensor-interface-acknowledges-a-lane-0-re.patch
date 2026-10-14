@@ -1,0 +1,295 @@
+From 31ecef4bc1dfbdd3cd015852dca4bb5f90d8fafd Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 03:49:15 +0000
+Subject: [PATCH 12/47] Z 6III: the sensor interface acknowledges a lane-0
+ request (global0 bit 10)
+
+Error 0x40 ("Error. Turn the camera off and on again" over live view) is
+CaptureSequence result 9 (sub_40F422E8), from bit 0x100 of the sensor
+module's stop sub_41168A0C, which CaptureSequence runs before restarting
+live view in movie mode (sub_40F3AD88, 0x40f3bca4). The sensor module
+stops the stream two ways, and they differ in one request:
+
+  sub_41166770: group-1 strobe (0x3049 at +0x3418, +0x341c), group-0
+    control off (+0x14 = 1), wait 150 ticks for flag 0x40 of 0xa04ce0da0
+    -- global0 bit 18, which ../z9-qemu's stop model raises.
+  sub_41168A0C: the same two, then sub_4116E6BC(0) -> sub_40C29E50 ->
+    sub_40C2BAB4(0x8000): +0x38 = 1, and a 150-tick wait for flag 0x80.
+
+Flag 0x80 is set in one place, the global0 (INTID 0xff) callback
+sub_4115C8A4 (installed by sub_4115C138 through sub_40C2C9A4 into the
+0x15080000 descriptor), from status bit 10 (+0x54 0x400). Nothing raised
+it, the wait timed out, the stop returned 0x100. ../z9-qemu records +0x38
+only as a write-only request "physical effect unknown", and has an
+opt-in, externally fed global0 bit 10 whose note says the ZR firmware
+maps it to flag 0x80 -- the same route.
+
+New attachment switch z63-1508-lane0-ack (default on, with the z9
+model's event1508-global0-bit10-model for the W1C): a write of 1 to
++0x38 raises global0 bit 10 through the z9 model's own pending, mask and
+W1C, immediately, as its stop model's drain is. Lanes 1 and 2 get no
+acknowledgement until something is seen waiting for one.
+
+Verified: the acknowledgement is taken (mask 0xffe7feb7 includes bit
+10), the stop no longer returns 0x100, and the camera-error poster
+sub_40EB1414 is not reached in any run since. The restart then goes on
+into blocks nothing had reached before (next commit).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c    | 70 +++++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63-z9lab.h    | 11 ++++--
+ z63-tools/z9lab_attach.c.in | 70 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 149 insertions(+), 2 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index bc468ae..db196fa 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -14304,6 +14304,54 @@ static void z63_z9lab_150c_started(NikonZ9State *s)
+     }
+ }
+ 
++/*
++ * The sensor interface's lane-0 request and its acknowledgement. The
++ * sensor module stops the stream two ways, and they differ in exactly one
++ * request:
++ *
++ *   sub_41166770: group-1 strobe (sub_4116F4A8(0x3049): +0x3418, +0x341c),
++ *     group-0 control off (sub_4116E6A8(0): +0x14 = 1), then waits up to
++ *     150 ticks for flag 0x40 of 0xA04CE0DA0 -- global0 status bit 18,
++ *     which ../z9-qemu's event1508-stop-model raises as the source drains.
++ *   sub_41168A0C (bit 0 of its argument set; CaptureSequence's stop before
++ *     a live-view restart, sub_40F3AD88 at 0x40f3bca4): the same two, then
++ *     sub_4116E6BC(0) -> sub_40C29E50 -> sub_40C2BAB4(0x8000), which writes
++ *     +0x38 = 1, and waits up to 150 ticks for flag 0x80 instead.
++ *
++ * Flag 0x80 is set in one place, the global0 (INTID 0xff) callback
++ * sub_4115C8A4, from status bit 10 (+0x54 bit 0x400). On timeout the stop
++ * returns 0x100, sub_40F422E8 turns that into CaptureSequence result 9,
++ * and sub_40F2FA70 posts camera error 0x40: "Error. Turn the camera off and
++ * on again" over the live view. The +0x38/+0x3c/+0x40 words are what
++ * ../z9-qemu's event1508-command-model records as "write-only request,
++ * physical effect unknown", and its event1508-global0-bit10-model notes
++ * the same bit-10 -> flag-0x80 route in the ZR firmware, fed only from
++ * outside.
++ *
++ * So the request on lane 0 is read as asking for the acknowledgement on
++ * global0 bit 10, and z63-1508-lane0-ack (default on) raises it when the
++ * firmware writes +0x38 = 1, through the z9 model's own global0 pending,
++ * mask (+0x50) and W1C (event1508-global0-bit10-model). Immediate, as the
++ * z9 stop model's drain is; nothing about the stream itself changes, and
++ * lanes 1 and 2 (+0x3c, +0x40) are left without an acknowledgement until
++ * something is seen waiting for one.
++ */
++static bool z63_z9lab_lane0_ack_on;
++
++static void z63_z9lab_lane0_ack(NikonZ9State *s)
++{
++    static uint64_t acks;
++
++    s->event_global0_pending |= 0x400;
++    s->event_global0_inputs++;
++    event_global0_update_irq(s);
++    if (acks++ == 0) {
++        fprintf(stderr, "Z63_1508: lane-0 request (+0x38) acknowledged on "
++                "global0 bit 10 (mask 0x%x, INTID 0xff) -- see "
++                "z9lab_attach.c.in\n", s->event_extended_1508[0x50 / 4]);
++    }
++}
++
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                       const char *props, Error **errp);
+ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size,
+@@ -14320,6 +14368,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     g_auto(GStrv) items = g_strsplit(props ? props : "", ";", -1);
+     uint64_t boundary_ms = 0;
+     bool frame_end = false;
++    bool lane0_ack = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -14342,6 +14391,15 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-1508-lane0-ack")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-1508-lane0-ack wants on "
++                           "or off");
++                goto fail;
++            }
++            lane0_ack = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-150c-frame-end")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-150c-frame-end wants on "
+@@ -14416,6 +14474,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                                     c);
+         }
+     }
++    if (lane0_ack && (!s->event1508_global0_model ||
++                      !s->event1508_global0_bit10_model)) {
++        error_setg(errp, "z9-capture: z63-1508-lane0-ack needs "
++                   "event1508-global0-model and "
++                   "event1508-global0-bit10-model");
++        goto fail;
++    }
++    z63_z9lab_lane0_ack_on = lane0_ack;
+     if (frame_end && !boundary_ms) {
+         error_setg(errp, "z9-capture: z63-150c-frame-end needs "
+                    "z63-boundary-ms");
+@@ -14466,6 +14532,10 @@ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+         (s->engine150c_active & ~was & 2)) {
+         z63_z9lab_150c_started(s);
+     }
++    if (addr == 0x15080038 && size == 4 && value == 1 &&
++        z63_z9lab_lane0_ack_on) {
++        z63_z9lab_lane0_ack(s);
++    }
+     return !s->compat_miss;
+ }
+ 
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index b658634..eb7c04c 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -51,7 +51,12 @@
+  * live-view start reads bank 1 +0x24 (sub_40C2B218). Also this board's
+  * z63-150c-frame-end: engine 0x150c's primary path ending its frame at the
+  * boundary on its own while the combined RAW pipeline is not engaged (see
+- * the attachment section). -machine z9-capture-props= replaces the list
++ * the attachment section). And z63-1508-lane0-ack, with the z9 model's
++ * event1508-global0-bit10-model for its W1C: the sensor interface's lane-0
++ * request (+0x38 = 1) acknowledged on global0 bit 10, which the sensor
++ * module's stop before a live-view restart waits 150 ticks for (camera
++ * error 0x40 on timeout; see the attachment section). -machine
++ * z9-capture-props= replaces the list
+  * (items separated by ';'). The statistics and RAW models need an
+  * NZ9RAW1 Bayer file: -machine z9-capture-raw=<path>; z63-tools/make_raw.py
+  * writes a synthetic one. That picture is an input chosen for the run, not
+@@ -115,8 +120,10 @@ static const char z63_z9lab_default_props[] =
+     "event1508-stop-model=on;"
+     "engine150d-readback-input=0:0:0:0:0;"
+     "multi-io-counter-model=on;"
++    "event1508-global0-bit10-model=on;"
+     "z63-boundary-ms=33;"
+-    "z63-150c-frame-end=on";
++    "z63-150c-frame-end=on;"
++    "z63-1508-lane0-ack=on";
+ 
+ #define Z63_Z9LAB_LO 0x15000000ULL
+ #define Z63_Z9LAB_HI 0x16100000ULL
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index f7ef0f1..e5c66db 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -160,6 +160,54 @@ static void z63_z9lab_150c_started(NikonZ9State *s)
+     }
+ }
+ 
++/*
++ * The sensor interface's lane-0 request and its acknowledgement. The
++ * sensor module stops the stream two ways, and they differ in exactly one
++ * request:
++ *
++ *   sub_41166770: group-1 strobe (sub_4116F4A8(0x3049): +0x3418, +0x341c),
++ *     group-0 control off (sub_4116E6A8(0): +0x14 = 1), then waits up to
++ *     150 ticks for flag 0x40 of 0xA04CE0DA0 -- global0 status bit 18,
++ *     which ../z9-qemu's event1508-stop-model raises as the source drains.
++ *   sub_41168A0C (bit 0 of its argument set; CaptureSequence's stop before
++ *     a live-view restart, sub_40F3AD88 at 0x40f3bca4): the same two, then
++ *     sub_4116E6BC(0) -> sub_40C29E50 -> sub_40C2BAB4(0x8000), which writes
++ *     +0x38 = 1, and waits up to 150 ticks for flag 0x80 instead.
++ *
++ * Flag 0x80 is set in one place, the global0 (INTID 0xff) callback
++ * sub_4115C8A4, from status bit 10 (+0x54 bit 0x400). On timeout the stop
++ * returns 0x100, sub_40F422E8 turns that into CaptureSequence result 9,
++ * and sub_40F2FA70 posts camera error 0x40: "Error. Turn the camera off and
++ * on again" over the live view. The +0x38/+0x3c/+0x40 words are what
++ * ../z9-qemu's event1508-command-model records as "write-only request,
++ * physical effect unknown", and its event1508-global0-bit10-model notes
++ * the same bit-10 -> flag-0x80 route in the ZR firmware, fed only from
++ * outside.
++ *
++ * So the request on lane 0 is read as asking for the acknowledgement on
++ * global0 bit 10, and z63-1508-lane0-ack (default on) raises it when the
++ * firmware writes +0x38 = 1, through the z9 model's own global0 pending,
++ * mask (+0x50) and W1C (event1508-global0-bit10-model). Immediate, as the
++ * z9 stop model's drain is; nothing about the stream itself changes, and
++ * lanes 1 and 2 (+0x3c, +0x40) are left without an acknowledgement until
++ * something is seen waiting for one.
++ */
++static bool z63_z9lab_lane0_ack_on;
++
++static void z63_z9lab_lane0_ack(NikonZ9State *s)
++{
++    static uint64_t acks;
++
++    s->event_global0_pending |= 0x400;
++    s->event_global0_inputs++;
++    event_global0_update_irq(s);
++    if (acks++ == 0) {
++        fprintf(stderr, "Z63_1508: lane-0 request (+0x38) acknowledged on "
++                "global0 bit 10 (mask 0x%x, INTID 0xff) -- see "
++                "z9lab_attach.c.in\n", s->event_extended_1508[0x50 / 4]);
++    }
++}
++
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                       const char *props, Error **errp);
+ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size,
+@@ -176,6 +224,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     g_auto(GStrv) items = g_strsplit(props ? props : "", ";", -1);
+     uint64_t boundary_ms = 0;
+     bool frame_end = false;
++    bool lane0_ack = false;
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
+@@ -198,6 +247,15 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-1508-lane0-ack")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-1508-lane0-ack wants on "
++                           "or off");
++                goto fail;
++            }
++            lane0_ack = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-150c-frame-end")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-150c-frame-end wants on "
+@@ -272,6 +330,14 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+                                     c);
+         }
+     }
++    if (lane0_ack && (!s->event1508_global0_model ||
++                      !s->event1508_global0_bit10_model)) {
++        error_setg(errp, "z9-capture: z63-1508-lane0-ack needs "
++                   "event1508-global0-model and "
++                   "event1508-global0-bit10-model");
++        goto fail;
++    }
++    z63_z9lab_lane0_ack_on = lane0_ack;
+     if (frame_end && !boundary_ms) {
+         error_setg(errp, "z9-capture: z63-150c-frame-end needs "
+                    "z63-boundary-ms");
+@@ -322,6 +388,10 @@ bool z63_z9lab_write(Object *obj, hwaddr addr, uint64_t value, unsigned size)
+         (s->engine150c_active & ~was & 2)) {
+         z63_z9lab_150c_started(s);
+     }
++    if (addr == 0x15080038 && size == 4 && value == 1 &&
++        z63_z9lab_lane0_ack_on) {
++        z63_z9lab_lane0_ack(s);
++    }
+     return !s->compat_miss;
+ }
+ 
+-- 
+2.55.0
+

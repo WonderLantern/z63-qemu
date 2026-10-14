@@ -1,0 +1,306 @@
+From 756c2cab1d865faf79b76d1fdd4747718e1d776e Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 05:58:30 +0000
+Subject: [PATCH 17/47] Z 6III: z63watch, and z63log names camera errors and
+ any function's callers
+
+Two questions kept costing a debugger session each: who writes this word,
+and which of a function's callers was it.
+
+z63-tools/plugins/z63watch.c logs every store into [lo, hi) made by code
+in [pclo, pchi): host time, vCPU, PC, LR, address, size and value, each
+(pc, address) pair at most max= times. Restricting the code range keeps
+the cost to the instructions that can matter -- the body MCU's flash, say,
+with the A53s untouched. It is how the expander work found that the
+MCU's input buffer at 0x20019e04 was never written.
+
+z63log gains two hooks:
+- "error": sub_40EB1414(code, ...), where the camera posts the error a
+  "press the shutter release button to reset" dialog shows (usually from
+  sub_40F35AD4). This is how the live-view restart after the menu was
+  seen to end in 0x35 or 0x40.
+- call=0x..:0x.. (A53 entries, up to 32): one line per call with x0..x3
+  and the return address.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ z63-tools/plugins/z63log.c   |  43 +++++++++-
+ z63-tools/plugins/z63watch.c | 159 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 200 insertions(+), 2 deletions(-)
+ create mode 100644 z63-tools/plugins/z63watch.c
+
+diff --git a/z63-tools/plugins/z63log.c b/z63-tools/plugins/z63log.c
+index 1ba64ed..dc307c0 100644
+--- a/z63-tools/plugins/z63log.c
++++ b/z63-tools/plugins/z63log.c
+@@ -10,12 +10,15 @@
+  * the object's first u16 names the module. The kernel layer has TOPPERS
+  * syslog, syslog_wri_log(prio, record) at 0x401842f8, which is fully
+  * enabled and never called on a healthy boot. The body MCU keeps an error
+- * ring through sub_80214C0(code, value). This plugin hooks the entry of
+- * those three and writes one line per call:
++ * ring through sub_80214C0(code, value). And a camera error -- the "Press
++ * the shutter release button to reset" kind -- is posted through
++ * sub_40EB1414(code, ...). This plugin hooks the entry of those four and
++ * writes one line per call:
+  *
+  *   <seq> <us> cpu<n> log  mod=0x42 lvl=1 a=0x1 code=0x1ea7 b=0x0 from=0x40f3b2ec
+  *   <seq> <us> cpu<n> syslog prio=3 fmt="..." args=0x.. 0x.. ...
+  *   <seq> <us> cpu4  mcu  code=10002 value=0x0 from=0x8041f8d
++ *   <seq> <us> cpu<n> error code=0x37 a=0x0 b=0x1 from=0x40f35c04
+  *
+  * <us> is host time in microseconds since the plugin loaded: good for order
+  * and gaps, not guest time (QEMU's register list does not expose
+@@ -26,6 +29,10 @@
+  *   build: z63-tools/plugins/build.sh   (needs a QEMU configured with
+  *          -Dplugins=true; this tree's build has it)
+  *   use:   -plugin z63-tools/plugins/libz63log.dylib,out=/tmp/z63log.txt
++ *
++ * call=0x40f36a08:0x... adds A53 function entries of your own (up to 32):
++ * one "call" line each time, x0..x3 and the return address -- which of a
++ * function's callers it was, without a debugger attached.
+  */
+ #include <glib.h>
+ #include <inttypes.h>
+@@ -47,6 +54,7 @@ static const Hook hooks[] = {
+     { 0x40c06924, ARCH_A53, "log" },     /* sub_40C06924 */
+     { 0x401842f8, ARCH_A53, "syslog" },  /* syslog_wri_log */
+     { 0x080214c0, ARCH_M4,  "mcu" },     /* sub_80214C0 */
++    { 0x40eb1414, ARCH_A53, "error" },   /* sub_40EB1414: camera error */
+ };
+ 
+ #define MAX_VCPUS 16
+@@ -57,6 +65,8 @@ typedef struct Vcpu {
+ } Vcpu;
+ 
+ static Vcpu vcpus[MAX_VCPUS];
++static Hook calls[32];                  /* call=0x..:0x.. (A53 entries) */
++static size_t n_calls;
+ static FILE *out;
+ static GMutex lock;
+ static uint64_t seq;
+@@ -176,6 +186,18 @@ static void hit(unsigned int idx, void *udata)
+                 " 0x%" PRIx64 " 0x%" PRIx64 " from=0x%" PRIx64 "\n",
+                 seq++, ts, idx, a[0], rec[0], fmt, rec[4], rec[5], rec[6],
+                 rec[7], from);
++    } else if (!strcmp(h->what, "error")) {
++        /* sub_40EB1414(code, flag, flag): the camera error a dialog shows
++         * (sub_40F35AD4 is the usual caller). */
++        fprintf(out, "%" PRIu64 " %s cpu%u error code=0x%" PRIx64
++                " a=0x%" PRIx64 " b=0x%" PRIx64 " from=0x%" PRIx64 "\n",
++                seq++, ts, idx, a[0] & 0xffffffff, a[1] & 0xff, a[2] & 0xff,
++                from);
++    } else if (!strcmp(h->what, "call")) {
++        fprintf(out, "%" PRIu64 " %s cpu%u call pc=0x%" PRIx64 " x0=0x%"
++                PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64 " x3=0x%" PRIx64
++                " from=0x%" PRIx64 "\n", seq++, ts, idx, h->pc, a[0], a[1],
++                a[2], a[3], from);
+     } else {
+         fprintf(out, "%" PRIu64 " %s cpu%u mcu code=%" PRIu64
+                 " value=0x%" PRIx64 " from=0x%" PRIx64 "\n", seq++, ts, idx,
+@@ -198,6 +220,12 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+                     insn, hit, QEMU_PLUGIN_CB_R_REGS, (void *)&hooks[k]);
+             }
+         }
++        for (size_t k = 0; k < n_calls; k++) {
++            if (calls[k].pc == pc) {
++                qemu_plugin_register_vcpu_insn_exec_cb(
++                    insn, hit, QEMU_PLUGIN_CB_R_REGS, (void *)&calls[k]);
++            }
++        }
+     }
+ }
+ 
+@@ -219,6 +247,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+             path = argv[i] + 4;
+         } else if (!strcmp(argv[i], "listregs=on")) {
+             list_regs = true;
++        } else if (g_str_has_prefix(argv[i], "call=")) {
++            g_auto(GStrv) pcs = g_strsplit(argv[i] + 5, ":", -1);
++
++            for (char **p = pcs; *p && n_calls < G_N_ELEMENTS(calls); p++) {
++                calls[n_calls++] = (Hook) {
++                    g_ascii_strtoull(*p, NULL, 0), ARCH_A53, "call"
++                };
++            }
+         }
+     }
+     out = path ? fopen(path, "w") : stderr;
+@@ -231,6 +267,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+         fprintf(out, "# hook %s at 0x%" PRIx64 " (%s)\n", hooks[k].what,
+                 hooks[k].pc, hooks[k].arch == ARCH_A53 ? "A53" : "M4");
+     }
++    for (size_t k = 0; k < n_calls; k++) {
++        fprintf(out, "# hook call at 0x%" PRIx64 " (A53)\n", calls[k].pc);
++    }
+     qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
+     qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
+     qemu_plugin_register_atexit_cb(id, at_exit, NULL);
+diff --git a/z63-tools/plugins/z63watch.c b/z63-tools/plugins/z63watch.c
+new file mode 100644
+index 0000000..7705a09
+--- /dev/null
++++ b/z63-tools/plugins/z63watch.c
+@@ -0,0 +1,159 @@
++/*
++ * z63watch -- who writes a range of guest memory, and what.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * For code in [pclo, pchi), every store whose virtual address falls in
++ * [lo, hi) is written out as one line: host microseconds, vCPU, PC,
++ * address, size and value. Each (pc, address) pair is reported at most
++ * max= times (default 4), so a store in a loop does not flood the file.
++ * Restricting the code range keeps the cost to the instructions that can
++ * matter -- the body MCU's flash, say, with the A53s untouched.
++ *
++ *   -plugin libz63watch.dylib,lo=0x20014150,hi=0x20014190,
++ *           pclo=0x08000000,pchi=0x08080000,out=/tmp/w.txt
++ */
++#include <glib.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++#include <qemu-plugin.h>
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
++
++static uint64_t lo, hi, pclo, pchi = UINT64_MAX, maxper = 4;
++static FILE *out;
++static GMutex lock;
++static GHashTable *seen;               /* (pc << 32 | addr low) -> count */
++static int64_t t0;
++static struct qemu_plugin_register *lr_reg[16];   /* per vCPU: lr / x30 */
++
++static uint64_t read_lr(unsigned int vcpu)
++{
++    g_autoptr(GByteArray) buf = g_byte_array_new();
++    uint64_t v = 0;
++    int n;
++
++    if (vcpu >= 16 || !lr_reg[vcpu]) {
++        return 0;
++    }
++    n = qemu_plugin_read_register(lr_reg[vcpu], buf);
++    if (n > 0) {
++        memcpy(&v, buf->data, MIN((size_t)n, sizeof(v)));
++    }
++    return v;
++}
++
++static void vcpu_init(qemu_plugin_id_t id, unsigned int idx)
++{
++    g_autoptr(GArray) regs = qemu_plugin_get_registers();
++
++    for (guint i = 0; idx < 16 && i < regs->len; i++) {
++        qemu_plugin_reg_descriptor *d =
++            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
++
++        if (!strcmp(d->name, "lr") || !strcmp(d->name, "x30")) {
++            lr_reg[idx] = d->handle;
++        }
++    }
++}
++
++static void store(unsigned int vcpu, qemu_plugin_meminfo_t info,
++                  uint64_t vaddr, void *udata)
++{
++    uint64_t pc = (uintptr_t)udata;
++    qemu_plugin_mem_value v;
++    uint64_t val = 0, key;
++    gpointer n;
++
++    if (!qemu_plugin_mem_is_store(info) || vaddr < lo || vaddr >= hi) {
++        return;
++    }
++    v = qemu_plugin_mem_get_value(info);
++    switch (v.type) {
++    case QEMU_PLUGIN_MEM_VALUE_U8:  val = v.data.u8;  break;
++    case QEMU_PLUGIN_MEM_VALUE_U16: val = v.data.u16; break;
++    case QEMU_PLUGIN_MEM_VALUE_U32: val = v.data.u32; break;
++    case QEMU_PLUGIN_MEM_VALUE_U64: val = v.data.u64; break;
++    default: break;
++    }
++    key = (pc << 32) ^ vaddr;
++    g_mutex_lock(&lock);
++    n = g_hash_table_lookup(seen, &key);
++    if (GPOINTER_TO_UINT(n) < maxper) {
++        uint64_t *k = g_new(uint64_t, 1);
++
++        *k = key;
++        g_hash_table_replace(seen, k, GUINT_TO_POINTER(GPOINTER_TO_UINT(n) + 1));
++        fprintf(out, "%" PRId64 " cpu%u pc=0x%" PRIx64 " lr=0x%" PRIx64
++                " addr=0x%" PRIx64 " size=%u val=0x%" PRIx64 "\n",
++                g_get_monotonic_time() - t0, vcpu, pc, read_lr(vcpu), vaddr,
++                1u << qemu_plugin_mem_size_shift(info), val);
++        fflush(out);
++    }
++    g_mutex_unlock(&lock);
++}
++
++static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
++{
++    size_t n = qemu_plugin_tb_n_insns(tb);
++
++    for (size_t i = 0; i < n; i++) {
++        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
++        uint64_t pc = qemu_plugin_insn_vaddr(insn);
++
++        if (pc >= pclo && pc < pchi) {
++            qemu_plugin_register_vcpu_mem_cb(insn, store,
++                                             QEMU_PLUGIN_CB_R_REGS,
++                                             QEMU_PLUGIN_MEM_W,
++                                             (void *)(uintptr_t)pc);
++        }
++    }
++}
++
++static void at_exit(qemu_plugin_id_t id, void *p)
++{
++    if (out && out != stderr) {
++        fclose(out);
++    }
++}
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
++                                           const qemu_info_t *info,
++                                           int argc, char **argv)
++{
++    const char *path = NULL;
++
++    for (int i = 0; i < argc; i++) {
++        g_auto(GStrv) kv = g_strsplit(argv[i], "=", 2);
++
++        if (!kv[0] || !kv[1]) {
++            continue;
++        }
++        if (!strcmp(kv[0], "out")) {
++            path = argv[i] + 4;
++        } else if (!strcmp(kv[0], "lo")) {
++            lo = g_ascii_strtoull(kv[1], NULL, 0);
++        } else if (!strcmp(kv[0], "hi")) {
++            hi = g_ascii_strtoull(kv[1], NULL, 0);
++        } else if (!strcmp(kv[0], "pclo")) {
++            pclo = g_ascii_strtoull(kv[1], NULL, 0);
++        } else if (!strcmp(kv[0], "pchi")) {
++            pchi = g_ascii_strtoull(kv[1], NULL, 0);
++        } else if (!strcmp(kv[0], "max")) {
++            maxper = g_ascii_strtoull(kv[1], NULL, 0);
++        }
++    }
++    out = path ? fopen(path, "w") : stderr;
++    if (!out) {
++        return -1;
++    }
++    seen = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
++    t0 = g_get_monotonic_time();
++    fprintf(out, "# stores to [0x%" PRIx64 ", 0x%" PRIx64 ") from code in "
++            "[0x%" PRIx64 ", 0x%" PRIx64 ")\n", lo, hi, pclo, pchi);
++    qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
++    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
++    qemu_plugin_register_atexit_cb(id, at_exit, NULL);
++    return 0;
++}
+-- 
+2.55.0
+

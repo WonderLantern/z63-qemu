@@ -1,0 +1,454 @@
+From bb1aa2cf90a5210359a74edb23254c2d0883b5a1 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 05:47:12 +0000
+Subject: [PATCH 15/47] Z 6III: the body's buttons -- the MCU's I2C expanders
+ answer, and MENU opens
+
+With mcu-image= the body MCU builds the key report itself (family 2 kind
+1, sub_8043C2C; the EXPEED's sub_41011850 names its bytes), and it read
+every button held. Most buttons are behind two devices on FMPI2C1, 0x22
+and 0x23: the switch service reads each one's three input ports
+(sub_80352C4 -> sub_8034800: 8-bit addresses 0x44 and 0x46, register 0,
+three bytes, table 0x80583c8) and takes a button as pressed when its bit
+is 0 (sub_803D998 / sub_803DA14: ~input & mask). As a plain register
+file both read 0 -- MENU, PLAY, OK, the multi-selector, the
+sub-selector, DISP, i, DELETE, zoom, Fn, the movie-record button, all
+held for ever. They now answer their input ports from levels, 1 =
+released unless the board presses one: the input port of a 24-bit I/O
+expander of the TCA6424A kind, whose two addresses these are. DECLARED:
+released = 1; the part is not identified.
+
+At run time the expander task ("IoExpCyc", sub_8034D18) reads both every
+~12 ms and hands the bytes to the key task (sub_80449F4 -> sub_8044960),
+so no interrupt line is needed. Which MCU pins the parts' INT outputs
+reach is not known, and the two tried were worse than none: PC7 is a
+shutter position sensor (asserting it made the shutter report status 6
+and the camera post error 0x39), and EXTI7 on PG7 resets the MCU. INT is
+not modelled.
+
+Those polled reads are interrupt-driven, and FMPI2C1 raised only NACK and
+STOP: a read began and never finished, so the input buffer at 0x20019e04
+never changed (found by watching it with z63watch). The event line now
+also follows TXIE/TXIS, RXIE/RXNE and TCIE with TC or TCR, and is
+re-evaluated after an RXDR read.
+
+hw/arm/nikon-z63-mcukeys.h names the buttons: the expander bits through
+the key task's run-time tables (0x80578d6 for 0x23: MENU is bit 6, key
+byte 37, report byte 0x43; 0x22's names are the power-on path's and not
+yet checked against 0x80578be), plus the GPIO ones from the MCU's pin
+tables (shutter half PG1, full PG13, AF-ON PG2, ISO PC2), which now idle
+released along with the 10-pin remote's inputs. -machine mcu-keys=,
+qom-set /machine mcu-keys (':'-separated, empty releases all) and the
+display window's keyboard press them; mcu-pins= still overrides a pin.
+
+Verified, with the SNOR_USER body's sensor tables emptied: the camera
+comes up in photo mode with nothing held; shutter half and full press
+produce key reports; MENU opens the setup menu; down moves the
+selection, left goes to the tab column, up to the playback menu, right
+enters it.
+
+Where it stands: a half press to leave the menu restarts live view, and
+the restart ends in camera error 0x35 or 0x40, varying from run to run.
+At boot the camera says the memory card cannot be accessed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-mcukeys.h | 179 +++++++++++++++++++++++++++++++++++++
+ hw/arm/nikon-z63-stm32.h   |  88 +++++++++++++++++-
+ hw/arm/nikon-z63.c         |  26 +++++-
+ 3 files changed, 286 insertions(+), 7 deletions(-)
+ create mode 100644 hw/arm/nikon-z63-mcukeys.h
+
+diff --git a/hw/arm/nikon-z63-mcukeys.h b/hw/arm/nikon-z63-mcukeys.h
+new file mode 100644
+index 0000000..f0b4866
+--- /dev/null
++++ b/hw/arm/nikon-z63-mcukeys.h
+@@ -0,0 +1,179 @@
++/*
++ * Nikon Z 6III -- the body's buttons, as the real MCU reads them.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * With mcu-image= the body MCU's own switch service builds the key report
++ * the EXPEED decodes (family 2 kind 1, sub_8043C2C; decoded by the EXPEED's
++ * sub_41011850 into the ID_SW0/1/2 banks of the name table at 0x42b8b27c).
++ * The MCU reads its buttons from two places:
++ *
++ *   - GPIO pins, through pin tables in its flash (sub_803BA3C / table
++ *     0x8057adc, sub_803B914 / 0x8057b0c, sub_803B9F4 / 0x8057b3c), each
++ *     entry a pin id ((port << 4) | pin) and an active level (0 for all
++ *     used here): the shutter's half press PG1 and full press PG13, the
++ *     10-pin remote's PG14/PG15, AF-ON PG2, ISO PC2, AF-ON (vertical) PF6,
++ *     the 10-pin Fn PB11;
++ *   - the two I2C button expanders (nikon-z63-stm32.h): word 0x200141c0
++ *     from one, word 0x200141c4 from the other (sub_803D998, sub_803DA14),
++ *     a bit per button, active low.
++ *
++ * Bit -> switch, followed through the switch service: the 61-row table at
++ * 0x8056cf8 turns word bits into per-button bytes (sub_803D6F8), those
++ * become the report's bytes (sub_804388C; the two selectors through the
++ * direction encoder sub_8044348), and the EXPEED's decoder names each byte.
++ * At run time the key task (sub_8044960) maps each expander bit to a key
++ * byte through the tables at 0x80578be (0x22) and 0x80578d6 (0x23); for
++ * 0x23 those tables, not the power-on words, give the names below (MENU is
++ * key byte 37 = 0x23 bit 6, which the report carries at 0x43).
++ *
++ * Without this every one of those inputs read 0 -- every button held,
++ * among them MENU, PLAY, OK, DELETE, i and the movie-record button -- and
++ * the shutter fully pressed. The board now holds them released (1) from
++ * machine init, and presses them by name: -machine mcu-keys=, qom-set
++ * /machine mcu-keys at run time, or the display window's keyboard.
++ * mcu-pins= still overrides any pin afterwards.
++ */
++
++#ifndef HW_ARM_NIKON_Z63_MCUKEYS_H
++#define HW_ARM_NIKON_Z63_MCUKEYS_H
++
++typedef struct Z63McuKey {
++    const char *name;
++    uint8_t expander;           /* I2C address, or 0 for a GPIO pin */
++    uint8_t port, bit;          /* GPIO port 0..10 and pin, or expander bit */
++    const char *also;           /* pressed with it ("full" holds "half") */
++} Z63McuKey;
++
++static const Z63McuKey z63_mcu_key_map[] = {
++    /* GPIO, active low */
++    { "half",         0, 6, 1 },            /* PG1  RELEASE_HALF */
++    { "full",         0, 6, 13, "half" },   /* PG13 RELEASE_ON */
++    { "af-on",        0, 6, 2 },            /* PG2  AF_ON */
++    { "iso",          0, 2, 2 },            /* PC2  ISO */
++    /* expander 0x23 (word 0x200141c4 at power-on) */
++    { "ss-center",    0x23, 0, 0 },
++    { "ss-down",      0x23, 0, 1 },
++    { "ss-right",     0x23, 0, 2 },
++    { "ss-up",        0x23, 0, 3 },
++    { "ss-left",      0x23, 0, 4 },
++    { "play",         0x23, 0, 5 },
++    { "menu",         0x23, 0, 6 },
++    { "i",            0x23, 0, 7 },
++    { "disp",         0x23, 0, 8 },
++    { "release-mode", 0x23, 0, 9 },
++    { "ok",           0x23, 0, 11 },
++    { "left",         0x23, 0, 12 },
++    { "down",         0x23, 0, 13 },
++    { "right",        0x23, 0, 14 },
++    { "up",           0x23, 0, 15 },
++    { "zoom-out",     0x23, 0, 16 },        /* THUMBNAIL */
++    { "zoom-in",      0x23, 0, 17 },        /* ZOOM */
++    { "delete",       0x23, 0, 18 },
++    /* expander 0x22 (word 0x200141c0 at power-on). These names are the
++     * power-on path's; the run-time table at 0x80578be sends bits 9..13 to
++     * key bytes 63, 36, 35, 9, 45, which have not been followed to the
++     * EXPEED's names yet. */
++    { "illuminate",   0x22, 0, 2 },
++    { "movie",        0x22, 0, 3 },         /* movie-record button */
++    { "fn-v",         0x22, 0, 9 },         /* FUNCTION_VPOS */
++    { "fn2",          0x22, 0, 10 },
++    { "fn",           0x22, 0, 11 },
++    { "exp-comp",     0x22, 0, 12 },
++};
++
++/* The GPIO inputs that must idle released: the keys above and the 10-pin
++ * remote's half/full press and Fn, and the vertical AF-ON. */
++static const uint8_t z63_mcu_key_idle_pins[][2] = {
++    { 6, 1 }, { 6, 13 }, { 6, 2 }, { 2, 2 },
++    { 6, 14 }, { 6, 15 }, { 1, 11 }, { 5, 6 },
++};
++
++static void z63_mcukey_drive(Z63Stm32 *m, const Z63McuKey *k, bool down)
++{
++    if (k->expander) {
++        z63_stm32_expander_set(m, k->expander, k->bit, down);
++    } else {
++        z63_stm32_gpio_drive(&m->gpio[k->port], k->bit, !down);
++    }
++}
++
++static const Z63McuKey *z63_mcukey_find(const char *name)
++{
++    for (size_t i = 0; i < ARRAY_SIZE(z63_mcu_key_map); i++) {
++        if (!strcmp(z63_mcu_key_map[i].name, name)) {
++            return &z63_mcu_key_map[i];
++        }
++    }
++    return NULL;
++}
++
++static void z63_mcukeys_init(Z63Stm32 *m)
++{
++    for (size_t i = 0; i < ARRAY_SIZE(z63_mcu_key_idle_pins); i++) {
++        z63_stm32_gpio_drive(&m->gpio[z63_mcu_key_idle_pins[i][0]],
++                             z63_mcu_key_idle_pins[i][1], 1);
++    }
++}
++
++/* Hold exactly the named keys (':'-separated; empty releases all). */
++static bool z63_mcukeys_set(Z63Stm32 *m, const char *list, Error **errp)
++{
++    g_auto(GStrv) names = g_strsplit_set(list ? list : "", ":,", -1);
++    bool held[ARRAY_SIZE(z63_mcu_key_map)] = { false };
++
++    for (char **n = names; *n; n++) {
++        const Z63McuKey *k;
++
++        if (!**n) {
++            continue;
++        }
++        k = z63_mcukey_find(*n);
++        if (!k) {
++            error_setg(errp, "mcu-keys: unknown key '%s'", *n);
++            return false;
++        }
++        held[k - z63_mcu_key_map] = true;
++        if (k->also) {
++            held[z63_mcukey_find(k->also) - z63_mcu_key_map] = true;
++        }
++    }
++    for (size_t i = 0; i < ARRAY_SIZE(z63_mcu_key_map); i++) {
++        z63_mcukey_drive(m, &z63_mcu_key_map[i], held[i]);
++    }
++    error_report("Z63_MCUKEYS: held: %s", list && *list ? list : "(none)");
++    return true;
++}
++
++/* The display window's keyboard. */
++static void z63_mcukeys_kbd(Z63Stm32 *m, int qcode, bool down)
++{
++    static const struct { int qcode; const char *name; } map[] = {
++        { Q_KEY_CODE_UP, "up" }, { Q_KEY_CODE_DOWN, "down" },
++        { Q_KEY_CODE_LEFT, "left" }, { Q_KEY_CODE_RIGHT, "right" },
++        { Q_KEY_CODE_RET, "ok" }, { Q_KEY_CODE_KP_ENTER, "ok" },
++        { Q_KEY_CODE_M, "menu" }, { Q_KEY_CODE_P, "play" },
++        { Q_KEY_CODE_BACKSPACE, "delete" }, { Q_KEY_CODE_DELETE, "delete" },
++        { Q_KEY_CODE_H, "half" }, { Q_KEY_CODE_SPC, "full" },
++        { Q_KEY_CODE_D, "disp" }, { Q_KEY_CODE_I, "i" },
++        { Q_KEY_CODE_F1, "fn" }, { Q_KEY_CODE_F2, "fn2" },
++        { Q_KEY_CODE_R, "movie" }, { Q_KEY_CODE_A, "af-on" },
++        { Q_KEY_CODE_EQUAL, "zoom-in" }, { Q_KEY_CODE_MINUS, "zoom-out" },
++        { Q_KEY_CODE_W, "ss-up" }, { Q_KEY_CODE_S, "ss-down" },
++        { Q_KEY_CODE_Q, "ss-left" }, { Q_KEY_CODE_E, "ss-right" },
++    };
++
++    for (size_t i = 0; i < ARRAY_SIZE(map); i++) {
++        if (map[i].qcode == qcode) {
++            const Z63McuKey *k = z63_mcukey_find(map[i].name);
++
++            z63_mcukey_drive(m, k, down);
++            if (k->also) {
++                z63_mcukey_drive(m, z63_mcukey_find(k->also), down);
++            }
++            return;
++        }
++    }
++}
++
++#endif /* HW_ARM_NIKON_Z63_MCUKEYS_H */
+diff --git a/hw/arm/nikon-z63-stm32.h b/hw/arm/nikon-z63-stm32.h
+index a54ba36..d1d49fa 100644
+--- a/hw/arm/nikon-z63-stm32.h
++++ b/hw/arm/nikon-z63-stm32.h
+@@ -161,6 +161,10 @@ struct Z63Stm32 {
+         uint8_t regs[256], ptr;
+         bool ptr_set;
+         uint64_t writes, reads;
++        /* The two button expanders (below z63_stm32_i2c_dev_at): input
++         * levels, 1 = released; logged, the last levels reported. */
++        bool expander;
++        uint32_t inputs, logged;
+     } i2c_dev[5];
+ 
+     struct Z63Stm32I2c {
+@@ -687,6 +691,25 @@ static void z63_stm32_gpio_drive(Z63Stm32Gpio *g, unsigned pin, bool level)
+     }
+ }
+ 
++/* Press (active) or release one input of a button expander (addr 0x22 or
++ * 0x23, bit 0..23); the MCU sees it at its next poll. */
++static bool z63_stm32_expander_set(Z63Stm32 *m, uint8_t addr, unsigned bit,
++                                   bool active)
++{
++    for (unsigned i = 0; i < ARRAY_SIZE(m->i2c_dev); i++) {
++        struct Z63Stm32I2cDev *d = &m->i2c_dev[i];
++        uint32_t was;
++
++        if (!d->expander || d->addr != addr || bit > 23) {
++            continue;
++        }
++        was = d->inputs;
++        d->inputs = active ? was & ~(1u << bit) : was | (1u << bit);
++        return true;
++    }
++    return false;
++}
++
+ /* "G7=1,C5=0": drive those inputs. */
+ static bool z63_stm32_pins(Z63Stm32 *m, const char *spec, Error **errp)
+ {
+@@ -1065,6 +1088,33 @@ static const struct { uint8_t bus, addr; } z63_stm32_i2c_dev_at[5] = {
+     { 3, 0x22 }, { 3, 0x23 },                   /* FMPI2C1 */
+ };
+ 
++/*
++ * The two FMPI2C1 devices are the body's button expanders. The switch
++ * service reads each one's three input ports (sub_80352C4 -> sub_8034800:
++ * 8-bit addresses 0x44 and 0x46, register 0, 3 bytes, table 0x80583c8)
++ * and takes a button as pressed when its input bit is 0 and it is enabled
++ * (sub_803D998 / sub_803DA14: ~input & mask) -- active low. MENU, PLAY,
++ * OK, the multi-selector, the sub-selector, DISP, i, DELETE, the zoom
++ * buttons, Fn1/Fn2, the movie-record button and more are here (the map is
++ * in nikon-z63-mcukeys.h). While the camera is on, the expander task
++ * ("IoExpCyc", sub_8034D18) reads both every ~12 ms (sub_803505C ->
++ * sub_80352C4) and hands the bytes to the key task (sub_80449F4 ->
++ * sub_8044960), so no interrupt line is needed for a press to be seen.
++ * Which MCU pins the parts' INT outputs reach is not known; asserting one
++ * on a guessed pin is worse than none (PC7 is a shutter position sensor,
++ * and EXTI7/PG7 reset the MCU), so INT is not modelled.
++ *
++ * Read as the plain register file above, every input was 0: every one of
++ * those buttons held, for ever. So these two answer their input ports
++ * (registers 0..2) from pin levels instead -- 1, released, unless the board
++ * presses a button (z63_stm32_expander_set). That is the input port of a
++ * 24-bit I/O expander of the TCA6424A kind, whose two addresses these
++ * are; the part is not identified, and everything else in it is still the
++ * register file. DECLARED: released = 1 (the firmware's active-low
++ * reading).
++ */
++static const uint8_t z63_stm32_expander_at[2] = { 0x22, 0x23 };
++
+ static Z63Stm32I2cDev *z63_stm32_i2c_find(Z63Stm32 *m, unsigned bus,
+                                           uint8_t addr, bool read,
+                                           uint8_t *nack_named)
+@@ -1103,6 +1153,19 @@ static void z63_stm32_i2c_dev_write(Z63Stm32I2cDev *d, uint8_t b)
+ static uint8_t z63_stm32_i2c_dev_read(Z63Stm32I2cDev *d)
+ {
+     d->reads++;
++    if (d->expander && d->ptr < 3) {
++        uint8_t v = d->inputs >> (8 * d->ptr);
++
++        /* The first reads, and then every read that sees a change. */
++        if (d->ptr == 0 && (d->reads <= 4 || d->inputs != d->logged)) {
++            error_report("Z63_STM32: button expander 0x%02x inputs read: "
++                         "0x%06x (pc=0x%08x, read %" PRIu64 ")", d->addr,
++                         d->inputs, z63_stm32_pc(), d->reads);
++            d->logged = d->inputs;
++        }
++        d->ptr++;
++        return v;
++    }
+     return d->regs[d->ptr++];
+ }
+ 
+@@ -1297,11 +1360,19 @@ static void z63_stm32_i2c_reset(Z63Stm32I2c *c)
+ #define Z63_FMP_ISR_STOPF (1u << 5)
+ #define Z63_FMP_ISR_BUSY  (1u << 15)
+ 
++/* Event sources (RM0402 FMPI2C_CR1): TXIE/TXIS, RXIE/RXNE, NACKIE/NACKF,
++ * STOPIE/STOPF and TCIE with TC or TCR. Polled and DMA transfers never
++ * set the first two enables; the button expanders' interrupt-driven reads
++ * (nikon-z63-mcukeys.h) wait on RXNE and TC, and without them a read began
++ * and never finished. No error source is ever raised here. */
+ static void z63_stm32_fmpi2c_irq(Z63Stm32 *m)
+ {
+     uint32_t cr1 = m->fmpi2c.cr1, isr = m->fmpi2c.isr;
+-    bool ev = ((cr1 & (1u << 4)) && (isr & Z63_FMP_ISR_NACKF)) ||    /* NACKIE */
+-              ((cr1 & (1u << 5)) && (isr & Z63_FMP_ISR_STOPF));      /* STOPIE */
++    bool ev = ((cr1 & (1u << 1)) && (isr & (1u << 1))) ||           /* TXIE */
++              ((cr1 & (1u << 2)) && (isr & (1u << 2))) ||           /* RXIE */
++              ((cr1 & (1u << 4)) && (isr & Z63_FMP_ISR_NACKF)) ||    /* NACKIE */
++              ((cr1 & (1u << 5)) && (isr & Z63_FMP_ISR_STOPF)) ||    /* STOPIE */
++              ((cr1 & (1u << 6)) && (isr & ((1u << 6) | (1u << 7)))); /* TCIE */
+ 
+     qemu_set_irq(m->fmpi2c.ev_irq, ev);
+ }
+@@ -1384,6 +1455,7 @@ static uint64_t z63_stm32_fmpi2c_read(void *opaque, hwaddr off, unsigned size)
+ 
+             m->fmpi2c.isr &= ~(1u << 2);
+             z63_stm32_fmpi2c_step(m);
++            z63_stm32_fmpi2c_irq(m);
+             return v;
+         }
+         }
+@@ -2480,8 +2552,16 @@ static void z63_stm32_init(Z63Stm32 *m, Object *owner, const char *image,
+     }
+ 
+     for (unsigned i = 0; i < ARRAY_SIZE(m->i2c_dev); i++) {
+-        m->i2c_dev[i].bus = z63_stm32_i2c_dev_at[i].bus;
+-        m->i2c_dev[i].addr = z63_stm32_i2c_dev_at[i].addr;
++        Z63Stm32I2cDev *d = &m->i2c_dev[i];
++
++        d->bus = z63_stm32_i2c_dev_at[i].bus;
++        d->addr = z63_stm32_i2c_dev_at[i].addr;
++        for (unsigned e = 0; e < ARRAY_SIZE(z63_stm32_expander_at); e++) {
++            if (d->bus == 3 && d->addr == z63_stm32_expander_at[e]) {
++                d->expander = true;
++                d->inputs = d->logged = 0xffffff; /* every button released */
++            }
++        }
+     }
+     for (unsigned i = 0; i < 3; i++) {
+         g_autofree char *name = g_strdup_printf("z63-mcu-i2c%u", i + 1);
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index cdcc69e..b35d5b7 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -604,6 +604,7 @@ static uint64_t z63_current_pc(void);
+ #include "hw/arm/nikon-z63-audio.h"
+ #include "hw/arm/nikon-z63-mcu.h"
+ #include "hw/arm/nikon-z63-stm32.h"    /* the MCU itself, as the board's peer */
++#include "hw/arm/nikon-z63-mcukeys.h"   /* its buttons */
+ #include "hw/arm/nikon-z63-wlsd.h"
+ #include "hw/arm/nikon-z63-stream154c.h"
+ #include "hw/arm/nikon-z63-dev199.h"
+@@ -3605,10 +3606,18 @@ static void z63_kbd_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
+     NikonZ63State *s = NIKON_Z63(qdev_get_machine());
+     InputKeyEvent *key;
+ 
+-    if (evt->type != INPUT_EVENT_KIND_KEY || !s->mcu_peer || !s->mcu.queue) {
++    if (evt->type != INPUT_EVENT_KIND_KEY) {
+         return;
+     }
+     key = evt->u.key.data;
++    if (s->real_mcu_built) {
++        z63_mcukeys_kbd(&s->real_mcu, qemu_input_key_value_to_qcode(key->key),
++                        key->down);
++        return;
++    }
++    if (!s->mcu_peer || !s->mcu.queue) {
++        return;
++    }
+     z63_mcu_kbd(&s->mcu, qemu_input_key_value_to_qcode(key->key), key->down);
+ }
+ 
+@@ -4304,6 +4313,12 @@ static void z63_init(MachineState *machine)
+          * which is why mcu-image= on its own left the handshake pins
+          * reading 0 no matter what the MCU was doing. */
+         s->mcu_peer = false;
++        /* Its buttons, released, and any held from the command line
++         * (nikon-z63-mcukeys.h). */
++        z63_mcukeys_init(&s->real_mcu);
++        if (s->mcu_keys && *s->mcu_keys) {
++            z63_mcukeys_set(&s->real_mcu, s->mcu_keys, &error_fatal);
++        }
+         /* mcu-pins=G7=1,C5=0 drives the MCU's own inputs, standing in for
+          * the wires the EXPEED holds. Without it the MCU's floating inputs
+          * read 0 and the handshake never starts. nikon-z63-stm32.h. */
+@@ -4908,8 +4923,13 @@ static void z63_prop_set_mcu_keys(Object *obj, const char *value,
+     NikonZ63State *s = NIKON_Z63(obj);
+ 
+     /* Before the machine is built this is the report sent after the boot
+-     * sequence; afterwards (qom-set) it is sent at once. */
+-    if (s->mcu_peer && s->mcu.queue) {
++     * sequence; afterwards (qom-set) it is sent at once. With the real MCU
++     * it is the buttons' levels, applied at once or at machine init. */
++    if (s->real_mcu_built) {
++        if (!z63_mcukeys_set(&s->real_mcu, value, errp)) {
++            return;
++        }
++    } else if (s->mcu_peer && s->mcu.queue) {
+         if (!z63_mcu_keys(&s->mcu, value, errp)) {
+             return;
+         }
+-- 
+2.55.0
+

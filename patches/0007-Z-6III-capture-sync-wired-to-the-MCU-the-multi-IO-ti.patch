@@ -1,0 +1,310 @@
+From d39426757f0ec52277a36e26b56856cf6bc932f3 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Sun, 11 Oct 2026 17:32:19 +0000
+Subject: [PATCH 07/47] Z 6III: capture-sync wired to the MCU; the multi-IO
+ timer counts
+
+Capture sync. CAPCOM's request/completion pair now reaches the body
+MCU's own pins. The mechanism manager (the module behind family 9) arms
+PF4 as EXTI line 4, rising (pin descriptor 0x2001A178, id 0x54) when it
+takes the mode command, and raises PD7 (0x2001A174, id 0x37) when its
+operation is done. mcu-wires= therefore defaults to
+B12=a3:2+E3=a3:3+D12=a4:3+G6=a4:7+F4=a3:12+D7=a3:7. Verified by running:
+the EXPEED raises port 3 bit 12, the MCU answers on PD7, the EXPEED's
+completion callback (sub_4117D560) runs -- not its timeout -- and CAPSEQ
+gets 0x03030004. Each wire's first changes are now logged both ways
+(Z63_MCU_WIRE), so an edge that never comes is visible.
+
+Multi-IO timer. 0x0E000000..0x0E001FFF, so far part of a plain register
+file, is the SoC's 13-channel timer block: channel n interrupts on INTID
+0x9B + n (TIMER_n in this image's name table; its driver init
+sub_40C19A7C enables 155..167), each channel handler acknowledges
+0x0E000110 + n * 0x100, the global enable bitmap is 0x0E001000. That is
+../z9-qemu's multi-io-counter-model register for register, and the
+import already carries it; with z9-capture=on it is now attached
+(default props), its ten counters wired on the board's GIC, and the E0
+window asks the front model first for that range. It matters because
+the sensor power-up sequence (sub_4115EDF4, run by CAPTG at boot) times
+every step on channel 5 and waits for its interrupt with no timeout:
+CAPTG sat in that wait from boot, so it never took the controller's
+"start" (bit 2) at live view. Now the sequence completes.
+
+Where it stands. With the sensor powered up, CSEQ waits 1 s on CSEQEV10
+for FrontEnd's "sensor ready". FrontEnd starts the sensor
+(sub_410AC918) and waits 400 ms for its completion, which the sensor
+interface's status interrupts (INTIDs 0xFE..0x105) would produce; the
+capture models do not produce them, so FrontEnd logs 7624, CSEQ times
+out with 0x1EA7, and the GUI -- which now draws the full movie shooting
+screen -- shows "Error. Turn the camera off and on again." Shortly after,
+the GUI issues a graphics draw start (0x48 reg 0x640) that ../z9-qemu
+never needed, and the graphics model stops the machine there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c    | 21 ++++++++++++--
+ hw/arm/nikon-z63-z9lab.h    | 19 +++++++++++--
+ hw/arm/nikon-z63.c          | 56 +++++++++++++++++++++++++++++++++----
+ z63-tools/z9lab_attach.c.in | 21 ++++++++++++--
+ 4 files changed, 105 insertions(+), 12 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index 31657a8..49229a1 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -14160,10 +14160,11 @@ type_init(nikon_z9_register_types)
+  *   0x6a  RSZ     engine1542 (RAW pipeline output)
+  *   0xfe/0xff/0x101/0x102/0x104 SIF_0/1/3/4/6  the 0x1508 event block
+  *   0x134 MVD     engine1524 MVD
++ *   0x9b..0xa4 TIMER_0..9  the multi-IO timer block (multi-io-counter-model)
+  *
+  * Switches the Z 9 profile has that belong to blocks this board models
+  * itself are refused: the display (engine1548-*), graphics, NOR, NAND,
+- * serial, I2C, ADC, bus windows, timers, the low service RAM/controller,
++ * serial, I2C, ADC, bus windows, the low service RAM/controller,
+  * the 0x13807d00 control block (nikon-z63.c's 0x138xxxxx window), and the
+  * CPU-patch event model.
+  */
+@@ -14174,7 +14175,7 @@ static const char *const z63_z9lab_refused[] = {
+     "graphics-image-model", "graphics-path-model", "graphics-clear-model",
+     "engine1548-config-model", "engine1548-control-model",
+     "engine1548-scanout-model", "orientation-fixture",
+-    "multi-io-counter-model", "low-service-ram-model",
++    "low-service-ram-model",
+     "low-service-status-input", "service-controller-model",
+     "service-controller-status-input", "service-cluster-inputs",
+     "control1380-model", "control1380-busy-input",
+@@ -14295,6 +14296,22 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     s->event_global0_irq = qdev_get_gpio_in(gic, 0xff - 32);
+     s->event_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_timing_expire, s);
++    /* The multi-IO timer block (0x0e000000/0x0e001000), wired as
++     * ../z9-qemu's machine init wires it: channel n on INTID 0x9b + n. This
++     * image's own driver init (sub_40C19A7C) enables exactly 155..167, and
++     * its per-channel handlers (sub_40C19634 ...) acknowledge the status at
++     * 0x0e000110 + n * 0x100, the layout the model implements. */
++    if (s->multi_io_counter_model) {
++        for (unsigned ch = 0; ch < 10; ch++) {
++            Z9MultiCounter *c = &s->multi_counter[ch];
++
++            c->owner = s;
++            c->channel = ch;
++            s->multi_counter_irq[ch] = qdev_get_gpio_in(gic, 0x9b + ch - 32);
++            c->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, multi_counter_expire,
++                                    c);
++        }
++    }
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index 07a5ef4..4d9bad4 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -96,10 +96,20 @@ static const char z63_z9lab_default_props[] =
+     "stream154c-stop-model=on;"
+     "event1508-stop-model=on;"
+     "engine150d-readback-input=0:0:0:0:0;"
++    "multi-io-counter-model=on;"
+     "z63-boundary-ms=33";
+ 
+ #define Z63_Z9LAB_LO 0x15000000ULL
+ #define Z63_Z9LAB_HI 0x16100000ULL
++/* The multi-IO timer block, ../z9-qemu's multi-io-counter-model: channel
++ * interrupt registers at 0x0e000100 + n * 0x100, the global enables at
++ * 0x0e001000.. and channel configuration at 0x0e001100 + n * 0x100. The
++ * sensor power-up sequence (sub_4115EDF4) times each of its steps on
++ * channel 5 and waits for its interrupt without a timeout. */
++#define Z63_Z9LAB_MIO_LO 0x0e000000ULL
++#define Z63_Z9LAB_MIO_HI 0x0e002000ULL
++#define Z63_Z9LAB_PAGES  (((Z63_Z9LAB_HI - Z63_Z9LAB_LO) >> 12) + \
++                          ((Z63_Z9LAB_MIO_HI - Z63_Z9LAB_MIO_LO) >> 12))
+ 
+ static Object *z63_z9lab;   /* NULL unless -machine z9-capture=on */
+ static unsigned long *z63_z9lab_named;
+@@ -109,6 +119,9 @@ static unsigned long *z63_z9lab_named;
+  * board's. */
+ static bool z63_z9lab_range(hwaddr addr)
+ {
++    if (addr >= Z63_Z9LAB_MIO_LO && addr < Z63_Z9LAB_MIO_HI) {
++        return true;
++    }
+     return addr >= Z63_Z9LAB_LO && addr < Z63_Z9LAB_HI &&
+            !(addr >= 0x15480000 && addr < 0x154c0000) &&
+            !(addr >= 0x15540000 && addr < 0x15560000);
+@@ -116,7 +129,9 @@ static bool z63_z9lab_range(hwaddr addr)
+ 
+ static void z63_z9lab_name(hwaddr addr, bool write, uint64_t value)
+ {
+-    unsigned page = (addr - Z63_Z9LAB_LO) >> 12;
++    unsigned page = addr >= Z63_Z9LAB_LO ? (addr - Z63_Z9LAB_LO) >> 12 :
++                    ((Z63_Z9LAB_HI - Z63_Z9LAB_LO) >> 12) +
++                    ((addr - Z63_Z9LAB_MIO_LO) >> 12);
+ 
+     if (!test_and_set_bit(page, z63_z9lab_named)) {
+         error_report("Z63_Z9LAB: page 0x%" HWADDR_PRIx " answered by "
+@@ -164,7 +179,7 @@ static bool z63_z9lab_init(Object *owner, DeviceState *gic, uint64_t ram_size,
+     if (!z63_z9lab) {
+         return false;
+     }
+-    z63_z9lab_named = bitmap_new((Z63_Z9LAB_HI - Z63_Z9LAB_LO) >> 12);
++    z63_z9lab_named = bitmap_new(Z63_Z9LAB_PAGES);
+     return true;
+ }
+ 
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 615d17e..8f2b44d 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -628,8 +628,14 @@ typedef struct Z63DmaBank {
+ typedef struct Z63McuWire {
+     uint8_t a53_bank, a53_bit;
+     uint8_t mcu_port, mcu_pin;
++    uint8_t level;              /* last level the EXPEED put on it */
++    uint8_t named;              /* level changes logged so far */
+ } Z63McuWire;
+ 
++/* Each wire's first changes either way are named on stderr, so an edge that
++ * never arrives is as visible as one that does. */
++#define Z63_MCU_WIRE_NAMED 8
++
+ #define Z63_MCU_WIRES_MAX 16
+ 
+ 
+@@ -1911,8 +1917,20 @@ static void z63_wires_drive_mcu(NikonZ63State *s, unsigned bank,
+         Z63McuWire *w = &s->wires[i];
+ 
+         if (w->a53_bank == bank) {
+-            z63_stm32_gpio_drive(&s->real_mcu.gpio[w->mcu_port], w->mcu_pin,
+-                                 (value >> w->a53_bit) & 1);
++            unsigned level = (value >> w->a53_bit) & 1;
++            Z63Stm32Gpio *g = &s->real_mcu.gpio[w->mcu_port];
++
++            if (level != w->level &&
++                ((g->moder >> (2 * w->mcu_pin)) & 3) != 1 &&
++                w->named < Z63_MCU_WIRE_NAMED) {
++                w->named++;
++                error_report("Z63_MCU_WIRE: EXPEED port %u bit %u -> P%c%u "
++                             "= %u (pc=0x%" PRIx64 ")", w->a53_bank,
++                             w->a53_bit, 'A' + w->mcu_port, w->mcu_pin,
++                             level, z63_current_pc());
++            }
++            w->level = level;
++            z63_stm32_gpio_drive(g, w->mcu_pin, level);
+         }
+     }
+ }
+@@ -1935,7 +1953,15 @@ static void z63_wires_pin_out(void *opaque, unsigned port, unsigned pin,
+     for (unsigned i = 0; i < s->n_wires; i++) {
+         Z63McuWire *w = &s->wires[i];
+ 
+-        if (w->mcu_port == port && w->mcu_pin == pin && w->a53_bank == 3) {
++        if (w->mcu_port != port || w->mcu_pin != pin) {
++            continue;
++        }
++        if (w->named < Z63_MCU_WIRE_NAMED) {
++            w->named++;
++            error_report("Z63_MCU_WIRE: P%c%u -> EXPEED port %u bit %u = %u",
++                         'A' + port, pin, w->a53_bank, w->a53_bit, level);
++        }
++        if (w->a53_bank == 3) {
+             z63_extint_set(&s->extint, w->a53_bit, level);
+         }
+     }
+@@ -2604,7 +2630,14 @@ static const MemoryRegionOps z63_cfg7_ops = {
+ static uint64_t z63_win_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     Z63Win *w = opaque;
++    uint64_t value;
+ 
++    /* The multi-IO timer block inside E0 is ../z9-qemu's model when
++     * z9-capture=on (nikon-z63-z9lab.h); everything else here stays a
++     * plain register file. */
++    if (z63_front_read(w->base + addr, size, &value)) {
++        return value;
++    }
+     if (size != 4 || (addr & 3) || addr >= w->size) {
+         z63_stop_read(w->name, w->base + addr, size);
+         return 0;
+@@ -2617,6 +2650,9 @@ static void z63_win_write(void *opaque, hwaddr addr, uint64_t value,
+ {
+     Z63Win *w = opaque;
+ 
++    if (z63_front_write(w->base + addr, value, size)) {
++        return;
++    }
+     if (size != 4 || (addr & 3) || addr >= w->size) {
+         z63_stop_write(w->name, w->base + addr, size, value);
+         return;
+@@ -4526,9 +4562,17 @@ static void z63_machine_instance_init(Object *obj)
+      * live EXTI_IMR has bit 6 set), where the link module's callback posts
+      * the "link established" flag bit that the transmit loop waits for --
+      * without this wire that loop retries its 128-word frame on a timeout
+-     * for ever. Only meaningful with mcu-image=; the synthetic peer answers
+-     * those ports itself. Overridable with mcu-wires=. */
+-    s->mcu_wires = g_strdup("B12=a3:2+E3=a3:3+D12=a4:3+G6=a4:7");
++     * for ever. Then CAPCOM's capture-sync pair (nikon-z63-mcu.h): EXPEED
++     * pin 43 = port 3 bit 12, the request, -> MCU PF4, which the mechanism
++     * manager arms as EXTI line 4, rising (its family-9 mode-command path,
++     * sub_803B404 -> sub_803A614; pin descriptor at 0x2001A178, id 0x54);
++     * and MCU PD7 (descriptor at 0x2001A174, id 0x37), which the same
++     * module raises when its operation is done (sub_803A820), -> EXPEED
++     * port 3 bit 7, pin 38, EXT_INT_7 rising, the completion. Only
++     * meaningful with mcu-image=; the synthetic peer answers those ports
++     * itself. Overridable with mcu-wires=. */
++    s->mcu_wires = g_strdup("B12=a3:2+E3=a3:3+D12=a4:3+G6=a4:7"
++                            "+F4=a3:12+D7=a3:7");
+     s->mcu_spi_peer = g_strdup("1:0+4:1");    /* see Z63McuSpiLink */
+     s->sio_sink = g_strdup("9"); /* the rear panel; nikon-z63-sio.h */
+     s->storage_caps_stub = true; /* nikon-z63-storage.h, declared values */
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 3fad5de..316bfc7 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -16,10 +16,11 @@
+  *   0x6a  RSZ     engine1542 (RAW pipeline output)
+  *   0xfe/0xff/0x101/0x102/0x104 SIF_0/1/3/4/6  the 0x1508 event block
+  *   0x134 MVD     engine1524 MVD
++ *   0x9b..0xa4 TIMER_0..9  the multi-IO timer block (multi-io-counter-model)
+  *
+  * Switches the Z 9 profile has that belong to blocks this board models
+  * itself are refused: the display (engine1548-*), graphics, NOR, NAND,
+- * serial, I2C, ADC, bus windows, timers, the low service RAM/controller,
++ * serial, I2C, ADC, bus windows, the low service RAM/controller,
+  * the 0x13807d00 control block (nikon-z63.c's 0x138xxxxx window), and the
+  * CPU-patch event model.
+  */
+@@ -30,7 +31,7 @@ static const char *const z63_z9lab_refused[] = {
+     "graphics-image-model", "graphics-path-model", "graphics-clear-model",
+     "engine1548-config-model", "engine1548-control-model",
+     "engine1548-scanout-model", "orientation-fixture",
+-    "multi-io-counter-model", "low-service-ram-model",
++    "low-service-ram-model",
+     "low-service-status-input", "service-controller-model",
+     "service-controller-status-input", "service-cluster-inputs",
+     "control1380-model", "control1380-busy-input",
+@@ -151,6 +152,22 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     s->event_global0_irq = qdev_get_gpio_in(gic, 0xff - 32);
+     s->event_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_timing_expire, s);
++    /* The multi-IO timer block (0x0e000000/0x0e001000), wired as
++     * ../z9-qemu's machine init wires it: channel n on INTID 0x9b + n. This
++     * image's own driver init (sub_40C19A7C) enables exactly 155..167, and
++     * its per-channel handlers (sub_40C19634 ...) acknowledge the status at
++     * 0x0e000110 + n * 0x100, the layout the model implements. */
++    if (s->multi_io_counter_model) {
++        for (unsigned ch = 0; ch < 10; ch++) {
++            Z9MultiCounter *c = &s->multi_counter[ch];
++
++            c->owner = s;
++            c->channel = ch;
++            s->multi_counter_irq[ch] = qdev_get_gpio_in(gic, 0x9b + ch - 32);
++            c->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, multi_counter_expire,
++                                    c);
++        }
++    }
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+-- 
+2.55.0
+

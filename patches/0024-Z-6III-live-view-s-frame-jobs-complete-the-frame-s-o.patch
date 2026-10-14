@@ -1,0 +1,1217 @@
+From e232f9aa1ace2712eba039b899c9718555696a82 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 11:28:55 +0000
+Subject: [PATCH 24/47] Z 6III: live view's frame jobs complete -- the frame's
+ other completions
+
+Each live-view frame is a job of four lanes (stage table 0xa02be8690;
+grant sub_40D1A81C, release sub_40D1A5C8) and completes only when every
+lane's stages have run; each stage waits, with no timeout, on a flag an
+interrupt posts. ../z9-qemu's combined RAW pipeline raises the RSZ's A0
+and C0 bits after a frame's writes, which serves one lane; live view ran
+a frame or two and stopped. What the lanes wait for, and what now raises
+it (z63-lv-frame-done unless noted; DECLARED, read from what the firmware
+subscribes and waits for):
+
+- lane 2, sub_40E789CC: B0..B2 bit 12 (RSZ ISR sub_40C25CE8 ->
+  sub_40CB8700 -> client sub_40E6F56C -> flag 0x200000 of 0xa03d22008),
+  and in mode 5 flag 0x80000 from event 0x41d0013 -- engine 0x150c's
+  +0x210 bit 31, which the 0x106 ISR sub_40C1F978 passes with +0x204/
+  +0x21c as event 0x41110001 to the front end's sub_410AB2F8. The
+  firmware enables bit 31 in +0x20c (0xe0240048) and live view runs
+  engine bits 1 and 2; bits 29/30 are bits 1/16's frame ends, so bit 31
+  is read as bit 2's (z63-150c-path2-end; +0x210's W1C admits it);
+- lane 1, sub_40E75790: FRECT_LV (0x151c0000, engine1518[2]) bit 27 per
+  frame and bit 29 on the third frame since the gate opened and every
+  fourth after (sub_40E69FB8's own count at 0xa03d26eb0);
+- lane 3, sub_40E76A60: the RSZ one-shot E unit's bit 0 after it is
+  enabled (0x11 to +0x10150);
+- lane 0, stage 2: flag 1 of 0xa03d22008 (sub_40E75140), set on
+  0x41d0001, which sub_410AB2F8 sends once it has seen +0x204 bit 2 and
+  +0x210 bit 31 -- the Z 9 model's own engine150c-bit2-model, now on.
+  Its bit6 model is now off: with +0x204 bit 6 present, sub_40CAE2EC
+  reads unit 0x199's +0x14 (sub_40CAD5F0) and, idle, drops the whole
+  event, bit 2 with it;
+- lane 0, sub_40E76080: flag 0x200, set by sub_40E6DEC8 on event
+  0x410b0002 when MIPU_LV's status (0x15140000 +0x44, engine151[1],
+  passed by its ISR sub_40C0D7C4) has bit 3. ../z9-qemu's later
+  revision (deb3a75, raw-pipeline-1514-completion-model) found the same
+  bit 3 completion in the ZR image.
+
+The sensor-mode cycle. In a long exposure this image turns capture group
+0 of the 0x1508 block off and on every frame or two: sub_41169F08 stops
+it (0x4116a050) while the cycle at 0xa04ce11a8 says so, the channel-0
+frame callback sub_4115C5D0 counts frames and tells CaptureSequence
+0x203000c, whose handler (0x40f4009c) arms the restart sub_4116A4BC,
+which waits for global0 bit 7 and turns group 0 back on. The Z 9 model's
+frame clock ran only while group 0 was on and restarted its period at
+each enable, so neither the count nor the boundary came and group 0
+stayed off. z63-sensor-vd: once capture has run, the clock keeps its
+period while group 3 is on and engine 0x150c's primary path is live, and
+a tick with group 0 off raises only the sensor's own events (channel bit
+0, global0 bit 7). The capture events stay with group 0, and the RAW
+pipeline's frame is now made on the capture tick too, with that tick's
+statistics (z63-vd-statistics), owed if the last frame is not yet
+acknowledged -- a frame made off the tick had no statistics and no
+exposure frame end, and its job's lane 1 (sub_40E7383C) waited for ever.
+
+These edits to ../z9-qemu's files are made by import_z9lab.py (edit 7,
+nikon-z9-pixels.h now included), so the files are generated again.
+
+Verified: frame jobs complete and are posted to the display (83 in one
+run, against 2 before); MENU opens over live view and its cursor moves;
+no camera error in the last runs. smoke.sh passes.
+
+Where it stands: the photometry results read as black (see the DSP
+commit), so live view runs in its long-exposure mode -- the group 0
+cycle, frames in bursts at about 12 per second -- and stalls between
+bursts; a half press does not yet bring live view back from the menu.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-z9lab.c    | 300 +++++++++++++++++++++++++++++++++++-
+ hw/arm/nikon-z63-z9lab.h    |  25 ++-
+ hw/arm/nikon-z9-pixels.h    |  44 +++++-
+ z63-tools/import_z9lab.py   | 246 ++++++++++++++++++++++++++++-
+ z63-tools/z9lab_attach.c.in | 231 +++++++++++++++++++++++++++
+ 5 files changed, 834 insertions(+), 12 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index db196fa..ebc608a 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -182,6 +182,7 @@ typedef struct Z9Engine1518 {
+     qemu_irq irq;
+     bool irq_level;
+     uint64_t drains, drain_acks;
++    uint32_t z63_frames;    /* z63-lv-frame-done: frames since the gate opened */
+ } Z9Engine1518;
+ 
+ struct NikonZ9State {
+@@ -366,6 +367,13 @@ struct NikonZ9State {
+     uint64_t raw_pipeline_bank_written[2], raw_pipeline_batches, raw_pipeline_repeated_batches;
+     bool raw_pipeline_wait_bank;
+     bool raw_pipeline_refill_notified;
++    bool raw_pipeline_output_done;     /* z63-lv-frame-done */
++    bool z63_e_armed;                  /* the RSZ E unit was enabled */
++    unsigned z63_raw_owed;             /* capture ticks without their frame */
++    bool z63_path2_end;                /* z63-150c-path2-end: +0x210 bit 31 */
++    bool z63_sensor_vd;                /* z63-sensor-vd */
++    bool z63_sensor_started;           /* capture timing has run */
++    uint64_t z63_sensor_frames;
+     uint8_t *raw_pipeline_cache[3];
+     unsigned raw_pipeline_width[3], raw_pipeline_height[3], raw_pipeline_stride[3];
+     bool raw_pipeline_uv_half[3];
+@@ -478,6 +486,8 @@ struct NikonZ9State {
+     /* Optional software-view statistics fed by a real Bayer fixture. No
+      * physical sensor geometry or complete ISP semantics are inferred. */
+     bool statistics_model;
++    bool z63_vd_statistics;     /* z63-vd-statistics */
++    bool statistics_owed;       /* a frame boundary came while pending */
+     char *statistics_raw_path, *statistics_raw_sha256;
+     QEMUTimer *statistics_timer;
+     uint16_t statistics_means[12][30];
+@@ -6147,29 +6157,56 @@ static void set_event_channel_input(Object *obj, const char *value, Error **errp
+  * enabling group0 and channel0 is an observed control boundary, not a
+  * recovered physical sensor clock specification. It supplies only status
+  * edges to two already modeled IRQ paths, without modifying guest RAM/PC. */
++static bool z63_sensor_timing(NikonZ9State *s);
++
+ static void event_timing_update(NikonZ9State *s)
+ {
+     bool active = s->event1508_timing_model && s->event1508_aux_model &&
+         s->event1508_channel_model && s->event_timing_period_ns &&
+         (s->event_control_1508[0] & 1) && (s->event_control_1508[3] & 1);
+-    if (!s->event_timing_timer || active == s->event_timing_active) {
++    /* z63-sensor-vd (z9lab_attach.c.in): the clock keeps running while
++     * group 0 alone is off; event_timing_active stays the capture state. */
++    bool run = active || z63_sensor_timing(s);
++    if (!s->event_timing_timer) {
+         return;
+     }
+-    s->event_timing_active = active;
+     if (active) {
++        s->z63_sensor_started = true;
++    }
++    s->event_timing_active = active;
++    if (run && !timer_pending(s->event_timing_timer)) {
+         timer_mod(s->event_timing_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->event_timing_period_ns);
+-    } else {
++    } else if (!run) {
+         timer_del(s->event_timing_timer);
+     }
+ }
+ 
++static bool statistics_active(NikonZ9State *s);
++static void statistics_tick(void *opaque);
++
++static void z63_sensor_frame(NikonZ9State *s);
++static void raw_pipeline_tick(void *opaque);
++
+ static void event_timing_expire(void *opaque)
+ {
+     NikonZ9State *s = opaque;
+     if (!s->event_timing_active) {
++        if (z63_sensor_timing(s)) {
++            z63_sensor_frame(s);
++            timer_mod(s->event_timing_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->event_timing_period_ns);
++        }
+         return;
+     }
+     s->event_timing_ticks++;
++    /* z63-vd-statistics (z9lab_attach.c.in): one statistics delivery per
++     * frame boundary, owed while the last one is unacknowledged. */
++    if (s->z63_vd_statistics && statistics_active(s)) {
++        if (s->statistics_pending) {
++            s->statistics_owed = true;
++        } else {
++            statistics_tick(s);
++        }
++    }
+     /* Explicit counterfactual: one primary bit2 input at this lab clock
+      * boundary. The real callback maps it to 041d0001; neither physical
+      * sensor timing nor a pixel transfer is claimed by this input. */
+@@ -6179,6 +6216,14 @@ static void event_timing_expire(void *opaque)
+     if (s->engine150c_bit6_model) {
+         engine150c_bit6_pulse(s);
+     }
++    /* z63-lv-frame-done (z9lab_attach.c.in): the RAW pipeline's frame on
++     * this same capture tick, not on a clock of its own. */
++    if (s->raw_pipeline_output_done && s->raw_pipeline_model) {
++        if (s->z63_raw_owed < 2) {
++            s->z63_raw_owed++;
++        }
++        raw_pipeline_tick(s);
++    }
+     s->event_aux0_inputs++;
+     s->event_channel_inputs++;
+     /* Opt-in paired auxiliary boundaries. The original4115ab5c maps
+@@ -7844,6 +7889,15 @@ static void statistics_update(NikonZ9State *s)
+     if (!s->statistics_timer) {
+         return;
+     }
++    if (s->z63_vd_statistics) {
++        timer_del(s->statistics_timer);
++        if (s->statistics_owed && statistics_active(s) &&
++            !s->statistics_pending) {
++            s->statistics_owed = false;
++            statistics_tick(s);
++        }
++        return;
++    }
+     if (!statistics_active(s) || s->statistics_pending) {
+         timer_del(s->statistics_timer);
+     } else if (!timer_pending(s->statistics_timer)) {
+@@ -8971,7 +9025,8 @@ static bool engine150c_stop_write(NikonZ9State *s, hwaddr addr,
+                                                 (s->engine150c_bit2_model ? 4 : 0) |
+                                                 (s->engine150c_bit6_model ? 0x40 : 0)) :
+                            (primary_direct_map(direct_engines, 1, false) | (s->statistics_model ? 0x20 : 0) |
+-                            (s->raw_pipeline_model ? 0x60000000 : 0));
++                            (s->raw_pipeline_model ? 0x60000000 : 0) |
++                            (s->z63_path2_end ? 0x80000000u : 0));
+         if (size != 4 || (value & ~allowed)) {
+             goto invalid;
+         }
+@@ -10030,6 +10085,9 @@ static bool engine1518_write(NikonZ9State *s, hwaddr addr, uint64_t value,
+              * This normal completion is distinct from forced drain bit22. */
+             e->pending |= 1u << 21;
+         }
++        if (value && !e->config[off / 4]) {
++            e->z63_frames = 0;          /* z63-lv-frame-done */
++        }
+         e->config[off / 4] = value;
+         engine1518_update_irq(e);
+         fprintf(stderr, "Z9_1518_GATE instance=%d value=%" PRIu64 "\n", i, value);
+@@ -10978,6 +11036,9 @@ static bool engine1542_write(NikonZ9State *s, hwaddr addr, uint64_t value,
+         return true;
+     }
+     s->engine1542_config[i][off / 4] = value;
++    if (i == 14 && off == 0x50 && (value & 1)) {
++        s->z63_e_armed = true;          /* z63-lv-frame-done */
++    }
+     if (s->raw_pipeline_model && i == 10 && off >= 0x200 && off < 0x600 &&
+         (off & 0x7f) < 0x40) {
+         unsigned bank = (off - 0x200) / 0x200;
+@@ -14200,6 +14261,8 @@ typedef struct Z63Z9Boundary {
+     uint64_t deliveries, aux_deliveries;
+     bool frame_end;                     /* z63-150c-frame-end */
+     uint64_t frame_ends;
++    bool path2_end;                     /* z63-150c-path2-end */
++    uint64_t path2_ends;
+ } Z63Z9Boundary;
+ 
+ /*
+@@ -14244,6 +14307,106 @@ static void z63_z9lab_150c_frame_end(Z63Z9Boundary *b)
+     }
+ }
+ 
++/*
++ * Engine 0x150c's +0x210 bit 31, for the engine-bit-2 path. Live view runs
++ * the engine with bits 1 and 2 active (engine150c_active 6), and the
++ * firmware enables +0x210 bits 29, 30 and 31 (+0x20c = 0xe0240048, from
++ * boot, sub_40C202DC). Bits 29 and 30 are the frame ends of engine bits 1
++ * and 16 (above, and ../z9-qemu's own analysis); nothing here raised bit
++ * 31. Its reader: the 0x106 ISR sub_40C1F978 passes +0x204/+0x210/+0x21c
++ * as event 0x41110001 through sub_40CAE2EC to the front end's
++ * sub_410AB2F8, which forwards +0x210 bit 31 as 0x41d0013 (0x410abc00 ->
++ * 0x410abc3c) to its type-0x12 consumers. One of them is the live-view
++ * module's sub_40E69B78, which sets flag 0x80000 of 0xa03d22008 in mode 5;
++ * lane 2 of every live-view frame job but the first (sub_40E789CC, mode 5)
++ * waits for that flag with no timeout, so the second frame never
++ * completed.
++ *
++ * z63-150c-path2-end (default on) raises bit 31 at each frame boundary
++ * while engine bit 2 is live (active, not being stopped) and the
++ * firmware's +0x20c enables it, through the same pending word, mask and
++ * W1C as bits 29/30 (the import admits bit 31 to +0x210's W1C when this is
++ * on). DECLARED: that bit 31 belongs to engine bit 2 is an inference -- it
++ * is the only enabled +0x210 boundary bit left, and engine bit 2 the only
++ * live path without one -- and its timing is the boundary's, not
++ * measured.
++ */
++static void z63_z9lab_150c_path2_end(Z63Z9Boundary *b)
++{
++    NikonZ9State *s = b->s;
++    uint32_t live = s->engine150c_active & ~s->engine150c_stop_requested;
++    uint32_t bit = 0x80000000u & s->engine_150c_init[0x20c / 4] &
++                   ~s->raw_primary_pending;
++
++    if (!b->path2_end || !(live & 4) || !bit) {
++        return;
++    }
++    s->raw_primary_pending |= bit;
++    s->raw_primary_events++;
++    engine150c_stop_irq_update(s);
++    if (b->path2_ends++ == 0) {
++        fprintf(stderr, "Z63_150C: engine bit 2 path frame end (+0x210 bit "
++                "31) at the frame boundary -- see z9lab_attach.c.in\n");
++    }
++}
++
++/*
++ * The sensor's frame timing while capture group 0 is off. ../z9-qemu's
++ * frame timing (event_timing_expire: aux0, channel, global0 bit 7, global1
++ * bit 7, and with this board statistics and engine 0x150c's bit 2) runs
++ * only while groups 0 and 3 of the 0x1508 block are enabled, and restarts
++ * its period whenever they are. This image turns group 0 off and on again
++ * every frame or two while live view runs, a sensor-mode cycle: each frame
++ * sub_41169F08 (from CaptureSequence's sub_40F3F814) stops group 0
++ * (0x4116a050 -> sub_4116E6A8(0)) when the cycle at 0xa04ce11a8 calls for
++ * it; the channel-0 frame callback sub_4115C5D0 (the 0x1508 channel
++ * handler sub_40C2B438 dispatches +0x48 bit 0 to it) counts 0xa04ce11a8 up
++ * to 0xa04ce11aa and tells CaptureSequence 0x203000c, whose handler
++ * (sub_40F3FA6C, 0x40f4009c) arms the restart (event 0x20 -> sub_40F3AD88
++ * -> sub_4116A4BC), which waits for flag 4 of 0xa04ce0da0 -- set by the
++ * global0 callback sub_4115C8A4 on status bit 7, the next frame boundary
++ * -- and turns group 0 back on (sub_4116E694(0)). With the timing stopped
++ * there was no frame to count and no boundary: group 0 stayed off, the
++ * per-frame engine 0x150c and statistics inputs stopped with it, live view
++ * stalled after about a second, and CaptureSequence's frame watchdog ended
++ * it with error 0x40. And with the period restarted at each enable, a
++ * group that is on for less than a period never saw a frame at all.
++ *
++ * z63-sensor-vd (default on): once capture has run, the frame clock keeps
++ * its period while group 3 is on and engine 0x150c's primary path (engine
++ * bit 1) is live and not being stopped -- the image pipeline still expects
++ * the sensor's frames. At a tick with group 0 off it raises only the
++ * sensor's own frame events, channel bit 0 and global0 bit 7, through the
++ * z9 model's pending words, masks and W1C; the capture events (aux0,
++ * statistics, engine 0x150c bit 2, a RAW frame) stay with group 0.
++ * DECLARED: the sensor's frame timing carries on while a capture group is
++ * disabled; nothing of the stream is produced then.
++ */
++static bool z63_sensor_timing(NikonZ9State *s)
++{
++    uint32_t live = s->engine150c_active & ~s->engine150c_stop_requested;
++
++    return s->z63_sensor_vd && s->z63_sensor_started &&
++           s->event1508_timing_model && s->event_timing_period_ns &&
++           (s->event_control_1508[3] & 1) && (live & 2);
++}
++
++static void z63_sensor_frame(NikonZ9State *s)
++{
++    s->event_pending_1508 |= 1;
++    s->event_channel_inputs++;
++    event_channel_update_irq(s);
++    if (s->event1508_global0_model) {
++        s->event_global0_pending |= 0x80;
++        s->event_global0_inputs++;
++        event_global0_update_irq(s);
++    }
++    if (s->z63_sensor_frames++ == 0) {
++        fprintf(stderr, "Z63_1508: sensor frame (channel bit 0, global0 bit "
++                "7) with capture group 0 off -- see z9lab_attach.c.in\n");
++    }
++}
++
+ static void z63_z9lab_boundary_tick(void *opaque)
+ {
+     Z63Z9Boundary *b = opaque;
+@@ -14260,6 +14423,7 @@ static void z63_z9lab_boundary_tick(void *opaque)
+         b->aux_deliveries++;
+     }
+     z63_z9lab_150c_frame_end(b);
++    z63_z9lab_150c_path2_end(b);
+     b->deliveries++;
+     timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + b->period_ns);
+ }
+@@ -14338,6 +14502,81 @@ static void z63_z9lab_150c_started(NikonZ9State *s)
+  */
+ static bool z63_z9lab_lane0_ack_on;
+ 
++/*
++ * A live-view frame's other completions. In this image a frame is a job
++ * of several lanes (stage table 0xa02bde320), and it completes only when
++ * every lane's stages have run (0x40d1aac0 polls them); each stage waits
++ * on an event a device's interrupt posts. ../z9-qemu's combined pipeline
++ * raises the RSZ's A0 bits 0/4 and C0 bits 0/3 after a frame's writes,
++ * which serves the RSZ's own lane, and live view ran one frame, then
++ * stopped: the job pool ran dry and CaptureSequence's frame watchdog
++ * ended it with error 0x40. What the other lanes wait for:
++ *
++ *   - lane 2, sub_40E789CC: an output writer's frame end, B0..B2 status
++ *     bit 12 (the RSZ ISR sub_40C25CE8 reports B to sub_40CB8700 under
++ *     the subscription 0x1000 the live-view set-up leaves at 0xa02dc48a4;
++ *     the client callback sub_40E6F56C turns it into flag 0x200000);
++ *   - lane 1, sub_40E75790: FRECT_LV (device 0x1ce, 0x151c0000, INTID
++ *     0xf8; this model's engine1518[2]) status bit 27 once a frame, and
++ *     bit 29 when a bank of four rows is done -- sub_40E69FB8 counts bit
++ *     27 modulo 4 at 0xa03d26eb0 and, when the count reaches 3, waits for
++ *     bit 29 (flag 0x800000) before flipping banks (sub_40E5F9B4). The
++ *     firmware enables both in +0x08 (0x39f00000) and clears them through
++ *     +0x0c, as for the stop bits 21/22 above;
++ *   - lane 3, sub_40E76A60: after enabling the RSZ's one-shot E unit
++ *     (0x11 to +0x10150, sub_40C26234), its status bit 0 (+0x10154,
++ *     event 0x41160002);
++ *   - lane 0, sub_40E76080 (second stage): flag 0x200 of 0xa03d22008,
++ *     which sub_40E6DEC8 sets on event 0x410b0002 when the status it is
++ *     given has bit 3. That event is MIPU_LV's (device 0x1d0, 0x15140000,
++ *     INTID 0x10e; this model's engine151[1]): its handler sub_40C0D7C4
++ *     reads +0x44, writes it back and passes it as the event's argument.
++ *     ../z9-qemu's later revision (deb3a75, raw-pipeline-1514-completion-
++ *     model) found the same bit 3 completion after the RAW-derived writes
++ *     in the ZR image.
++ *
++ * z63-lv-frame-done (default on) raises them with the frame's other bits:
++ * B0..B2 bit 12; FRECT_LV, while its gate is open, bit 27 and, on the
++ * third frame since the gate opened and every fourth after, bit 29; E bit
++ * 0 at the first frame after it is enabled; MIPU_LV bit 3, through the
++ * model's own +0x44 pending, +0x40 mask and W1C. And it makes its frames
++ * on the capture tick of the sensor's frame timing -- the tick that also
++ * delivers the frame's statistics and engine 0x150c's bit 2 -- instead of
++ * on a 33.3 ms clock of its own: the sensor-mode cycle below turns capture
++ * group 0 off and on every frame or two in a long exposure, and a RAW
++ * frame made outside a capture tick had no statistics and no exposure-
++ * module frame end, so its job's lane 1 (sub_40E7383C) waited for ever.
++ * A tick whose frame cannot be made yet -- the last one not acknowledged
++ * -- owes it (up to two), and it is made as soon as it can be.
++ * ../z9-qemu's later revision likewise gates its new DMA on that timing.
++ * DECLARED: these meanings are
++ * read from what the firmware subscribes and waits for, not measured, and
++ * bit 29's phase is the one the firmware's own counter expects. Never A
++ * bits 8/12 or B bit 8: sub_40CB8700 takes those as errors and ends the
++ * run (sub_40CBA3FC).
++ */
++static bool z63_z9lab_lv_frame_done_on = true;
++
++/*
++ * Statistics per frame. ../z9-qemu's statistics model delivers a frame of
++ * statistics 33.3 ms after the firmware acknowledged the last one, on a
++ * clock of its own, so the deliveries drift against the sensor's frames.
++ * This image pairs them: each live-view frame job's lane 1 (sub_40E7383C)
++ * waits, with no timeout, for the exposure module's end of that frame --
++ * bit (frame id % 31) of 0xa03d22020, posted from event 0x40f0008
++ * (sub_41020C74 / sub_4102F2B0 -> sub_40F57A70 -> sub_40E80BE4) -- and a
++ * frame that had no statistics never gets one. z63-vd-statistics (default
++ * on) delivers one frame of statistics on each capture tick of the sensor's
++ * frame timing (event_timing_expire), the tick that also makes the RAW
++ * frame (z63-lv-frame-done), and, when the last delivery is still
++ * unacknowledged then, as soon as it is. DECLARED: one statistics frame per
++ * captured sensor frame, which is what the firmware's per-frame bookkeeping
++ * assumes; the content is the model's, as before.
++ */
++static bool z63_z9lab_vd_statistics_on = true;
++
++
++
+ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+ {
+     static uint64_t acks;
+@@ -14368,6 +14607,8 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     g_auto(GStrv) items = g_strsplit(props ? props : "", ";", -1);
+     uint64_t boundary_ms = 0;
+     bool frame_end = false;
++    bool path2_end = false;
++    bool sensor_vd = false;
+     bool lane0_ack = false;
+ 
+     s->compat = true;
+@@ -14391,6 +14632,41 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-vd-statistics")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-vd-statistics wants on "
++                           "or off");
++                goto fail;
++            }
++            z63_z9lab_vd_statistics_on = !strcmp(kv[1], "on");
++            continue;
++        }
++        if (!strcmp(kv[0], "z63-lv-frame-done")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-lv-frame-done wants on "
++                           "or off");
++                goto fail;
++            }
++            z63_z9lab_lv_frame_done_on = !strcmp(kv[1], "on");
++            continue;
++        }
++        if (!strcmp(kv[0], "z63-sensor-vd")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-sensor-vd wants on or off");
++                goto fail;
++            }
++            sensor_vd = !strcmp(kv[1], "on");
++            continue;
++        }
++        if (!strcmp(kv[0], "z63-150c-path2-end")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-150c-path2-end wants on "
++                           "or off");
++                goto fail;
++            }
++            path2_end = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-1508-lane0-ack")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-1508-lane0-ack wants on "
+@@ -14482,11 +14758,26 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         goto fail;
+     }
+     z63_z9lab_lane0_ack_on = lane0_ack;
++    s->raw_pipeline_output_done = z63_z9lab_lv_frame_done_on;
++    s->z63_vd_statistics = z63_z9lab_vd_statistics_on;
+     if (frame_end && !boundary_ms) {
+         error_setg(errp, "z9-capture: z63-150c-frame-end needs "
+                    "z63-boundary-ms");
+         goto fail;
+     }
++    if (path2_end && (!boundary_ms || !s->raw_pipeline_model)) {
++        error_setg(errp, "z9-capture: z63-150c-path2-end needs "
++                   "z63-boundary-ms and raw-pipeline-model");
++        goto fail;
++    }
++    s->z63_path2_end = path2_end;
++    if (sensor_vd && (!s->event1508_timing_model ||
++                      !s->event1508_channel_model)) {
++        error_setg(errp, "z9-capture: z63-sensor-vd needs "
++                   "event1508-timing-model and event1508-channel-model");
++        goto fail;
++    }
++    s->z63_sensor_vd = sensor_vd;
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+@@ -14498,6 +14789,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         }
+         b->s = s;
+         b->frame_end = frame_end;
++        b->path2_end = path2_end;
+         b->period_ns = boundary_ms * 1000000;
+         b->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_z9lab_boundary_tick, b);
+         timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index eb7c04c..f4e680f 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -6,8 +6,8 @@
+  *
+  * hw/arm/nikon-z63-z9lab.c is ../z9-qemu's Z 9 board file (WonderLantern;
+  * GPL-2.0-or-later), carried in by z63-tools/import_z9lab.py with the edits
+- * that script lists, plus its two pixel headers (nikon-z9-pixels.h,
+- * nikon-raw-pixels.h) unchanged. The Z 9 reached its live view with those
++ * that script lists, plus its two pixel headers (nikon-raw-pixels.h
++ * unchanged, nikon-z9-pixels.h with the live-view edits the script lists). The Z 9 reached its live view with those
+  * models: the sensor-interface event block at 0x15080000 with a periodic
+  * frame-boundary input, the ISP_APB configuration/submission blocks
+  * (0x194, 0x19b/0x19c, 0x19d), engines 0x150c/0x150d/0x1524 (+MVD), 0x1543,
+@@ -51,7 +51,22 @@
+  * live-view start reads bank 1 +0x24 (sub_40C2B218). Also this board's
+  * z63-150c-frame-end: engine 0x150c's primary path ending its frame at the
+  * boundary on its own while the combined RAW pipeline is not engaged (see
+- * the attachment section). And z63-1508-lane0-ack, with the z9 model's
++ * the attachment section), and z63-150c-path2-end: +0x210 bit 31, the
++ * frame end this board reads as engine bit 2's, which the live-view
++ * module's lane 2 waits for (attachment section), and z63-sensor-vd: the
++ * sensor's frame boundary (channel bit 0, global0 bit 7) carried on while capture group 0
++ * is off, which the sensor-mode change in the middle of live view waits for
++ * before it turns the group back on (attachment section). A third switch the Z 9
++ * profile leaves off is on: engine150c-bit2-model, the model's own
++ * "primary bit2 input at the lab clock boundary" (+0x204 bit 2, while
++ * engine bit 1 is active). Its note says the real callback maps it to
++ * 0x41d0001, and in this image it does: the front end's sub_410AB2F8
++ * counts +0x204 bit 2 (0x410ab35c) and then sends 0x41d0001 to its type-0
++ * consumers (0x410abe28), among them the live-view module's sub_40E69B78,
++ * which sets flag 1 of 0xa03d22008 -- what lane 0 of each live-view frame
++ * job waits for in its second stage (sub_40E75140, no timeout). Nothing
++ * else raised bit 2, and the first frame job never finished.
++ * And z63-1508-lane0-ack, with the z9 model's
+  * event1508-global0-bit10-model for its W1C: the sensor interface's lane-0
+  * request (+0x38 = 1) acknowledged on global0 bit 10, which the sensor
+  * module's stop before a live-view restart waits 150 ticks for (camera
+@@ -115,7 +130,7 @@ static const char z63_z9lab_default_props[] =
+     "zr-primary-bank1-model=on;"
+     "statistics-model=on;"
+     "primary-empty-end-model=on;"
+-    "engine150c-bit6-model=on;"
++    "engine150c-bit2-model=on;"
+     "stream154c-stop-model=on;"
+     "event1508-stop-model=on;"
+     "engine150d-readback-input=0:0:0:0:0;"
+@@ -123,6 +138,8 @@ static const char z63_z9lab_default_props[] =
+     "event1508-global0-bit10-model=on;"
+     "z63-boundary-ms=33;"
+     "z63-150c-frame-end=on;"
++    "z63-150c-path2-end=on;"
++    "z63-sensor-vd=on;"
+     "z63-1508-lane0-ack=on";
+ 
+ #define Z63_Z9LAB_LO 0x15000000ULL
+diff --git a/hw/arm/nikon-z9-pixels.h b/hw/arm/nikon-z9-pixels.h
+index 174eae2..f64456f 100644
+--- a/hw/arm/nikon-z9-pixels.h
++++ b/hw/arm/nikon-z9-pixels.h
+@@ -34,7 +34,16 @@ static void raw_pipeline_tick(void *opaque)
+     unsigned widths[3], heights[3], strides[3];
+     bool halves[3];
+     if (!s->raw_pipeline_model) { return; }
+-    timer_mod(s->raw_pipeline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
++    /* Z 6III (z63-lv-frame-done): a frame is owed per capture tick and made
++     * as soon as the last one is acknowledged, retried every 2 ms. */
++    if (s->raw_pipeline_output_done) {
++        if (!s->z63_raw_owed) {
++            return;
++        }
++        timer_mod(s->raw_pipeline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2000000);
++    } else {
++        timer_mod(s->raw_pipeline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
++    }
+     /* Wait for the original parameter and source-gate submissions. Holding
+      * a pending frame prevents overwriting buffers before the ISR accepts it. */
+     if (!s->raw_pixels || !s->engine1543_active[0] || s->engine1543_held[0] ||
+@@ -77,6 +86,12 @@ static void raw_pipeline_tick(void *opaque)
+         raw_pipeline_irq_update(s);
+         return;
+     }
++    /* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): a frame only while the
++     * sensor's capture timing runs, as ../z9-qemu's later revision does for
++     * its stopped-source profile. */
++    if (s->raw_pipeline_output_done && !s->event_timing_active) {
++        return;
++    }
+     for (unsigned ch = 0; ch < 3; ch++) {
+         const uint32_t *b = s->engine1542_config[3 + ch];
+         const uint32_t *f = s->engine1542_config[15 + ch];
+@@ -119,7 +134,34 @@ static void raw_pipeline_tick(void *opaque)
+         s->raw_pipeline_y[ch] = ys[ch]; s->raw_pipeline_uv[ch] = uvs[ch];
+         total += ybytes + uvbytes;
+     }
++    /* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): the frame's other
++     * completions. Each output's writer, B0..B2 bit 12; FRECT_LV, while
++     * its gate is open, bit 27 and on every fourth frame from the third
++     * bit 29; the RSZ E unit, once enabled, bit 0; MIPU_LV bit 3. */
++    if (s->raw_pipeline_output_done) {
++        Z9Engine1518 *fr = &s->engine1518[2];
++
++        for (unsigned ch = 0; ch < 3; ch++) {
++            s->engine1542_pending[3 + ch] |= 0x1000;
++        }
++        if (fr->config[0x30 / 4]) {
++            fr->pending |= 1u << 27;
++            if (++fr->z63_frames % 4 == 3) {
++                fr->pending |= 1u << 29;
++            }
++            engine1518_update_irq(fr);
++        }
++        if (s->z63_e_armed && (s->engine1542_config[14][0x50 / 4] & 1)) {
++            s->z63_e_armed = false;
++            s->engine1542_pending[14] |= 1;
++        }
++        s->engine151_pending[1] |= 8;
++        engine151_update_irq(s, 1);
++    }
+     s->raw_pipeline_frames++;
++    if (s->z63_raw_owed && --s->z63_raw_owed == 0) {
++        timer_del(s->raw_pipeline_timer);
++    }
+     s->raw_pipeline_bytes += total;
+     s->raw_pipeline_row = (row + 1) & 3;
+     /* The original40e94934 callback consumes A0 bits0/4 as input boundary
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index d90d0bd..b576267 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -27,7 +27,15 @@ The edits, each asserted to match exactly once (or the stated count):
+   5. the machine class fields go, and nikon_z9_init stays only as unused
+      reference (the attachment below replaces it);
+   6. an attachment section is appended: object creation, switches, and the
+-     capture interrupts and timers on the board's GIC.
++     capture interrupts and timers on the board's GIC;
++  7. the Z 6III's live-view edits, each behind a switch the attachment sets
++     and documents (z63-lv-frame-done, z63-vd-statistics, z63-150c-path2-end,
++     z63-sensor-vd): state for them, the frame clock that keeps running
++     while capture group 0 alone is off, statistics and the RAW pipeline's
++     frame on the frame clock's capture tick, +0x210 bit 31 admitted to
++     engine 0x150c's W1C, FRECT_LV's frame count reset when its gate opens,
++     the RSZ E unit's arming -- and in nikon-z9-pixels.h the frame's other
++     completions. With every switch off the models behave as ../z9-qemu's.
+ 
+ Nothing else in the files is changed. Re-run after updating ../z9-qemu and
+ review the diff; a failed assertion means the source moved under an edit.
+@@ -109,9 +117,241 @@ edit("    mc->init = nikon_z9_init;\n"
+ edit("    .parent = TYPE_MACHINE,\n", "    .parent = TYPE_OBJECT,\n")
+ edit("    .interfaces = aarch64_machine_interfaces,\n", "")
+ 
++# 7. The Z 6III's live-view edits (the switches are documented in
++# z9lab_attach.c.in).
++edit("    uint64_t drains, drain_acks;\n} Z9Engine1518;\n",
++     "    uint64_t drains, drain_acks;\n"
++     "    uint32_t z63_frames;    /* z63-lv-frame-done: frames since the gate opened */\n"
++     "} Z9Engine1518;\n")
++edit("    bool raw_pipeline_refill_notified;\n",
++     "    bool raw_pipeline_refill_notified;\n"
++     "    bool raw_pipeline_output_done;     /* z63-lv-frame-done */\n"
++     "    bool z63_e_armed;                  /* the RSZ E unit was enabled */\n"
++     "    unsigned z63_raw_owed;             /* capture ticks without their frame */\n"
++     "    bool z63_path2_end;                /* z63-150c-path2-end: +0x210 bit 31 */\n"
++     "    bool z63_sensor_vd;                /* z63-sensor-vd */\n"
++     "    bool z63_sensor_started;           /* capture timing has run */\n"
++     "    uint64_t z63_sensor_frames;\n")
++edit("    bool statistics_model;\n    char *statistics_raw_path, *statistics_raw_sha256;\n",
++     "    bool statistics_model;\n"
++     "    bool z63_vd_statistics;     /* z63-vd-statistics */\n"
++     "    bool statistics_owed;       /* a frame boundary came while pending */\n"
++     "    char *statistics_raw_path, *statistics_raw_sha256;\n")
++edit("""static void event_timing_update(NikonZ9State *s)
++{
++    bool active = s->event1508_timing_model && s->event1508_aux_model &&
++        s->event1508_channel_model && s->event_timing_period_ns &&
++        (s->event_control_1508[0] & 1) && (s->event_control_1508[3] & 1);
++    if (!s->event_timing_timer || active == s->event_timing_active) {
++        return;
++    }
++    s->event_timing_active = active;
++    if (active) {
++        timer_mod(s->event_timing_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->event_timing_period_ns);
++    } else {
++        timer_del(s->event_timing_timer);
++    }
++}
++
++static void event_timing_expire(void *opaque)
++{
++    NikonZ9State *s = opaque;
++    if (!s->event_timing_active) {
++        return;
++    }
++    s->event_timing_ticks++;
++""", """static bool z63_sensor_timing(NikonZ9State *s);
++
++static void event_timing_update(NikonZ9State *s)
++{
++    bool active = s->event1508_timing_model && s->event1508_aux_model &&
++        s->event1508_channel_model && s->event_timing_period_ns &&
++        (s->event_control_1508[0] & 1) && (s->event_control_1508[3] & 1);
++    /* z63-sensor-vd (z9lab_attach.c.in): the clock keeps running while
++     * group 0 alone is off; event_timing_active stays the capture state. */
++    bool run = active || z63_sensor_timing(s);
++    if (!s->event_timing_timer) {
++        return;
++    }
++    if (active) {
++        s->z63_sensor_started = true;
++    }
++    s->event_timing_active = active;
++    if (run && !timer_pending(s->event_timing_timer)) {
++        timer_mod(s->event_timing_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->event_timing_period_ns);
++    } else if (!run) {
++        timer_del(s->event_timing_timer);
++    }
++}
++
++static bool statistics_active(NikonZ9State *s);
++static void statistics_tick(void *opaque);
++
++static void z63_sensor_frame(NikonZ9State *s);
++static void raw_pipeline_tick(void *opaque);
++
++static void event_timing_expire(void *opaque)
++{
++    NikonZ9State *s = opaque;
++    if (!s->event_timing_active) {
++        if (z63_sensor_timing(s)) {
++            z63_sensor_frame(s);
++            timer_mod(s->event_timing_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->event_timing_period_ns);
++        }
++        return;
++    }
++    s->event_timing_ticks++;
++    /* z63-vd-statistics (z9lab_attach.c.in): one statistics delivery per
++     * frame boundary, owed while the last one is unacknowledged. */
++    if (s->z63_vd_statistics && statistics_active(s)) {
++        if (s->statistics_pending) {
++            s->statistics_owed = true;
++        } else {
++            statistics_tick(s);
++        }
++    }
++""")
++edit("""    if (s->engine150c_bit6_model) {
++        engine150c_bit6_pulse(s);
++    }
++    s->event_aux0_inputs++;
++""", """    if (s->engine150c_bit6_model) {
++        engine150c_bit6_pulse(s);
++    }
++    /* z63-lv-frame-done (z9lab_attach.c.in): the RAW pipeline's frame on
++     * this same capture tick, not on a clock of its own. */
++    if (s->raw_pipeline_output_done && s->raw_pipeline_model) {
++        if (s->z63_raw_owed < 2) {
++            s->z63_raw_owed++;
++        }
++        raw_pipeline_tick(s);
++    }
++    s->event_aux0_inputs++;
++""")
++edit("""static void statistics_update(NikonZ9State *s)
++{
++    if (!s->statistics_timer) {
++        return;
++    }
++""", """static void statistics_update(NikonZ9State *s)
++{
++    if (!s->statistics_timer) {
++        return;
++    }
++    if (s->z63_vd_statistics) {
++        timer_del(s->statistics_timer);
++        if (s->statistics_owed && statistics_active(s) &&
++            !s->statistics_pending) {
++            s->statistics_owed = false;
++            statistics_tick(s);
++        }
++        return;
++    }
++""")
++edit("                            (s->raw_pipeline_model ? 0x60000000 : 0));\n",
++     "                            (s->raw_pipeline_model ? 0x60000000 : 0) |\n"
++     "                            (s->z63_path2_end ? 0x80000000u : 0));\n")
++edit("""        e->config[off / 4] = value;
++        engine1518_update_irq(e);
++        fprintf(stderr, "Z9_1518_GATE instance=%d value=%" PRIu64 "\\n", i, value);
++""", """        if (value && !e->config[off / 4]) {
++            e->z63_frames = 0;          /* z63-lv-frame-done */
++        }
++        e->config[off / 4] = value;
++        engine1518_update_irq(e);
++        fprintf(stderr, "Z9_1518_GATE instance=%d value=%" PRIu64 "\\n", i, value);
++""")
++edit("""    s->engine1542_config[i][off / 4] = value;
++    if (s->raw_pipeline_model && i == 10 && off >= 0x200 && off < 0x600 &&
++""", """    s->engine1542_config[i][off / 4] = value;
++    if (i == 14 && off == 0x50 && (value & 1)) {
++        s->z63_e_armed = true;          /* z63-lv-frame-done */
++    }
++    if (s->raw_pipeline_model && i == 10 && off >= 0x200 && off < 0x600 &&
++""")
++
++# nikon-z9-pixels.h, with its own z63 edits (7).
++pixels = (src / "nikon-z9-pixels.h").read_text()
++
++
++def pedit(old, new):
++    global pixels
++    n = pixels.count(old)
++    if n != 1:
++        sys.exit("nikon-z9-pixels.h: expected 1 match, found %d:\n%s" % (n, old))
++    pixels = pixels.replace(old, new)
++
++
++pedit("""    if (!s->raw_pipeline_model) { return; }
++    timer_mod(s->raw_pipeline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
++""", """    if (!s->raw_pipeline_model) { return; }
++    /* Z 6III (z63-lv-frame-done): a frame is owed per capture tick and made
++     * as soon as the last one is acknowledged, retried every 2 ms. */
++    if (s->raw_pipeline_output_done) {
++        if (!s->z63_raw_owed) {
++            return;
++        }
++        timer_mod(s->raw_pipeline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2000000);
++    } else {
++        timer_mod(s->raw_pipeline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 33333333);
++    }
++""")
++pedit("""        raw_pipeline_irq_update(s);
++        return;
++    }
++    for (unsigned ch = 0; ch < 3; ch++) {
++        const uint32_t *b = s->engine1542_config[3 + ch];
++""", """        raw_pipeline_irq_update(s);
++        return;
++    }
++    /* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): a frame only while the
++     * sensor's capture timing runs, as ../z9-qemu's later revision does for
++     * its stopped-source profile. */
++    if (s->raw_pipeline_output_done && !s->event_timing_active) {
++        return;
++    }
++    for (unsigned ch = 0; ch < 3; ch++) {
++        const uint32_t *b = s->engine1542_config[3 + ch];
++""")
++pedit("""        total += ybytes + uvbytes;
++    }
++    s->raw_pipeline_frames++;
++""", """        total += ybytes + uvbytes;
++    }
++    /* Z 6III (z63-lv-frame-done, z9lab_attach.c.in): the frame's other
++     * completions. Each output's writer, B0..B2 bit 12; FRECT_LV, while
++     * its gate is open, bit 27 and on every fourth frame from the third
++     * bit 29; the RSZ E unit, once enabled, bit 0; MIPU_LV bit 3. */
++    if (s->raw_pipeline_output_done) {
++        Z9Engine1518 *fr = &s->engine1518[2];
++
++        for (unsigned ch = 0; ch < 3; ch++) {
++            s->engine1542_pending[3 + ch] |= 0x1000;
++        }
++        if (fr->config[0x30 / 4]) {
++            fr->pending |= 1u << 27;
++            if (++fr->z63_frames % 4 == 3) {
++                fr->pending |= 1u << 29;
++            }
++            engine1518_update_irq(fr);
++        }
++        if (s->z63_e_armed && (s->engine1542_config[14][0x50 / 4] & 1)) {
++            s->z63_e_armed = false;
++            s->engine1542_pending[14] |= 1;
++        }
++        s->engine151_pending[1] |= 8;
++        engine151_update_irq(s, 1);
++    }
++    s->raw_pipeline_frames++;
++    if (s->z63_raw_owed && --s->z63_raw_owed == 0) {
++        timer_del(s->raw_pipeline_timer);
++    }
++""")
++
+ attach = (here / "z9lab_attach.c.in").read_text()
+ (tree / "hw/arm/nikon-z63-z9lab.c").write_text(head + lab + attach)
+-for name in ("nikon-z9-pixels.h", "nikon-raw-pixels.h"):
+-    (tree / "hw/arm" / name).write_bytes((src / name).read_bytes())
++(tree / "hw/arm/nikon-z9-pixels.h").write_text(pixels)
++(tree / "hw/arm/nikon-raw-pixels.h").write_bytes(
++    (src / "nikon-raw-pixels.h").read_bytes())
+ print("wrote hw/arm/nikon-z63-z9lab.c (source sha256 %s) and the two pixel "
+       "headers" % sha)
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index e5c66db..fee12fb 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -56,6 +56,8 @@ typedef struct Z63Z9Boundary {
+     uint64_t deliveries, aux_deliveries;
+     bool frame_end;                     /* z63-150c-frame-end */
+     uint64_t frame_ends;
++    bool path2_end;                     /* z63-150c-path2-end */
++    uint64_t path2_ends;
+ } Z63Z9Boundary;
+ 
+ /*
+@@ -100,6 +102,106 @@ static void z63_z9lab_150c_frame_end(Z63Z9Boundary *b)
+     }
+ }
+ 
++/*
++ * Engine 0x150c's +0x210 bit 31, for the engine-bit-2 path. Live view runs
++ * the engine with bits 1 and 2 active (engine150c_active 6), and the
++ * firmware enables +0x210 bits 29, 30 and 31 (+0x20c = 0xe0240048, from
++ * boot, sub_40C202DC). Bits 29 and 30 are the frame ends of engine bits 1
++ * and 16 (above, and ../z9-qemu's own analysis); nothing here raised bit
++ * 31. Its reader: the 0x106 ISR sub_40C1F978 passes +0x204/+0x210/+0x21c
++ * as event 0x41110001 through sub_40CAE2EC to the front end's
++ * sub_410AB2F8, which forwards +0x210 bit 31 as 0x41d0013 (0x410abc00 ->
++ * 0x410abc3c) to its type-0x12 consumers. One of them is the live-view
++ * module's sub_40E69B78, which sets flag 0x80000 of 0xa03d22008 in mode 5;
++ * lane 2 of every live-view frame job but the first (sub_40E789CC, mode 5)
++ * waits for that flag with no timeout, so the second frame never
++ * completed.
++ *
++ * z63-150c-path2-end (default on) raises bit 31 at each frame boundary
++ * while engine bit 2 is live (active, not being stopped) and the
++ * firmware's +0x20c enables it, through the same pending word, mask and
++ * W1C as bits 29/30 (the import admits bit 31 to +0x210's W1C when this is
++ * on). DECLARED: that bit 31 belongs to engine bit 2 is an inference -- it
++ * is the only enabled +0x210 boundary bit left, and engine bit 2 the only
++ * live path without one -- and its timing is the boundary's, not
++ * measured.
++ */
++static void z63_z9lab_150c_path2_end(Z63Z9Boundary *b)
++{
++    NikonZ9State *s = b->s;
++    uint32_t live = s->engine150c_active & ~s->engine150c_stop_requested;
++    uint32_t bit = 0x80000000u & s->engine_150c_init[0x20c / 4] &
++                   ~s->raw_primary_pending;
++
++    if (!b->path2_end || !(live & 4) || !bit) {
++        return;
++    }
++    s->raw_primary_pending |= bit;
++    s->raw_primary_events++;
++    engine150c_stop_irq_update(s);
++    if (b->path2_ends++ == 0) {
++        fprintf(stderr, "Z63_150C: engine bit 2 path frame end (+0x210 bit "
++                "31) at the frame boundary -- see z9lab_attach.c.in\n");
++    }
++}
++
++/*
++ * The sensor's frame timing while capture group 0 is off. ../z9-qemu's
++ * frame timing (event_timing_expire: aux0, channel, global0 bit 7, global1
++ * bit 7, and with this board statistics and engine 0x150c's bit 2) runs
++ * only while groups 0 and 3 of the 0x1508 block are enabled, and restarts
++ * its period whenever they are. This image turns group 0 off and on again
++ * every frame or two while live view runs, a sensor-mode cycle: each frame
++ * sub_41169F08 (from CaptureSequence's sub_40F3F814) stops group 0
++ * (0x4116a050 -> sub_4116E6A8(0)) when the cycle at 0xa04ce11a8 calls for
++ * it; the channel-0 frame callback sub_4115C5D0 (the 0x1508 channel
++ * handler sub_40C2B438 dispatches +0x48 bit 0 to it) counts 0xa04ce11a8 up
++ * to 0xa04ce11aa and tells CaptureSequence 0x203000c, whose handler
++ * (sub_40F3FA6C, 0x40f4009c) arms the restart (event 0x20 -> sub_40F3AD88
++ * -> sub_4116A4BC), which waits for flag 4 of 0xa04ce0da0 -- set by the
++ * global0 callback sub_4115C8A4 on status bit 7, the next frame boundary
++ * -- and turns group 0 back on (sub_4116E694(0)). With the timing stopped
++ * there was no frame to count and no boundary: group 0 stayed off, the
++ * per-frame engine 0x150c and statistics inputs stopped with it, live view
++ * stalled after about a second, and CaptureSequence's frame watchdog ended
++ * it with error 0x40. And with the period restarted at each enable, a
++ * group that is on for less than a period never saw a frame at all.
++ *
++ * z63-sensor-vd (default on): once capture has run, the frame clock keeps
++ * its period while group 3 is on and engine 0x150c's primary path (engine
++ * bit 1) is live and not being stopped -- the image pipeline still expects
++ * the sensor's frames. At a tick with group 0 off it raises only the
++ * sensor's own frame events, channel bit 0 and global0 bit 7, through the
++ * z9 model's pending words, masks and W1C; the capture events (aux0,
++ * statistics, engine 0x150c bit 2, a RAW frame) stay with group 0.
++ * DECLARED: the sensor's frame timing carries on while a capture group is
++ * disabled; nothing of the stream is produced then.
++ */
++static bool z63_sensor_timing(NikonZ9State *s)
++{
++    uint32_t live = s->engine150c_active & ~s->engine150c_stop_requested;
++
++    return s->z63_sensor_vd && s->z63_sensor_started &&
++           s->event1508_timing_model && s->event_timing_period_ns &&
++           (s->event_control_1508[3] & 1) && (live & 2);
++}
++
++static void z63_sensor_frame(NikonZ9State *s)
++{
++    s->event_pending_1508 |= 1;
++    s->event_channel_inputs++;
++    event_channel_update_irq(s);
++    if (s->event1508_global0_model) {
++        s->event_global0_pending |= 0x80;
++        s->event_global0_inputs++;
++        event_global0_update_irq(s);
++    }
++    if (s->z63_sensor_frames++ == 0) {
++        fprintf(stderr, "Z63_1508: sensor frame (channel bit 0, global0 bit "
++                "7) with capture group 0 off -- see z9lab_attach.c.in\n");
++    }
++}
++
+ static void z63_z9lab_boundary_tick(void *opaque)
+ {
+     Z63Z9Boundary *b = opaque;
+@@ -116,6 +218,7 @@ static void z63_z9lab_boundary_tick(void *opaque)
+         b->aux_deliveries++;
+     }
+     z63_z9lab_150c_frame_end(b);
++    z63_z9lab_150c_path2_end(b);
+     b->deliveries++;
+     timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + b->period_ns);
+ }
+@@ -194,6 +297,81 @@ static void z63_z9lab_150c_started(NikonZ9State *s)
+  */
+ static bool z63_z9lab_lane0_ack_on;
+ 
++/*
++ * A live-view frame's other completions. In this image a frame is a job
++ * of several lanes (stage table 0xa02bde320), and it completes only when
++ * every lane's stages have run (0x40d1aac0 polls them); each stage waits
++ * on an event a device's interrupt posts. ../z9-qemu's combined pipeline
++ * raises the RSZ's A0 bits 0/4 and C0 bits 0/3 after a frame's writes,
++ * which serves the RSZ's own lane, and live view ran one frame, then
++ * stopped: the job pool ran dry and CaptureSequence's frame watchdog
++ * ended it with error 0x40. What the other lanes wait for:
++ *
++ *   - lane 2, sub_40E789CC: an output writer's frame end, B0..B2 status
++ *     bit 12 (the RSZ ISR sub_40C25CE8 reports B to sub_40CB8700 under
++ *     the subscription 0x1000 the live-view set-up leaves at 0xa02dc48a4;
++ *     the client callback sub_40E6F56C turns it into flag 0x200000);
++ *   - lane 1, sub_40E75790: FRECT_LV (device 0x1ce, 0x151c0000, INTID
++ *     0xf8; this model's engine1518[2]) status bit 27 once a frame, and
++ *     bit 29 when a bank of four rows is done -- sub_40E69FB8 counts bit
++ *     27 modulo 4 at 0xa03d26eb0 and, when the count reaches 3, waits for
++ *     bit 29 (flag 0x800000) before flipping banks (sub_40E5F9B4). The
++ *     firmware enables both in +0x08 (0x39f00000) and clears them through
++ *     +0x0c, as for the stop bits 21/22 above;
++ *   - lane 3, sub_40E76A60: after enabling the RSZ's one-shot E unit
++ *     (0x11 to +0x10150, sub_40C26234), its status bit 0 (+0x10154,
++ *     event 0x41160002);
++ *   - lane 0, sub_40E76080 (second stage): flag 0x200 of 0xa03d22008,
++ *     which sub_40E6DEC8 sets on event 0x410b0002 when the status it is
++ *     given has bit 3. That event is MIPU_LV's (device 0x1d0, 0x15140000,
++ *     INTID 0x10e; this model's engine151[1]): its handler sub_40C0D7C4
++ *     reads +0x44, writes it back and passes it as the event's argument.
++ *     ../z9-qemu's later revision (deb3a75, raw-pipeline-1514-completion-
++ *     model) found the same bit 3 completion after the RAW-derived writes
++ *     in the ZR image.
++ *
++ * z63-lv-frame-done (default on) raises them with the frame's other bits:
++ * B0..B2 bit 12; FRECT_LV, while its gate is open, bit 27 and, on the
++ * third frame since the gate opened and every fourth after, bit 29; E bit
++ * 0 at the first frame after it is enabled; MIPU_LV bit 3, through the
++ * model's own +0x44 pending, +0x40 mask and W1C. And it makes its frames
++ * on the capture tick of the sensor's frame timing -- the tick that also
++ * delivers the frame's statistics and engine 0x150c's bit 2 -- instead of
++ * on a 33.3 ms clock of its own: the sensor-mode cycle below turns capture
++ * group 0 off and on every frame or two in a long exposure, and a RAW
++ * frame made outside a capture tick had no statistics and no exposure-
++ * module frame end, so its job's lane 1 (sub_40E7383C) waited for ever.
++ * A tick whose frame cannot be made yet -- the last one not acknowledged
++ * -- owes it (up to two), and it is made as soon as it can be.
++ * ../z9-qemu's later revision likewise gates its new DMA on that timing.
++ * DECLARED: these meanings are
++ * read from what the firmware subscribes and waits for, not measured, and
++ * bit 29's phase is the one the firmware's own counter expects. Never A
++ * bits 8/12 or B bit 8: sub_40CB8700 takes those as errors and ends the
++ * run (sub_40CBA3FC).
++ */
++static bool z63_z9lab_lv_frame_done_on = true;
++
++/*
++ * Statistics per frame. ../z9-qemu's statistics model delivers a frame of
++ * statistics 33.3 ms after the firmware acknowledged the last one, on a
++ * clock of its own, so the deliveries drift against the sensor's frames.
++ * This image pairs them: each live-view frame job's lane 1 (sub_40E7383C)
++ * waits, with no timeout, for the exposure module's end of that frame --
++ * bit (frame id % 31) of 0xa03d22020, posted from event 0x40f0008
++ * (sub_41020C74 / sub_4102F2B0 -> sub_40F57A70 -> sub_40E80BE4) -- and a
++ * frame that had no statistics never gets one. z63-vd-statistics (default
++ * on) delivers one frame of statistics on each capture tick of the sensor's
++ * frame timing (event_timing_expire), the tick that also makes the RAW
++ * frame (z63-lv-frame-done), and, when the last delivery is still
++ * unacknowledged then, as soon as it is. DECLARED: one statistics frame per
++ * captured sensor frame, which is what the firmware's per-frame bookkeeping
++ * assumes; the content is the model's, as before.
++ */
++static bool z63_z9lab_vd_statistics_on = true;
++
++
++
+ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+ {
+     static uint64_t acks;
+@@ -224,6 +402,8 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     g_auto(GStrv) items = g_strsplit(props ? props : "", ";", -1);
+     uint64_t boundary_ms = 0;
+     bool frame_end = false;
++    bool path2_end = false;
++    bool sensor_vd = false;
+     bool lane0_ack = false;
+ 
+     s->compat = true;
+@@ -247,6 +427,41 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+             }
+             continue;
+         }
++        if (!strcmp(kv[0], "z63-vd-statistics")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-vd-statistics wants on "
++                           "or off");
++                goto fail;
++            }
++            z63_z9lab_vd_statistics_on = !strcmp(kv[1], "on");
++            continue;
++        }
++        if (!strcmp(kv[0], "z63-lv-frame-done")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-lv-frame-done wants on "
++                           "or off");
++                goto fail;
++            }
++            z63_z9lab_lv_frame_done_on = !strcmp(kv[1], "on");
++            continue;
++        }
++        if (!strcmp(kv[0], "z63-sensor-vd")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-sensor-vd wants on or off");
++                goto fail;
++            }
++            sensor_vd = !strcmp(kv[1], "on");
++            continue;
++        }
++        if (!strcmp(kv[0], "z63-150c-path2-end")) {
++            if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
++                error_setg(errp, "z9-capture: z63-150c-path2-end wants on "
++                           "or off");
++                goto fail;
++            }
++            path2_end = !strcmp(kv[1], "on");
++            continue;
++        }
+         if (!strcmp(kv[0], "z63-1508-lane0-ack")) {
+             if (strcmp(kv[1], "on") && strcmp(kv[1], "off")) {
+                 error_setg(errp, "z9-capture: z63-1508-lane0-ack wants on "
+@@ -338,11 +553,26 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         goto fail;
+     }
+     z63_z9lab_lane0_ack_on = lane0_ack;
++    s->raw_pipeline_output_done = z63_z9lab_lv_frame_done_on;
++    s->z63_vd_statistics = z63_z9lab_vd_statistics_on;
+     if (frame_end && !boundary_ms) {
+         error_setg(errp, "z9-capture: z63-150c-frame-end needs "
+                    "z63-boundary-ms");
+         goto fail;
+     }
++    if (path2_end && (!boundary_ms || !s->raw_pipeline_model)) {
++        error_setg(errp, "z9-capture: z63-150c-path2-end needs "
++                   "z63-boundary-ms and raw-pipeline-model");
++        goto fail;
++    }
++    s->z63_path2_end = path2_end;
++    if (sensor_vd && (!s->event1508_timing_model ||
++                      !s->event1508_channel_model)) {
++        error_setg(errp, "z9-capture: z63-sensor-vd needs "
++                   "event1508-timing-model and event1508-channel-model");
++        goto fail;
++    }
++    s->z63_sensor_vd = sensor_vd;
+     if (boundary_ms) {
+         Z63Z9Boundary *b = g_new0(Z63Z9Boundary, 1);
+ 
+@@ -354,6 +584,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+         }
+         b->s = s;
+         b->frame_end = frame_end;
++        b->path2_end = path2_end;
+         b->period_ns = boundary_ms * 1000000;
+         b->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, z63_z9lab_boundary_tick, b);
+         timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+-- 
+2.55.0
+

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Z 6III</title>
+    <link rel="stylesheet" href="./src/style.css" />
+    <link rel="stylesheet" href="./src/camera.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <span class="mark"></span>
+        <div>
+          <div class="name">Z 6III</div>
+          <div class="sub">nikon-z63 · QEMU</div>
+        </div>
+      </div>
+      <div class="state">
+        <span id="pill" class="pill off"><i></i><b id="state">off</b></span>
+        <span id="run" class="run"></span>
+        <span id="detail" class="detail"></span>
+      </div>
+      <div class="actions">
+        <span id="fps" class="fps"></span>
+        <button id="power" class="act" title="Boot a new run, or end this one">Power</button>
+        <button id="restart" class="act" title="End this run and boot a new one">Restart</button>
+        <button id="pause" class="act" title="Stop or continue the vCPUs">Pause</button>
+        <button id="zoomBtn" class="act" title="The monitor at 1:1 (touch works there too)">1:1</button>
+        <button id="shot" class="act" title="Save the monitor's picture next to the run's logs">Screenshot</button>
+        <button id="dockToggle" class="act" title="Show or hide the debug dock">Debug</button>
+      </div>
+    </header>
+
+    <main class="stage">
+      <section class="body-wrap" id="bodyWrap">
+        <div class="body" id="body"><!-- camera.ts --></div>
+      </section>
+
+      <aside class="side">
+        <section class="panel shoulder">
+          <div class="panel-head"><h2>Top</h2><span class="hint" id="topHint">control panel · drawn by the body MCU · click it to enlarge</span></div>
+          <div class="topwrap" id="topWrap"><div class="topview" id="top"><!-- camera.ts --></div></div>
+          <div class="front" id="front"><span class="hint">front</span></div>
+        </section>
+
+        <section class="panel console">
+          <div class="panel-head">
+            <h2>Linux console</h2>
+            <span class="hint">UART · RTOS and Linux share it</span>
+            <div class="seg" id="conFilter">
+              <button data-f="all" class="on">All</button>
+              <button data-f="kernel">Kernel</button>
+              <button data-f="other">Other</button>
+            </div>
+            <button class="mini" id="conFollow" title="Keep the newest line in view">Follow</button>
+            <button class="mini" id="conClear">Clear</button>
+          </div>
+          <pre class="log" id="conLog"></pre>
+          <form class="prompt" id="conForm">
+            <span>#</span>
+            <input id="conInput" autocomplete="off" spellcheck="false" placeholder="type to the BusyBox shell; Enter sends" />
+            <button type="button" class="mini" id="conCtrlC" title="Send ^C">^C</button>
+          </form>
+        </section>
+      </aside>
+
+      <section class="dock" id="dock">
+        <nav class="tabs" id="tabs">
+          <button data-tab="stderr" class="on">QEMU stderr <em id="stderrCount"></em></button>
+          <button data-tab="fw">Firmware log <em id="fwCount"></em></button>
+          <button data-tab="mon">Monitor</button>
+          <button data-tab="run">Run</button>
+        </nav>
+        <div class="tab on" data-tab="stderr">
+          <div class="tab-tools">
+            <input id="errFilter" class="filter" placeholder="filter -- text, or /regex/" spellcheck="false" />
+            <button class="mini" id="errFollow">Follow</button>
+            <span class="hint" id="errMuted"></span>
+          </div>
+          <div class="split">
+            <pre class="log" id="errLog"></pre>
+            <div class="tags"><table id="tagTable"></table></div>
+          </div>
+        </div>
+        <div class="tab" data-tab="fw">
+          <div class="tab-tools">
+            <input id="fwFilter" class="filter" placeholder="filter -- text, or /regex/" spellcheck="false" />
+            <button class="mini" id="fwFollow">Follow</button>
+          </div>
+          <pre class="log" id="fwLog"></pre>
+        </div>
+        <div class="tab" data-tab="mon">
+          <div class="tab-tools" id="monChips">
+            <button class="chip">info status</button>
+            <button class="chip">info cpus</button>
+            <button class="chip">info registers -a</button>
+            <button class="chip">x/8i $pc</button>
+            <button class="chip">info qtree</button>
+          </div>
+          <pre class="log" id="monLog"></pre>
+          <form class="prompt" id="monForm">
+            <span>(qemu)</span>
+            <input id="monInput" autocomplete="off" spellcheck="false" placeholder="a monitor command, e.g. xp /4wx 0xa03d74928" />
+          </form>
+        </div>
+        <div class="tab" data-tab="run"><div class="runinfo" id="runInfo"></div></div>
+      </section>
+    </main>
+
+    <div class="zoom" id="zoom" hidden>
+      <canvas id="zoomLcd" width="1024" height="682"></canvas>
+      <p>The monitor at 1:1 -- it takes touches like the body's. <button class="mini" id="zoomClose">Close (Esc)</button></p>
+    </div>
+    <div class="toasts" id="toasts"></div>
+    <script type="module" src="./src/app.ts"></script>
+  </body>
+</html>

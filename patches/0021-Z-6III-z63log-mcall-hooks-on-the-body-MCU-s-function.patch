@@ -1,0 +1,91 @@
+From 941dda61d872741ff24081a4ad045b01294bccf5 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 06:54:41 +0000
+Subject: [PATCH 21/47] Z 6III: z63log mcall= -- hooks on the body MCU's
+ functions too
+
+call= took A53 entries only. mcall= takes the M4's (the Thumb bit is
+ignored) and prints r0..r3 and lr, which is how the shutter chain above
+was followed from the PF4 edge to PD7 without a debugger.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ z63-tools/plugins/z63log.c | 31 +++++++++++++++++++------------
+ 1 file changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/z63-tools/plugins/z63log.c b/z63-tools/plugins/z63log.c
+index dc307c0..c9e8c80 100644
+--- a/z63-tools/plugins/z63log.c
++++ b/z63-tools/plugins/z63log.c
+@@ -30,9 +30,10 @@
+  *          -Dplugins=true; this tree's build has it)
+  *   use:   -plugin z63-tools/plugins/libz63log.dylib,out=/tmp/z63log.txt
+  *
+- * call=0x40f36a08:0x... adds A53 function entries of your own (up to 32):
+- * one "call" line each time, x0..x3 and the return address -- which of a
+- * function's callers it was, without a debugger attached.
++ * call=0x40f36a08:0x... adds A53 function entries of your own, mcall= the
++ * body MCU's (Thumb bit ignored); up to 32 in all. One "call" line each
++ * time, the first four argument registers and the return address -- which
++ * of a function's callers it was, without a debugger attached.
+  */
+ #include <glib.h>
+ #include <inttypes.h>
+@@ -65,7 +66,7 @@ typedef struct Vcpu {
+ } Vcpu;
+ 
+ static Vcpu vcpus[MAX_VCPUS];
+-static Hook calls[32];                  /* call=0x..:0x.. (A53 entries) */
++static Hook calls[32];                  /* call=, mcall= entries */
+ static size_t n_calls;
+ static FILE *out;
+ static GMutex lock;
+@@ -194,10 +195,12 @@ static void hit(unsigned int idx, void *udata)
+                 seq++, ts, idx, a[0] & 0xffffffff, a[1] & 0xff, a[2] & 0xff,
+                 from);
+     } else if (!strcmp(h->what, "call")) {
+-        fprintf(out, "%" PRIu64 " %s cpu%u call pc=0x%" PRIx64 " x0=0x%"
+-                PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64 " x3=0x%" PRIx64
+-                " from=0x%" PRIx64 "\n", seq++, ts, idx, h->pc, a[0], a[1],
+-                a[2], a[3], from);
++        char r = h->arch == ARCH_A53 ? 'x' : 'r';
++
++        fprintf(out, "%" PRIu64 " %s cpu%u call pc=0x%" PRIx64 " %c0=0x%"
++                PRIx64 " %c1=0x%" PRIx64 " %c2=0x%" PRIx64 " %c3=0x%" PRIx64
++                " from=0x%" PRIx64 "\n", seq++, ts, idx, h->pc, r, a[0], r,
++                a[1], r, a[2], r, a[3], from);
+     } else {
+         fprintf(out, "%" PRIu64 " %s cpu%u mcu code=%" PRIu64
+                 " value=0x%" PRIx64 " from=0x%" PRIx64 "\n", seq++, ts, idx,
+@@ -247,12 +250,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+             path = argv[i] + 4;
+         } else if (!strcmp(argv[i], "listregs=on")) {
+             list_regs = true;
+-        } else if (g_str_has_prefix(argv[i], "call=")) {
+-            g_auto(GStrv) pcs = g_strsplit(argv[i] + 5, ":", -1);
++        } else if (g_str_has_prefix(argv[i], "call=") ||
++                   g_str_has_prefix(argv[i], "mcall=")) {
++            bool m4 = argv[i][0] == 'm';
++            g_auto(GStrv) pcs = g_strsplit(strchr(argv[i], '=') + 1, ":", -1);
+ 
+             for (char **p = pcs; *p && n_calls < G_N_ELEMENTS(calls); p++) {
+                 calls[n_calls++] = (Hook) {
+-                    g_ascii_strtoull(*p, NULL, 0), ARCH_A53, "call"
++                    g_ascii_strtoull(*p, NULL, 0) & ~(uint64_t)(m4 ? 1 : 0),
++                    m4 ? ARCH_M4 : ARCH_A53, "call"
+                 };
+             }
+         }
+@@ -268,7 +274,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+                 hooks[k].pc, hooks[k].arch == ARCH_A53 ? "A53" : "M4");
+     }
+     for (size_t k = 0; k < n_calls; k++) {
+-        fprintf(out, "# hook call at 0x%" PRIx64 " (A53)\n", calls[k].pc);
++        fprintf(out, "# hook call at 0x%" PRIx64 " (%s)\n", calls[k].pc,
++                calls[k].arch == ARCH_A53 ? "A53" : "M4");
+     }
+     qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
+     qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
+-- 
+2.55.0
+

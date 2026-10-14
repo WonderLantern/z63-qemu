@@ -1,0 +1,88 @@
+From 21f861686ac6b6d215651701becc9158a128b82c Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 06:34:26 +0000
+Subject: [PATCH 19/47] Z 6III: the SD slot's card detect -- an empty slot
+ reads empty
+
+After boot the camera said "This memory card cannot be accessed. Insert
+another card." and the frame counter read [Err]. Neither slot's presence
+comes from GPIO, the MCU or SDHCI Present State (sub_4028F0F0, bit 16,
+has no callers): both are read from the EXS glue block at 0x17a00000.
+The card service polls each slot every 50 ms (sub_40327600 ->
+sub_403276E8, debounced in sub_403277C0, slot descriptors copied from
+0x42b6b7a8 "XQD" and 0x42b6b8c8 "SD" by sub_403288D8). The SD slot's
+sample, sub_4028DB44, reads index 3 of the block's offset table
+(0xa02808508: +0x00c) and keeps ~value & 1 (MVN / AND #1 at 0x4028db78 /
+0x4028db88) -- bit 0 is the card-detect input, active low. As storage it
+read 0, a card; the open (sub_402E7878 -> sub_4028DBD0, twice, 50 ms
+apart) then failed against the empty host, and the mount went to its
+"cannot be accessed" state.
+
+That word's only other user is sub_4028D24C's set-up, a read-modify-write
+(& 0xfefcfcff | 0x01010200) that carries bit 0 through, so bit 0 now
+reads 1 whatever was written. DECLARED: the slot is empty -- the same
+configuration nikon-z63-storage.h's Present State already declares. The
+CFexpress slot needed nothing: its detect, sub_4028C1CC (index 2 * port
++ 13 = +0x044, bit 1, active high; taken as detect rather than link
+because sub_4028C6B0 tests it before powering the card), reads 0.
+
+Verified: the camera comes up in photo mode with no dialog and no camera
+error, the frame counter reading [-E-], Nikon's "no memory card". The
+boot-time error 0x37 that a shutter press used to clear is gone with it.
+smoke.sh passes.
+
+Where it stands: a full press with no card ("Slot empty release lock"
+reads OK, release enabled) starts no capture -- no capture-sync pulse,
+nothing from the camera controller. The boot's mode-0 request is still
+pending: the EXPEED pulses pin 43 (PF4 on the MCU, sub_4117D340) and
+waits for a rising edge on EXT_INT_7 (PD7) that the MCU never makes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-usb.h | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/hw/arm/nikon-z63-usb.h b/hw/arm/nikon-z63-usb.h
+index 7b9a152..23b6c19 100644
+--- a/hw/arm/nikon-z63-usb.h
++++ b/hw/arm/nikon-z63-usb.h
+@@ -179,6 +179,7 @@ static void z63_stop_write(const char *block, hwaddr addr, unsigned size,
+ #define Z63_EXS_SIZE            0x2000
+ #define Z63_EXS_IRQ_FIRST       0x1000 /* ten 2-bit W1C status registers */
+ #define Z63_EXS_IRQ_LAST        0x1024
++#define Z63_EXS_SD_DETECT       0x000C /* index 3: bit 0 = SD card absent */
+ 
+ /* The two USB3 PHY / isolation glue blocks, one per port. Not an array
+  * with a clean stride: 0x17A40000 sits between them. */
+@@ -612,6 +613,28 @@ static uint64_t z63_exs_read(void *opaque, hwaddr off, unsigned size)
+         return 0;
+     }
+ 
++    if (off == Z63_EXS_SD_DETECT) {
++        /* Bit 0 is the SD slot's card-detect input, active low. The card
++         * service polls each slot every 50 ms (sub_40327600 ->
++         * sub_403276E8); the SD slot's sample is sub_4028DB44, which reads
++         * index 3 of the offset table (this word) and stores ~value & 1
++         * (MVN / AND #1 at 0x4028db78 / 0x4028db88) as "card present". Its
++         * only other user is sub_4028D24C's set-up, a read-modify-write
++         * (& 0xfefcfcff | 0x01010200) that carries bit 0 through. As
++         * storage the bit read 0 -- a card -- and the camera, finding no
++         * card behind the host (nikon-z63-storage.h answers an empty
++         * slot), said "This memory card cannot be accessed": the open
++         * (sub_402E7878 -> sub_4028DBD0) fails, mount state 2, [Err].
++         *
++         * DECLARED CHOICE: the slot is empty, the same configuration
++         * nikon-z63-storage.h's Present State declares; bit 0 reads 1
++         * whatever was written. The CFexpress slot needs nothing: its
++         * detect (sub_4028C1CC, index 2 * port + 13 = +0x044, bit 1,
++         * active high -- inferred to be detect rather than link because
++         * sub_4028C6B0 tests it before powering the card) reads 0. */
++        return u->exs_regs[off / 4] | 1;
++    }
++
+     /* Everything else is read-modify-written by its users -- the USB clock
+      * and reset gates at 0x500/0x504 (sub_40C7160C 0x40C7160C,
+      * sub_40C719E4, sub_40C715A8) and 0x600/0x604 (sub_40C71494), and the
+-- 
+2.55.0
+

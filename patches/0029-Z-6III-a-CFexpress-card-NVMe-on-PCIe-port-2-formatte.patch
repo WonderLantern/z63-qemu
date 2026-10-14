@@ -1,0 +1,535 @@
+From f3cc6f5c71622c5ea857c39c780618227d8a6e4b Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 12 Oct 2026 13:35:27 +0000
+Subject: [PATCH 29/47] Z 6III: a CFexpress card -- NVMe on PCIe port 2,
+ formatted by the camera
+
+-machine cfexpress=on puts ../z9-qemu's PCIe port-2 adapter
+(nikon-z9-pcie.h, imported with deb3a75) in front of the board: QEMU's
+DesignWare host behind DBI 0x1a800000, the unrolled iATU and the CPU
+aperture at 0x600000000, the port's link wrappers at 0x17b00000 and its
+legacy interrupt on INTID 0x95 (EXS_PCIE10_PCIE_MISC). The card is an
+NVMe device on that bus:
+
+  -drive if=none,id=cf,file=<image>,format=raw
+  -device nvme,drive=cf,serial=<s>,bus=dw-pcie,addr=0
+
+What the board adds:
+
+  - the slot's detect: EXS +0x044 bit 1 (index 2 * 2 + 13 of the EXS
+    offset table, sub_4028C1CC), set while a card is configured
+    (nikon-z63-usb.h). DECLARED: present means bit 1;
+  - the adapter's DMA view: the board's DRAM at 0xa00000000 (the state
+    now carries z63_dram, which import_z9lab.py substitutes for
+    MACHINE(s)->ram in nikon-z9-pcie.h as well as in the lab) and
+    BUFFER_EXT aliased where the Z 9 aliases its image banks
+    (pcie-image-ram-dma-input stays refused);
+  - the link wrappers' page in the z9lab range, for cfexpress only;
+  - ../z9-qemu's designware.c fix: an iATU limit takes the base's high
+    bits, and size 0 disables the window.
+
+With a blank 8 GiB image the camera shows [ For ] (card present, not
+formatted); SETUP > Format memory card > CFexpress/XQD > Yes formats it
+("Format complete"), and live view then counts 867 shots. The card
+holds what the camera wrote: an MBR with one FAT32 (LBA) partition at
+LBA 63 and a boot sector "NIKON5.0", label "NIKON Z6_3".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-usb.h      | 17 ++++++++++++++
+ hw/arm/nikon-z63-z9lab.c    | 47 ++++++++++++++++++++++++++++++++++++-
+ hw/arm/nikon-z63-z9lab.h    | 43 +++++++++++++++++++++++++++------
+ hw/arm/nikon-z63.c          | 29 ++++++++++++++++++++++-
+ hw/arm/nikon-z9-pcie.h      |  6 ++---
+ hw/pci-host/designware.c    |  7 ++++--
+ z63-tools/import_z9lab.py   | 15 ++++++++++--
+ z63-tools/z9lab_attach.c.in | 46 +++++++++++++++++++++++++++++++++++-
+ 8 files changed, 193 insertions(+), 17 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-usb.h b/hw/arm/nikon-z63-usb.h
+index 23b6c19..039e2c3 100644
+--- a/hw/arm/nikon-z63-usb.h
++++ b/hw/arm/nikon-z63-usb.h
+@@ -180,6 +180,7 @@ static void z63_stop_write(const char *block, hwaddr addr, unsigned size,
+ #define Z63_EXS_IRQ_FIRST       0x1000 /* ten 2-bit W1C status registers */
+ #define Z63_EXS_IRQ_LAST        0x1024
+ #define Z63_EXS_SD_DETECT       0x000C /* index 3: bit 0 = SD card absent */
++#define Z63_EXS_PCIE2_STATUS    0x0044 /* index 17: bit 1 = port 2 card/link */
+ 
+ /* The two USB3 PHY / isolation glue blocks, one per port. Not an array
+  * with a clean stride: 0x17A40000 sits between them. */
+@@ -311,6 +312,10 @@ typedef struct Z63Usb {
+     /* 0x17a40000..0x17a40fff. */
+     MemoryRegion assist;
+     uint32_t assist_regs[Z63_USB_ASSIST_SIZE / 4];
++
++    /* -machine cfexpress=on: a card in the CFexpress slot, behind PCIe
++     * port 2 (../z9-qemu's adapter, nikon-z9-pcie.h). */
++    bool cfexpress;
+ } Z63Usb;
+ 
+ /* ------------------------------------------------------------------ */
+@@ -635,6 +640,18 @@ static uint64_t z63_exs_read(void *opaque, hwaddr off, unsigned size)
+         return u->exs_regs[off / 4] | 1;
+     }
+ 
++    if (off == Z63_EXS_PCIE2_STATUS && u->cfexpress) {
++        /* PCIe port 2, the CFexpress slot: bit 1 is both the slot's detect
++         * (sub_4028C1CC, index 2 * port + 13, tested by sub_4028C6B0 before
++         * it powers the card) and the link-usable test of the port's
++         * accessors (sub_40289B30). With a card attached, DECLARED: the
++         * card is there and its link is up -- ../z9-qemu answers the same
++         * word 2 (pcie-link-diagnostic-mask), and its wrapper input then
++         * reports the trained link (+0xb4 = 0x11) once an endpoint sits on
++         * the port's bus. */
++        return u->exs_regs[off / 4] | 2;
++    }
++
+     /* Everything else is read-modify-written by its users -- the USB clock
+      * and reset gates at 0x500/0x504 (sub_40C7160C 0x40C7160C,
+      * sub_40C719E4, sub_40C715A8) and 0x600/0x604 (sub_40C71494), and the
+diff --git a/hw/arm/nikon-z63-z9lab.c b/hw/arm/nikon-z63-z9lab.c
+index a96a450..ff01121 100644
+--- a/hw/arm/nikon-z63-z9lab.c
++++ b/hw/arm/nikon-z63-z9lab.c
+@@ -191,6 +191,7 @@ typedef struct Z9Engine1518 {
+ struct NikonZ9State {
+     Object parent;
+     uint64_t ram_size;      /* z63: was s->ram_size */
++    MemoryRegion *z63_dram; /* z63: was MACHINE(s)->ram (PCIe DMA) */
+     bool compat;            /* z63: misses are reported, not stopped */
+     bool compat_miss;
+     uint64_t compat_misses;
+@@ -18213,7 +18214,8 @@ type_init(nikon_z9_register_types)
+ static const char *const z63_z9lab_refused[] = {
+     "service-core-event-model", "nor-model", "nand-fixture",
+     "serial-fixture", "i2c-fixture", "bus-window-fixture",
+-    "pcie-empty-fixture", "adc-fixture", "adc-input",
++    "pcie-empty-fixture", "pcie-image-ram-dma-input",
++    "adc-fixture", "adc-input",
+     "graphics-image-model", "graphics-path-model", "graphics-clear-model",
+     "engine1548-config-model", "engine1548-control-model",
+     "engine1548-scanout-model", "orientation-fixture",
+@@ -18223,6 +18225,43 @@ static const char *const z63_z9lab_refused[] = {
+     "control1380-model", "control1380-busy-input",
+ };
+ 
++/*
++ * The CFexpress slot: PCIe port 2. This image's PCIe is ../z9-qemu's: four
++ * DesignWare root ports with DBI windows at 0x1a000000 + 0x400000 * n,
++ * unrolled iATU at DBI + 0x300000 (nikon-z63-usb.h, "two things that are
++ * not part of this complex"), link wrappers at 0x17b00000/0x17b80000, and
++ * the CFexpress card on port 2 -- its detect is index 2 * 2 + 13 of the
++ * EXS offset table, +0x044 (sub_4028C1CC) -- the port ../z9-qemu's adapter
++ * models: DBI 0x1a800000, its CPU aperture 0x600000000, the port's
++ * legacy-interrupt wrapper and INTID 0x95 (EXS_PCIE10_PCIE_MISC, SPI 117,
++ * in this image's interrupt-name table). z9_pcie_init puts QEMU's
++ * DesignWare host behind those windows; an NVMe device on its bus
++ * (-device nvme,bus=dw-pcie,addr=0) is the card.
++ *
++ * DMA. The adapter shows the device the board's DRAM at 0xa00000000
++ * (pcie-ram-dma-input, through z63_dram) and, where ../z9-qemu aliases its
++ * two image-bank RAM objects, this board has one BUFFER_EXT region at
++ * 0x840000000; it is aliased here instead (pcie-image-ram-dma-input is
++ * refused). DECLARED, as there: inbound addresses are identity.
++ */
++static void z63_z9lab_pcie_init(NikonZ9State *s, DeviceState *gic,
++                                MemoryRegion *buffer_ext)
++{
++    DesignwarePCIEHost *host;
++    MemoryRegion *alias;
++
++    z9_pcie_init(s, get_system_memory(), gic);
++    host = DESIGNWARE_PCIE_HOST(s->pcie_dbi_host);
++    if (buffer_ext) {
++        alias = g_new0(MemoryRegion, 1);
++        memory_region_init_alias(alias, OBJECT(s), "z63.pcie-buffer-ext",
++                                 buffer_ext, 0,
++                                 memory_region_size(buffer_ext));
++        memory_region_add_subregion_overlap(&host->pci.address_space_root,
++                                            UINT64_C(0x840000000), alias, -2);
++    }
++}
++
+ /*
+  * The frame-boundary peer. ../z9-qemu's run loop (tools/run.py with
+  * tools/z9_global1_boundary_input.py, Peer.tick) sets the 0x1508 block's
+@@ -18571,6 +18610,7 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+ }
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
++                      MemoryRegion *dram, MemoryRegion *buffer_ext,
+                       const char *props, Error **errp);
+ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size,
+                     uint64_t *value);
+@@ -18580,6 +18620,7 @@ uint64_t z63_z9lab_misses(Object *obj);
+ 
+ /* props: "name=value" items separated by ';'. */
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
++                      MemoryRegion *dram, MemoryRegion *buffer_ext,
+                       const char *props, Error **errp)
+ {
+     NikonZ9State *s = NIKON_Z9_LAB(object_new(TYPE_NIKON_Z9_LAB));
+@@ -18592,6 +18633,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
++    s->z63_dram = dram;
+     for (char **item = items; *item; item++) {
+         g_auto(GStrv) kv = g_strsplit(g_strstrip(*item), "=", 2);
+ 
+@@ -18711,6 +18753,9 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     s->event_channel_irq = qdev_get_gpio_in(gic, 0xfe - 32);
+     s->event_global1_irq = qdev_get_gpio_in(gic, 0x101 - 32);
+     s->event_global0_irq = qdev_get_gpio_in(gic, 0xff - 32);
++    if (s->pcie_dbi_model) {
++        z63_z9lab_pcie_init(s, gic, buffer_ext);
++    }
+     s->event_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_timing_expire, s);
+     /* The multi-IO timer block (0x0e000000/0x0e001000), wired as
+diff --git a/hw/arm/nikon-z63-z9lab.h b/hw/arm/nikon-z63-z9lab.h
+index 5c27455..59d2ef4 100644
+--- a/hw/arm/nikon-z63-z9lab.h
++++ b/hw/arm/nikon-z63-z9lab.h
+@@ -85,6 +85,7 @@
+ #define HW_ARM_NIKON_Z63_Z9LAB_H
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
++                      MemoryRegion *dram, MemoryRegion *buffer_ext,
+                       const char *props, Error **errp);
+ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size,
+                     uint64_t *value);
+@@ -155,10 +156,17 @@ static const char z63_z9lab_default_props[] =
+  * channel 5 and waits for its interrupt without a timeout. */
+ #define Z63_Z9LAB_MIO_LO 0x0e000000ULL
+ #define Z63_Z9LAB_MIO_HI 0x0e002000ULL
++/* The PCIe ports' link wrappers (../z9-qemu's pcie_wrapper_word, link
++ * input +0xb4 and legacy-interrupt status +0xe8), with -machine
++ * cfexpress=on only. */
++#define Z63_Z9LAB_PCIEW_LO 0x17b00000ULL
++#define Z63_Z9LAB_PCIEW_HI 0x17c00000ULL
+ #define Z63_Z9LAB_PAGES  (((Z63_Z9LAB_HI - Z63_Z9LAB_LO) >> 12) + \
+-                          ((Z63_Z9LAB_MIO_HI - Z63_Z9LAB_MIO_LO) >> 12))
++                          ((Z63_Z9LAB_MIO_HI - Z63_Z9LAB_MIO_LO) >> 12) + \
++                          ((Z63_Z9LAB_PCIEW_HI - Z63_Z9LAB_PCIEW_LO) >> 12))
+ 
+ static Object *z63_z9lab;   /* NULL unless -machine z9-capture=on */
++static bool z63_z9lab_pcie; /* -machine cfexpress=on: the PCIe port-2 models */
+ static unsigned long *z63_z9lab_named;
+ 
+ /* The capture ranges, less the display unit/complex (0x15480000..
+@@ -169,6 +177,10 @@ static bool z63_z9lab_range(hwaddr addr)
+     if (addr >= Z63_Z9LAB_MIO_LO && addr < Z63_Z9LAB_MIO_HI) {
+         return true;
+     }
++    if (z63_z9lab_pcie && addr >= Z63_Z9LAB_PCIEW_LO &&
++        addr < Z63_Z9LAB_PCIEW_HI) {
++        return true;                /* the PCIe link wrappers */
++    }
+     return addr >= Z63_Z9LAB_LO && addr < Z63_Z9LAB_HI &&
+            !(addr >= 0x15480000 && addr < 0x154c0000) &&
+            !(addr >= 0x15540000 && addr < 0x15560000);
+@@ -176,9 +188,12 @@ static bool z63_z9lab_range(hwaddr addr)
+ 
+ static void z63_z9lab_name(hwaddr addr, bool write, uint64_t value)
+ {
+-    unsigned page = addr >= Z63_Z9LAB_LO ? (addr - Z63_Z9LAB_LO) >> 12 :
+-                    ((Z63_Z9LAB_HI - Z63_Z9LAB_LO) >> 12) +
+-                    ((addr - Z63_Z9LAB_MIO_LO) >> 12);
++    unsigned capture = (Z63_Z9LAB_HI - Z63_Z9LAB_LO) >> 12;
++    unsigned mio = (Z63_Z9LAB_MIO_HI - Z63_Z9LAB_MIO_LO) >> 12;
++    unsigned page = addr >= Z63_Z9LAB_PCIEW_LO ?
++                        capture + mio + ((addr - Z63_Z9LAB_PCIEW_LO) >> 12) :
++                    addr >= Z63_Z9LAB_LO ? (addr - Z63_Z9LAB_LO) >> 12 :
++                    capture + ((addr - Z63_Z9LAB_MIO_LO) >> 12);
+ 
+     if (!test_and_set_bit(page, z63_z9lab_named)) {
+         error_report("Z63_Z9LAB: page 0x%" HWADDR_PRIx " answered by "
+@@ -209,12 +224,24 @@ static bool z63_front_write(hwaddr addr, uint64_t value, unsigned size)
+     return true;
+ }
+ 
++/* -machine cfexpress=on: ../z9-qemu's PCIe port-2 adapter (nikon-z9-pcie.h;
++ * the attachment section explains the port). */
++static const char z63_z9lab_cfexpress_props[] =
++    "pcie-dbi-model=on;"
++    "pcie-link-diagnostic-mask=4;"
++    "pcie-ram-dma-input=on;"
++    "pcie-intx-model=on;";
++
+ static bool z63_z9lab_init(Object *owner, DeviceState *gic, uint64_t ram_size,
+-                           const char *props, const char *raw, Error **errp)
++                           MemoryRegion *dram, MemoryRegion *buffer_ext,
++                           bool cfexpress, const char *props,
++                           const char *raw, Error **errp)
+ {
+-    g_autofree char *all = g_strdup_printf("%s;statistics-raw=%s",
++    g_autofree char *all = g_strdup_printf("%s;%sstatistics-raw=%s",
+                                            props && *props ? props :
+                                            z63_z9lab_default_props,
++                                           cfexpress ?
++                                           z63_z9lab_cfexpress_props : "",
+                                            raw ? raw : "");
+ 
+     if (!raw || !*raw) {
+@@ -222,10 +249,12 @@ static bool z63_z9lab_init(Object *owner, DeviceState *gic, uint64_t ram_size,
+                    "(z63-tools/make_raw.py writes one)");
+         return false;
+     }
+-    z63_z9lab = z63_z9lab_new(owner, gic, ram_size, all, errp);
++    z63_z9lab = z63_z9lab_new(owner, gic, ram_size, dram, buffer_ext, all,
++                              errp);
+     if (!z63_z9lab) {
+         return false;
+     }
++    z63_z9lab_pcie = cfexpress;
+     z63_z9lab_named = bitmap_new(Z63_Z9LAB_PAGES);
+     return true;
+ }
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 6126e76..949347a 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -817,6 +817,7 @@ typedef struct NikonZ63State {
+     char *sio_sink;              /* write-only serial sinks, nikon-z63-sio.h */
+     bool audio_codec;            /* nikon-z63-audio.h */
+     bool z9_capture;             /* nikon-z63-z9lab.h */
++    bool cfexpress;              /* a card on PCIe port 2, ditto */
+     char *z9_capture_props;
+     char *z9_capture_raw;
+     char *mcu_keys;              /* held keys, nikon-z63-mcu.h */
+@@ -4340,6 +4341,12 @@ static void z63_init(MachineState *machine)
+     /* DWC3 USB in device mode plus its EXS and PHY glue.
+      * See docs/usb-registers.md. */
+     z63_usb_init(OBJECT(machine), sysmem, &s->usb);
++    if (s->cfexpress && !s->z9_capture) {
++        error_report("cfexpress=on needs z9-capture=on: the slot's PCIe port "
++                     "is ../z9-qemu's adapter (nikon-z63-z9lab.h)");
++        exit(1);
++    }
++    s->usb.cfexpress = s->cfexpress;
+ 
+     /* The auxiliary pair, register set taken from the driver rather than
+      * from the accesses that happened to have been seen. See
+@@ -4460,7 +4467,8 @@ static void z63_init(MachineState *machine)
+     /* ../z9-qemu's capture models, asked before the windows above where
+      * they cover the same addresses. Opt-in; see nikon-z63-z9lab.h. */
+     if (s->z9_capture &&
+-        !z63_z9lab_init(OBJECT(machine), s->gic, Z63_DRAM_SIZE,
++        !z63_z9lab_init(OBJECT(machine), s->gic, Z63_DRAM_SIZE, &s->dram,
++                        &s->buffer_ext, s->cfexpress,
+                         s->z9_capture_props, s->z9_capture_raw,
+                         &error_fatal)) {
+         return;
+@@ -4900,6 +4908,16 @@ static void z63_prop_set_camctl(Object *obj, bool value, Error **errp)
+     NIKON_Z63(obj)->mcu.camctl_reply = value;
+ }
+ 
++static bool z63_prop_get_cfexpress(Object *obj, Error **errp)
++{
++    return NIKON_Z63(obj)->cfexpress;
++}
++
++static void z63_prop_set_cfexpress(Object *obj, bool value, Error **errp)
++{
++    NIKON_Z63(obj)->cfexpress = value;
++}
++
+ static bool z63_prop_get_z9_capture(Object *obj, Error **errp)
+ {
+     return NIKON_Z63(obj)->z9_capture;
+@@ -5310,6 +5328,15 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "board's register windows in 0x15000000..0x160fffff: where they "
+         "answer, their answer is used. Needs z9-capture-raw. Off by default. "
+         "See nikon-z63-z9lab.h.");
++    object_class_property_add_bool(oc, "cfexpress",
++                                   z63_prop_get_cfexpress,
++                                   z63_prop_set_cfexpress);
++    object_class_property_set_description(oc, "cfexpress",
++        "A card in the CFexpress slot: PCIe port 2 through ../z9-qemu's "
++        "DesignWare adapter, the slot's detect and link reporting it. Give "
++        "the card itself as an NVMe device on that port: -drive "
++        "if=none,id=cf,file=<image>,format=raw -device "
++        "nvme,drive=cf,serial=<s>,bus=dw-pcie,addr=0. Needs z9-capture=on.");
+     object_class_property_add_str(oc, "z9-capture-props",
+                                   z63_prop_get_z9_capture_props,
+                                   z63_prop_set_z9_capture_props);
+diff --git a/hw/arm/nikon-z9-pcie.h b/hw/arm/nikon-z9-pcie.h
+index bae983e..99f93f7 100644
+--- a/hw/arm/nikon-z9-pcie.h
++++ b/hw/arm/nikon-z9-pcie.h
+@@ -322,7 +322,7 @@ static char *get_pcie_dbi_state(Object *obj, Error **errp)
+         s->pcie_dbi_writes, s->pcie_atu_writes, s->pcie_cpu_reads,
+         s->pcie_cpu_writes, s->pcie_dbi_ro_enable,
+         s->pcie_ram_dma_input ? "true" : "false",
+-        s->pcie_ram_dma_input ? MACHINE(s)->ram_size : UINT64_C(0),
++        s->pcie_ram_dma_input ? s->ram_size : UINT64_C(0),
+         s->pcie_image_ram_dma_input ? "true" : "false",
+         s->pcie_image_ram_dma_input ?
+             (image_bank_ranges[0].end - image_bank_ranges[0].base) +
+@@ -361,8 +361,8 @@ static void z9_pcie_init(NikonZ9State *s, MemoryRegion *mem, DeviceState *gic)
+          * Physical Nikon inbound routing remains unverified. */
+         DesignwarePCIEHost *host = DESIGNWARE_PCIE_HOST(dev);
+         memory_region_init_alias(&s->pcie_ram_dma, OBJECT(s),
+-                                 "z9.pcie-work-ram-input", MACHINE(s)->ram,
+-                                 0, MACHINE(s)->ram_size);
++                                 "z9.pcie-work-ram-input", s->z63_dram,
++                                 0, s->ram_size);
+         memory_region_add_subregion_overlap(&host->pci.address_space_root,
+                                            UINT64_C(0xa00000000),
+                                            &s->pcie_ram_dma, -2);
+diff --git a/hw/pci-host/designware.c b/hw/pci-host/designware.c
+index f6e49ce..a4a3002 100644
+--- a/hw/pci-host/designware.c
++++ b/hw/pci-host/designware.c
+@@ -274,8 +274,11 @@ static void designware_pcie_update_viewport(DesignwarePCIERoot *root,
+ {
+     const uint64_t target = viewport->target;
+     const uint64_t base   = viewport->base;
+-    const uint64_t size   = (uint64_t)viewport->limit - base + 1;
+-    const bool enabled    = viewport->cr[1] & DESIGNWARE_PCIE_ATU_ENABLE;
++    /* The limit register is the low32 bits of the same base-high window.
++     * Keep windows above4GiB bounded instead of unsigned subtraction wrap. */
++    const uint64_t limit = (base & ~UINT64_C(0xffffffff)) | viewport->limit;
++    const uint64_t size = limit >= base ? limit - base + 1 : 0;
++    const bool enabled = size && (viewport->cr[1] & DESIGNWARE_PCIE_ATU_ENABLE);
+ 
+     MemoryRegion *current, *other;
+ 
+diff --git a/z63-tools/import_z9lab.py b/z63-tools/import_z9lab.py
+index f199667..7c549ed 100644
+--- a/z63-tools/import_z9lab.py
++++ b/z63-tools/import_z9lab.py
+@@ -17,7 +17,8 @@ its answer is used, and where it declines the board's own window does.
+ The edits, each asserted to match exactly once (or the stated count):
+ 
+   1. the type is a plain Object named "nikon-z63-z9lab", not a machine;
+-  2. the state gains ram_size (was MACHINE(s)->ram_size) and a compat flag;
++  2. the state gains ram_size and z63_dram (were MACHINE(s)->ram_size and
++     ->ram, also in nikon-z9-pcie.h) and a compat flag;
+   3. with the compat flag, unknown_access() records a miss and returns,
+      instead of printing and stopping -- the board decides what a miss means;
+   4. the two lines that set the Z 9's CPU patch fields (wl_event_peer/
+@@ -80,6 +81,7 @@ edit('#define TYPE_NIKON_Z9_LAB MACHINE_TYPE_NAME("nikon-z9-lab")',
+ edit("struct NikonZ9State {\n    MachineState parent;\n",
+      "struct NikonZ9State {\n    Object parent;\n"
+      "    uint64_t ram_size;      /* z63: was MACHINE(s)->ram_size */\n"
++     "    MemoryRegion *z63_dram; /* z63: was MACHINE(s)->ram (PCIe DMA) */\n"
+      "    bool compat;            /* z63: misses are reported, not stopped */\n"
+      "    bool compat_miss;\n"
+      "    uint64_t compat_misses;\n")
+@@ -338,8 +340,17 @@ pedit("""    s->raw_pipeline_frames++;
+ attach = (here / "z9lab_attach.c.in").read_text()
+ (tree / "hw/arm/nikon-z63-z9lab.c").write_text(head + lab + attach)
+ (tree / "hw/arm/nikon-z9-pixels.h").write_text(pixels)
++# 2, in nikon-z9-pcie.h: the board's DRAM, not the machine's.
++pcie = (src / "nikon-z9-pcie.h").read_text()
++for old, new, n in (("MACHINE(s)->ram_size", "s->ram_size", 2),
++                    ("MACHINE(s)->ram,", "s->z63_dram,", 1)):
++    if pcie.count(old) != n:
++        sys.exit("nikon-z9-pcie.h: expected %d of %r, found %d" %
++                 (n, old, pcie.count(old)))
++    pcie = pcie.replace(old, new)
++(tree / "hw/arm/nikon-z9-pcie.h").write_text(pcie)
+ for header in sorted(src.glob("nikon-*.h")):
+-    if header.name != "nikon-z9-pixels.h":
++    if header.name not in ("nikon-z9-pixels.h", "nikon-z9-pcie.h"):
+         (tree / "hw/arm" / header.name).write_bytes(header.read_bytes())
+ print("wrote hw/arm/nikon-z63-z9lab.c (source sha256 %s) and the model "
+       "headers" % sha)
+diff --git a/z63-tools/z9lab_attach.c.in b/z63-tools/z9lab_attach.c.in
+index 22470e7..5113a72 100644
+--- a/z63-tools/z9lab_attach.c.in
++++ b/z63-tools/z9lab_attach.c.in
+@@ -28,7 +28,8 @@
+ static const char *const z63_z9lab_refused[] = {
+     "service-core-event-model", "nor-model", "nand-fixture",
+     "serial-fixture", "i2c-fixture", "bus-window-fixture",
+-    "pcie-empty-fixture", "adc-fixture", "adc-input",
++    "pcie-empty-fixture", "pcie-image-ram-dma-input",
++    "adc-fixture", "adc-input",
+     "graphics-image-model", "graphics-path-model", "graphics-clear-model",
+     "engine1548-config-model", "engine1548-control-model",
+     "engine1548-scanout-model", "orientation-fixture",
+@@ -38,6 +39,43 @@ static const char *const z63_z9lab_refused[] = {
+     "control1380-model", "control1380-busy-input",
+ };
+ 
++/*
++ * The CFexpress slot: PCIe port 2. This image's PCIe is ../z9-qemu's: four
++ * DesignWare root ports with DBI windows at 0x1a000000 + 0x400000 * n,
++ * unrolled iATU at DBI + 0x300000 (nikon-z63-usb.h, "two things that are
++ * not part of this complex"), link wrappers at 0x17b00000/0x17b80000, and
++ * the CFexpress card on port 2 -- its detect is index 2 * 2 + 13 of the
++ * EXS offset table, +0x044 (sub_4028C1CC) -- the port ../z9-qemu's adapter
++ * models: DBI 0x1a800000, its CPU aperture 0x600000000, the port's
++ * legacy-interrupt wrapper and INTID 0x95 (EXS_PCIE10_PCIE_MISC, SPI 117,
++ * in this image's interrupt-name table). z9_pcie_init puts QEMU's
++ * DesignWare host behind those windows; an NVMe device on its bus
++ * (-device nvme,bus=dw-pcie,addr=0) is the card.
++ *
++ * DMA. The adapter shows the device the board's DRAM at 0xa00000000
++ * (pcie-ram-dma-input, through z63_dram) and, where ../z9-qemu aliases its
++ * two image-bank RAM objects, this board has one BUFFER_EXT region at
++ * 0x840000000; it is aliased here instead (pcie-image-ram-dma-input is
++ * refused). DECLARED, as there: inbound addresses are identity.
++ */
++static void z63_z9lab_pcie_init(NikonZ9State *s, DeviceState *gic,
++                                MemoryRegion *buffer_ext)
++{
++    DesignwarePCIEHost *host;
++    MemoryRegion *alias;
++
++    z9_pcie_init(s, get_system_memory(), gic);
++    host = DESIGNWARE_PCIE_HOST(s->pcie_dbi_host);
++    if (buffer_ext) {
++        alias = g_new0(MemoryRegion, 1);
++        memory_region_init_alias(alias, OBJECT(s), "z63.pcie-buffer-ext",
++                                 buffer_ext, 0,
++                                 memory_region_size(buffer_ext));
++        memory_region_add_subregion_overlap(&host->pci.address_space_root,
++                                            UINT64_C(0x840000000), alias, -2);
++    }
++}
++
+ /*
+  * The frame-boundary peer. ../z9-qemu's run loop (tools/run.py with
+  * tools/z9_global1_boundary_input.py, Peer.tick) sets the 0x1508 block's
+@@ -386,6 +424,7 @@ static void z63_z9lab_lane0_ack(NikonZ9State *s)
+ }
+ 
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
++                      MemoryRegion *dram, MemoryRegion *buffer_ext,
+                       const char *props, Error **errp);
+ bool z63_z9lab_read(Object *obj, hwaddr addr, unsigned size,
+                     uint64_t *value);
+@@ -395,6 +434,7 @@ uint64_t z63_z9lab_misses(Object *obj);
+ 
+ /* props: "name=value" items separated by ';'. */
+ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
++                      MemoryRegion *dram, MemoryRegion *buffer_ext,
+                       const char *props, Error **errp)
+ {
+     NikonZ9State *s = NIKON_Z9_LAB(object_new(TYPE_NIKON_Z9_LAB));
+@@ -407,6 +447,7 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+ 
+     s->compat = true;
+     s->ram_size = ram_size;
++    s->z63_dram = dram;
+     for (char **item = items; *item; item++) {
+         g_auto(GStrv) kv = g_strsplit(g_strstrip(*item), "=", 2);
+ 
+@@ -526,6 +567,9 @@ Object *z63_z9lab_new(Object *owner, DeviceState *gic, uint64_t ram_size,
+     s->event_channel_irq = qdev_get_gpio_in(gic, 0xfe - 32);
+     s->event_global1_irq = qdev_get_gpio_in(gic, 0x101 - 32);
+     s->event_global0_irq = qdev_get_gpio_in(gic, 0xff - 32);
++    if (s->pcie_dbi_model) {
++        z63_z9lab_pcie_init(s, gic, buffer_ext);
++    }
+     s->event_timing_timer =
+         timer_new_ns(QEMU_CLOCK_VIRTUAL, event_timing_expire, s);
+     /* The multi-IO timer block (0x0e000000/0x0e001000), wired as
+-- 
+2.55.0
+
