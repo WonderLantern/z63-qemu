@@ -1,0 +1,114 @@
+# The address the RTOS currently stops on.
+#
+# smoke.sh compares the first stop against this. A stop anywhere else is
+# news: either the crank moved forward, in which case update this file in the
+# same change, or a model that used to work has stopped working. While this
+# line holds an address, smoke.sh skips the Linux check -- a refused access
+# stops the whole machine, so CPU3 never gets its chance, and that is a fact
+# about where the RTOS has got to rather than anything wrong with Linux.
+# Clear the line when the crank runs out of blockers.
+
+frontier 0x015540000
+
+# Superseded in the same round: with the image program modelled the RTOS no
+# longer stops at all in 45 s (smoke.sh reports "nothing stopped"). The line
+# stays because clearing it turns on the Linux check, and Linux in the full
+# machine is known broken for a reason that is now understood: the RTOS
+# starts CPU3 itself (sub_40C9CD68 signals it through WorkSRAM 0x082013e0
+# and only then builds share_mem), so the board's li-wait-ipc stand-in
+# hijacks a core that is already on its way into Linux -- CPU3 ends at
+# 0x200 with VBAR_EL1 still zero. Clear this once that hand-off is fixed.
+
+# Recorded with SNOR_USER set (smoke.sh). Without the per-unit SNOR_USER
+# body the RTOS never gets here: configuration object 28 reads 0, a mask
+# loop in sub_40321450 runs 2^32 times, and the module lifecycle's barrier
+# desynchronises -- see "Status, NAND round" in docs/plan.md.
+
+# History, most recent first. Each line is the stop, the PC that made it, and
+# what modelling it took. See docs/register-windows.md for the method.
+#
+#   0x015540000  pc 0x04026b35c  the same address, much later: FIFO A word
+#                                0xa004bf80 selects program 0x97f, ../z9-qemu's
+#                                path control -- vector drawing, which
+#                                nikon-z63-gfx.h does not model yet. Reached
+#                                after the start-up the MCU peer unlocked
+#                                (nikon-z63-mcu.h, -sio.h, -extint.h): power
+#                                and battery status, card slots settled,
+#                                then SD hosts (storage caps, SDIO +0x100,
+#                                +0x224), TOP +0x500, 0x154c0000
+#                                (-stream154c.h), ISP_APB 0x199 and the rest
+#                                of that family (-dev199.h, -ispfam.h).
+#   0x015540000  pc 0x04026b35c  the graphics engine's first draw: FIFO A
+#                                word 0xa0014080 selects program 0x281, an
+#                                image draw by ../z9-qemu's reading. Not a
+#                                missing register -- nikon-z63-gfx.h stops
+#                                on purpose until drawing is modelled. On
+#                                the way: NoC windows (nikon-z63-noc.h),
+#                                XDMAC bus translation and memset, the other
+#                                three DSP memories, the command ring.
+#   0x015540018  pc 0x04026b37c  ISP_APB, through sub_4026B364 (a 1 MiB-
+#                                window accessor). Reached once EXS1780 became
+#                                the NAND controller (nikon-z63-nand.h) and
+#                                SNOR_USER held the real per-unit body.
+#   (none)       --              smoke.sh PASSES both checks: the RTOS runs
+#                                45 s with nothing stopping, and Linux
+#                                reaches a BusyBox prompt in the same
+#                                machine (146 serial lines). 40,917 distinct
+#                                blocks with Linux running.
+#   0x01b200000  pc 0x04163aa38  sequential writes from the image's memcpy:
+#                                DSP local memory, mapped RAM
+#                                (Z63_DSPMEM_BASE)
+#   0x01b800040  pc 0x040c2df68  +0x40 was in the other DSP window's set;
+#                                the two sets are now unioned
+#   0x01b800020  pc 0x040c2df0c  materialised constant, DSP region
+#                                -> nikon-z63-dsp1b80.h
+#   0x0150402c4  pc 0x040c239dc  a FALSE stop: the offset is written by a
+#                                loop whose extent is an argument, so no
+#                                static set can contain it. The two ispband
+#                                windows are `dense` now; see the note in
+#                                nikon-z63-regwindow.h
+#   0x01fc00020  pc 0x040c0a550  third instance; the image names all three
+#                                in the driver's own handle init at
+#                                0x40c0a254-0x40c0a288, so the list is closed
+#   0x01d800020  pc 0x040c0a550  the same driver's next instance; the base
+#                                list in nikon-z63-dsp1c80.h came from .data
+#   0x01c800020  pc 0x040c0a550  descriptor field [handle+8], DSP region
+#                                -> nikon-z63-dsp1c80.h
+#   0x016807f10  (RTOS console)  not a stop -- an external abort the guest
+#                                reported itself, as task [STSQNOR], because
+#                                XDMAC's ops refused a 64-bit store. `valid`
+#                                now admits 8 bytes and `impl` splits them.
+#   0x015d8001c  pc 0x040c0bea8  materialised constant, ISP_AHB_AXI region
+#                                -> nikon-z63-blk15d8.h
+#   0x017800118  pc 0x040c5dfd0  materialised constant; the two windows
+#                                docs/storage-registers.md section 8 had
+#                                left unmapped on purpose
+#                                -> nikon-z63-exs1780.h, -exs1784.h
+#   0x7ffffffb0  pc 0x040168a04  NOT a fault record, as first recorded: the
+#                                sync vector's own STP X0,X1,[SP] with an SP
+#                                that was never set, because the fault it was
+#                                handling came of executing zeros. Cleared by
+#                                placing the image in DRAM where the
+#                                firmware's initial page tables expect it --
+#                                see z63_image_in_dram in hw/arm/nikon-z63.c.
+#   (none)       --              before XDMAC: the RTOS ran clean and
+#                                and reaches a BusyBox prompt. What blocks
+#                                now is not an unmodelled access but a
+#                                missing interrupt -- see "After the crank"
+#                                in docs/register-windows.md.
+#   0x017820230  pc 0x04028d310  SD vendor reg was classed write-only
+#   0x00f00001c  pc 0x040c1a624  UART port 1: the block has three ports
+#   0x015180014  pc 0x040c0aaf0  devices 0x1cc/0x1cd/0x1ce -> nikon-z63-dev1cc.h
+#   0x0160207f8  pc 0x040c5b314  CODEC, offsets at call sites -> nikon-z63-codec.h
+#   0x01510000c  pc 0x040c0d898  devices 0x1cf/0x1d0       -> nikon-z63-dev1cf.h
+#   0x015240044  pc 0x040c13970  pointer slot 0xa02dc3d88  -> nikon-z63-blk1524.h
+#   0x015000000  pc 0x040c2425c  pointer slot 0xa02dc47f0  -> nikon-z63-ispband.h
+#   0x015040000  pc 0x040c2383c  pointer slot 0xa02dc47d8  -> nikon-z63-ispband.h
+#   0x0153c0044  pc 0x040c24974  cleared by consolidating  -> nikon-z63-blkfam.h
+#   0x015440308  pc 0x040c25568  materialised constant     -> nikon-z63-blkfam.h
+#   0x015340014  pc 0x040c27ed0  devices 0x185/0x186       -> nikon-z63-blkfam.h
+#   0x015200000  pc 0x040c75c80  pointer at 0xa02e7b0c0    -> nikon-z63-vpipe-ctl.h
+#   0x00c86f014  pc 0x040c15e90  AUX pair                  -> nikon-z63-aux.h
+#   0x00e70073c  pc 0x040c14664  serial bus, instance 7    -> nikon-z63-spibus.h
+#   0x0150c0018  pc 0x040c1fd58  ISP_APB device 0x1a0      -> nikon-z63-isp-apb.h
+#   0x015080044  pc 0x040c2c9c4  sensor interface          -> nikon-z63-sensorif.h

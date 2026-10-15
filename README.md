@@ -11,10 +11,17 @@ camera.
 The repository contains no firmware and no data from a camera.
 
 ```
-patches/   47 patches for QEMU v10.2.4 (git format-patch; apply with git am)
-z63ui/     the desktop front end (Go + MyGo, a Vite/TypeScript page)
-SHA256SUMS the firmware files the machine was built against
+patches/    47 patches for QEMU v10.2.4 (git format-patch; apply with git am)
+z63-tools/  the scripts this README uses, as the patches add them
+z63ui/      the desktop front end (Go + MyGo, a Vite/TypeScript page)
+SHA256SUMS  the firmware files the machine was built against
 ```
+
+The commands below run from the patched QEMU tree, which has the same
+`z63-tools/` (plus the rest of the debugging tools). The Python scripts
+also run from this repository's copy. `smoke.sh`, `gui.sh` and
+`plugins/build.sh` need the tree, because they find `build/` and
+`include/` relative to themselves.
 
 ## What works
 
@@ -231,8 +238,9 @@ does not work yet" for where it stops.
 - Patch 0047 lets a DMA buffer run from one NoC bus window into the next.
   Without it the machine stops on a graphics clear when a menu page such as
   Custom Settings d opens.
-- `z63-tools/` has the launcher, `smoke.sh` (regression), the gdb and QMP
-  helpers, the TCG plugins and the input-file tools.
+- In the patched tree, `z63-tools/` has `smoke.sh` (regression), the gdb
+  and QMP helpers, the TCG plugins and the input-file tools. This
+  repository's copy keeps only the ones this README uses.
 - `docs/` has `plan.md` (the current state and what comes next) and the
   register notes behind the models.
 
