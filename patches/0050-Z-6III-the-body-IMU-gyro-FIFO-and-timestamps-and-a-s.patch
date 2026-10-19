@@ -1,0 +1,749 @@
+From fca653ba38961d6bce1c20416b16d4ee1efad7c7 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 19 Oct 2026 11:17:37 +0800
+Subject: [PATCH 50/57] Z 6III: the body IMU -- gyro, FIFO and timestamps, and
+ a settable I2C rate
+
+nikon-z63-imu.h gains the gyro side of the posture sensor: its FIFO,
+timestamps and byte order as the firmware reads them, so the stock image
+now sees a real 1 g. -machine imu-dps= sets the rotation (default a slow
+sine), imu-clock-ppm= the sensor's clock error, and i2c-byte-ns= the time
+an I2C byte takes on the EXPEED's banks (nikon-z63-i2c.h; default about
+24 us, the driver's divisors at an unmeasured 100 MHz pclk). Bus steps
+catch up in virtual time instead of drifting.
+
+Pass -machine imu-mg=-1000:0:0 for a level body: the old default of 1 g
+on Z puts the GUI into its rotated layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-i2c.h |  25 ++-
+ hw/arm/nikon-z63-imu.h | 442 ++++++++++++++++++++++++++++++++++++++---
+ hw/arm/nikon-z63.c     |  88 ++++++++
+ 3 files changed, 528 insertions(+), 27 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-i2c.h b/hw/arm/nikon-z63-i2c.h
+index 98af9b5..827456c 100644
+--- a/hw/arm/nikon-z63-i2c.h
++++ b/hw/arm/nikon-z63-i2c.h
+@@ -29,7 +29,9 @@
+ 
+ /* Functional Cadence master controller; original 40c16df8/40c16f68/40c17134.
+  * Four banks, IRQ a9..ac, FIFO16. The 100us boundary is virtual timing, not
+- * a measured I2C rate. No endpoint means address NACK, never invented data.
++ * a measured I2C rate (-machine i2c-byte-ns= changes it; the driver's
++ * divisors, DIV_A 0 / DIV_B 11, give pclk/264, about 24 us a byte at an
++ * unmeasured 100 MHz pclk). No endpoint means address NACK, never invented data.
+  * See docs/native-i2c-controller.md for native ISR and callback evidence. */
+ #define Z63_I2C_BASE 0x0e005000ULL
+ #define Z63_I2C_BANKS 4
+@@ -75,6 +77,7 @@ typedef struct Z63I2cBlock {
+     bool active, address_pending, bus_started, repeated;
+     bool segment_done, tx_empty_announced, irq_level;
+     uint64_t starts, tx_bytes, rx_bytes, completions, nacks;
++    int64_t step_due;             /* virtual time the pending step is for */
+ } Z63I2cBlock;
+ 
+ struct Z63I2c {
+@@ -86,6 +89,7 @@ struct Z63I2c {
+     void *peripheral;
+     uint32_t configuration_writes, acknowledgements, rejected_accesses;
+     bool halted;
++    uint32_t step_ns;          /* virtual time per bus step, 0: the default */
+ };
+ 
+ static void z63_i2c_schedule(Z63I2cBlock *b);
+@@ -248,8 +252,10 @@ static void z63_i2c_schedule(Z63I2cBlock *b)
+     }
+     if (z63_i2c_needs_step(b)) {
+         if (!timer_pending(b->timer)) {
+-            timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+-                                   Z63_I2C_STEP_NS);
++            uint32_t step = b->owner->step_ns ? b->owner->step_ns
++                                              : Z63_I2C_STEP_NS;
++            b->step_due = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + step;
++            timer_mod(b->timer, b->step_due);
+         }
+     } else {
+         timer_del(b->timer);
+@@ -260,6 +266,19 @@ static void z63_i2c_timer_tick(void *opaque)
+ {
+     Z63I2cBlock *b = opaque;
+     z63_i2c_advance(b);
++    /* With i2c-byte-ns= given, the bus keeps its rate even when the host
++     * runs the timer late: every step the virtual time already covers is
++     * taken now, as long as the FIFO lets the bus go on. Without it, one
++     * step per tick, as always. */
++    uint32_t step = b->owner->step_ns;
++    if (step) {
++        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        for (unsigned n = 0; n < 64 && z63_i2c_needs_step(b) &&
++                             b->step_due + step <= now; n++) {
++            b->step_due += step;
++            z63_i2c_advance(b);
++        }
++    }
+     z63_i2c_schedule(b);
+ }
+ 
+diff --git a/hw/arm/nikon-z63-imu.h b/hw/arm/nikon-z63-imu.h
+index d194b17..6b9012c 100644
+--- a/hw/arm/nikon-z63-imu.h
++++ b/hw/arm/nikon-z63-imu.h
+@@ -7,25 +7,57 @@
+  * orientation. Its constructor (sub_40C8A214) takes bus handle 7 -- bank 3,
+  * 0x00030080 -- and sets 0xa02f84e1c = 1, which selects the second of the
+  * two sensors the code supports: slave 0x68, read as "write 0x1f, repeated
+- * START, read six bytes" (sub_40C8ACA4), three big-endian 16-bit axes
+- * scaled by 1/16384 g. The other branch, slave 0x1d with 1/1024 g, is the
++ * START, read six bytes" (sub_40C8ACA4), three 16-bit axes scaled by
++ * 1/16384 g. The other branch, slave 0x1d with 1/1024 g, is the
+  * MMA8452Q path ../n-research/z8-qemu modelled on the Z 8, where a strap
+  * GPIO chose between them; this image hard-codes the 0x68 one. Before
+  * sampling, the task writes its configuration one register at a time
+  * through sub_40C8C798 (bank select 0x76, then 0x7c, 0x7a, 0x13, 0x11,
+  * 0x4c, 3, 4, 5, 0x51..0x53, 0x50, 0x4e), and it only needs each write
+  * ACKed. Those addresses and the 0x1f data block are an InvenSense
+- * ICM-426xx's bank-0 map, so that is what this answers to.
++ * ICM-426xx's bank-0 map, so that is what this answers to. The values come
++ * from SNOR adjustment record 0x16 ("ACCEL", pointer 0xa02f850d8): soft
++ * reset (0x11 = 1), INTF_CONFIG0 0x4c = 0x22 (sensor data little-endian,
++ * FIFO count big-endian -- sub_40C8ACA4 copies the six bytes without a
++ * swap on this branch), ACCEL_CONFIG0 0x50 = 0x66 then 0x6b (+/-2 g) and
++ * PWR_MGMT0 0x4e = 0x23: accelerometer low-noise, gyroscope OFF. The stock
++ * firmware never powers the gyroscope or touches the FIFO.
+  *
+  * What is modelled -- a declared, compatible subset, not the body's part:
+  * a 128-byte register file per bank (0x76 selects among eight), writes
+  * stored with a pointer that auto-increments, reads returning the file,
+- * and the accelerometer block at 0x1f..0x24 filled from a milligravity
+- * input, converted at 16384 LSB/g. The default input, like the Z 8 model's,
+- * is a body at rest with 1 g along Z (-machine imu-mg=x:y:z to change it;
+- * qom-set works at run time). WHO_AM_I (0x75) answers 0x47, the ICM-42688-P
+- * value, which nothing has been seen to read. No interrupt, FIFO, gyro or
+- * self-test behaviour.
++ * soft reset (0x11 bit 0) restoring the bank-0 reset values this model
++ * uses, and the data block filled at each read from the inputs:
++ *   - accelerometer 0x1f..0x24 from a milligravity input (-machine
++ *     imu-mg=x:y:z; default a body at rest, 1 g along Z), scaled by
++ *     ACCEL_CONFIG0's full scale;
++ *   - gyroscope 0x25..0x2a from an angular-rate input (-machine
++ *     imu-dps=x:y:z in millidegrees per second, or "sine", the default: a
++ *     declared synthetic motion, x 20 deg/s at 1.3 Hz, y 12 deg/s at
++ *     0.7 Hz, z 6 deg/s at 2.9 Hz plus 0.5 deg/s), scaled by
++ *     GYRO_CONFIG0's full scale, and -32768 while PWR_MGMT0 has the gyro
++ *     off or for the first 30 ms after it is switched on;
++ *   - temperature 0x1d..0x1e, 25 C.
++ * Byte order follows INTF_CONFIG0: bit 4 for sensor data (registers and
++ * FIFO), bit 5 for the FIFO count; reset value 0x30, both big-endian.
++ *
++ * The FIFO (2048 bytes) is filled at the faster enabled sensor's ODR
++ * (GYRO_CONFIG0 / ACCEL_CONFIG0 bits 3:0) in the sensor's own time base,
++ * which runs -machine imu-clock-ppm= parts per million fast against the
++ * virtual clock (default 0) -- a real part's ODR is off by up to about a
++ * percent. FIFO_CONFIG 0x16 bits 7:6 pick bypass / stream (oldest packets
++ * dropped, INT_STATUS 0x2d bit 1 raised) / stop-on-full; FIFO_CONFIG1 0x5f
++ * bits 0/1 put accel / gyro in: packet 1 (accel+temp, 8 bytes, header
++ * 0x40), packet 2 (gyro+temp, 8 bytes, 0x20) or packet 3 (accel, gyro,
++ * temp, 16-bit ODR timestamp in TMST_CONFIG 0x54 bit 3's unit, 16 bytes,
++ * 0x68). FIFO_COUNTH/L 0x2e/0x2f (bytes, or packets with INTF_CONFIG0
++ * bit 6) are latched when a read starts there; a read of FIFO_DATA 0x30
++ * pops a byte and does not advance the pointer, 0xff when empty;
++ * SIGNAL_PATH_RESET 0x4b bit 1 flushes. Packets are made lazily, at each
++ * transfer, for the ODR ticks that have passed. No interrupt pins,
++ * watermark, high-resolution packets, FSYNC, filters or self-test.
++ * WHO_AM_I (0x75) answers 0x47, the ICM-42688-P value, which the stock
++ * firmware never reads.
+  *
+  * Every other bank/address NACKs, as an empty bus does, and is named once.
+  */
+@@ -33,9 +65,32 @@
+ #ifndef HW_ARM_NIKON_Z63_IMU_H
+ #define HW_ARM_NIKON_Z63_IMU_H
+ 
++#include <math.h>
++#include "qemu/timer.h"
++
+ #define Z63_IMU_BANK      3
+ #define Z63_IMU_ADDRESS   0x68
+-#define Z63_IMU_LSB_PER_G 16384
++#define Z63_IMU_FIFO      2048
++#define Z63_IMU_GYRO_START_NS (30 * 1000 * 1000)
++
++/* Bank-0 registers this model gives a meaning to. */
++#define Z63_IMU_DEVICE_CONFIG   0x11
++#define Z63_IMU_FIFO_CONFIG     0x16
++#define Z63_IMU_TEMP_DATA1      0x1d
++#define Z63_IMU_ACCEL_DATA_X1   0x1f
++#define Z63_IMU_GYRO_DATA_X1    0x25
++#define Z63_IMU_INT_STATUS      0x2d
++#define Z63_IMU_FIFO_COUNTH     0x2e
++#define Z63_IMU_FIFO_COUNTL     0x2f
++#define Z63_IMU_FIFO_DATA       0x30
++#define Z63_IMU_SIGNAL_PATH_RESET 0x4b
++#define Z63_IMU_INTF_CONFIG0    0x4c
++#define Z63_IMU_PWR_MGMT0       0x4e
++#define Z63_IMU_GYRO_CONFIG0    0x4f
++#define Z63_IMU_ACCEL_CONFIG0   0x50
++#define Z63_IMU_TMST_CONFIG     0x54
++#define Z63_IMU_FIFO_CONFIG1    0x5f
++#define Z63_IMU_WHO_AM_I        0x75
+ 
+ typedef struct Z63Imu {
+     uint8_t regs[8][128];
+@@ -44,19 +99,281 @@ typedef struct Z63Imu {
+     bool selected, receive, pointer_set;
+     int32_t mg[3];
+     bool mg_set;                    /* -machine imu-mg= given */
++    int32_t mdps[3];                /* imu-dps constant input */
++    bool mdps_set;                  /* false: the synthetic motion */
++    int32_t clock_ppm;              /* sensor time base vs virtual clock */
+     uint64_t writes, reads;
+     uint8_t nack_reported[Z63_I2C_BANKS][128 / 8];
++    /* FIFO */
++    uint8_t fifo[Z63_IMU_FIFO];
++    unsigned fifo_head, fifo_len;
++    unsigned head_left;             /* unread bytes of a packet begun */
++    uint32_t fifo_key;              /* configuration the schedule is for */
++    int64_t next_ns;                /* next ODR tick, virtual ns; 0 none */
++    int64_t gyro_on_ns;             /* when PWR_MGMT0 last switched it on */
++    uint64_t fifo_packets, fifo_dropped;
+ } Z63Imu;
+ 
++static int64_t z63_imu_now(void)
++{
++    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++}
++
++/* ODR code (bits 3:0 of GYRO/ACCEL_CONFIG0) -> period in ns, 0 if none. */
++static int64_t z63_imu_odr_ns(unsigned code)
++{
++    static const int64_t ns[16] = {
++        0, 31250, 62500, 125000, 250000, 500000, 1000000, 5000000,
++        10000000, 20000000, 40000000, 80000000, 160000000, 320000000,
++        640000000, 2000000,
++    };
++    return ns[code & 15];
++}
++
++static bool z63_imu_big(Z63Imu *m)
++{
++    return m->regs[0][Z63_IMU_INTF_CONFIG0] & 0x10;
++}
++
++static void z63_imu_put16(Z63Imu *m, uint8_t *p, int16_t v)
++{
++    if (z63_imu_big(m)) {
++        p[0] = (uint16_t)v >> 8;
++        p[1] = (uint16_t)v;
++    } else {
++        p[0] = (uint16_t)v;
++        p[1] = (uint16_t)v >> 8;
++    }
++}
++
++static int16_t z63_imu_clamp(int64_t v)
++{
++    return v > INT16_MAX ? INT16_MAX : v < -INT16_MAX ? -INT16_MAX : v;
++}
++
++static bool z63_imu_gyro_on(Z63Imu *m)
++{
++    return ((m->regs[0][Z63_IMU_PWR_MGMT0] >> 2) & 3) == 3;
++}
++
++/* The inputs at virtual time t_ns, as raw counts. */
++static void z63_imu_sample(Z63Imu *m, int64_t t_ns, int16_t accel[3],
++                           int16_t gyro[3])
++{
++    unsigned afs = m->regs[0][Z63_IMU_ACCEL_CONFIG0] >> 5;   /* 16 g >> n */
++    unsigned gfs = m->regs[0][Z63_IMU_GYRO_CONFIG0] >> 5;    /* 2000 >> n */
++    double t = t_ns / 1e9;
++
++    for (unsigned i = 0; i < 3; i++) {
++        /* 32768 / (16 >> afs) counts per g */
++        accel[i] = z63_imu_clamp((int64_t)m->mg[i] * (2048 << (afs & 3)) /
++                                 1000);
++    }
++    if (!z63_imu_gyro_on(m) || t_ns - m->gyro_on_ns < Z63_IMU_GYRO_START_NS) {
++        gyro[0] = gyro[1] = gyro[2] = INT16_MIN;
++        return;
++    }
++    double dps[3];
++    if (m->mdps_set) {
++        for (unsigned i = 0; i < 3; i++) {
++            dps[i] = m->mdps[i] / 1000.0;
++        }
++    } else {
++        dps[0] = 20.0 * sin(2 * M_PI * 1.3 * t);
++        dps[1] = 12.0 * sin(2 * M_PI * 0.7 * t + 1.0);
++        dps[2] = 6.0 * sin(2 * M_PI * 2.9 * t + 2.0) + 0.5;
++    }
++    /* 32768 / (2000 >> gfs) counts per deg/s */
++    double per_dps = 32768.0 / (2000.0 / (1 << gfs));
++    for (unsigned i = 0; i < 3; i++) {
++        gyro[i] = z63_imu_clamp(llround(dps[i] * per_dps));
++    }
++}
++
+ static void z63_imu_fill(Z63Imu *m)
+ {
++    int16_t accel[3], gyro[3];
++
++    z63_imu_sample(m, z63_imu_now(), accel, gyro);
++    z63_imu_put16(m, &m->regs[0][Z63_IMU_TEMP_DATA1], 0);   /* 25 C */
+     for (unsigned i = 0; i < 3; i++) {
+-        int64_t v = (int64_t)m->mg[i] * Z63_IMU_LSB_PER_G / 1000;
+-        int16_t s = v > INT16_MAX ? INT16_MAX : v < INT16_MIN ? INT16_MIN : v;
++        z63_imu_put16(m, &m->regs[0][Z63_IMU_ACCEL_DATA_X1 + 2 * i], accel[i]);
++        z63_imu_put16(m, &m->regs[0][Z63_IMU_GYRO_DATA_X1 + 2 * i], gyro[i]);
++    }
++}
+ 
+-        m->regs[0][0x1f + 2 * i] = (uint16_t)s >> 8;
+-        m->regs[0][0x20 + 2 * i] = (uint16_t)s;
++static void z63_imu_fifo_flush(Z63Imu *m)
++{
++    m->fifo_head = m->fifo_len = m->head_left = 0;
++}
++
++static unsigned z63_imu_packet_bytes(uint8_t header)
++{
++    return (header & 0x60) == 0x60 ? 16 : 8;
++}
++
++static void z63_imu_fifo_push(Z63Imu *m, const uint8_t *p, unsigned n)
++{
++    unsigned mode = m->regs[0][Z63_IMU_FIFO_CONFIG] >> 6;
++
++    while (m->fifo_len + n > Z63_IMU_FIFO) {
++        if (mode != 1) {                /* stop-on-full: the new one is lost */
++            m->fifo_dropped++;
++            m->regs[0][Z63_IMU_INT_STATUS] |= 0x02;
++            return;
++        }
++        /* the oldest packet, or what is left of one being read */
++        unsigned old = m->head_left ? m->head_left
++                                    : z63_imu_packet_bytes(m->fifo[m->fifo_head]);
++        old = MIN(old, m->fifo_len);
++        m->head_left = 0;
++        m->fifo_head = (m->fifo_head + old) % Z63_IMU_FIFO;
++        m->fifo_len -= old;
++        m->fifo_dropped++;
++        m->regs[0][Z63_IMU_INT_STATUS] |= 0x02;
+     }
++    for (unsigned i = 0; i < n; i++) {
++        m->fifo[(m->fifo_head + m->fifo_len + i) % Z63_IMU_FIFO] = p[i];
++    }
++    m->fifo_len += n;
++    m->fifo_packets++;
++}
++
++/* What the FIFO is filling with: 0 when nothing goes in. */
++static uint32_t z63_imu_fifo_key(Z63Imu *m)
++{
++    uint8_t *r = m->regs[0];
++    unsigned mode = r[Z63_IMU_FIFO_CONFIG] >> 6;
++    unsigned what = r[Z63_IMU_FIFO_CONFIG1] & 3;
++    bool accel = (what & 1) && (r[Z63_IMU_PWR_MGMT0] & 3) >= 2;
++    bool gyro = (what & 2) && z63_imu_gyro_on(m);
++
++    if (mode == 0 || (!accel && !gyro)) {
++        return 0;
++    }
++    return 1u | what << 1 | (uint32_t)r[Z63_IMU_GYRO_CONFIG0] << 8 |
++           (uint32_t)r[Z63_IMU_ACCEL_CONFIG0] << 16 |
++           (uint32_t)(r[Z63_IMU_PWR_MGMT0] & 0xf) << 24;
++}
++
++static void z63_imu_make_packet(Z63Imu *m, int64_t t_ns)
++{
++    uint8_t *r = m->regs[0];
++    unsigned what = r[Z63_IMU_FIFO_CONFIG1] & 3;
++    int16_t accel[3], gyro[3];
++    uint8_t p[16];
++    unsigned n;
++
++    z63_imu_sample(m, t_ns, accel, gyro);
++    if (what == 3) {
++        /* the sensor's own clock, in TMST_CONFIG's unit */
++        int64_t sensor_ns = t_ns + t_ns / 1000000 * m->clock_ppm;
++        uint64_t us = sensor_ns / 1000;
++        uint16_t ts = (r[Z63_IMU_TMST_CONFIG] & 0x08) ? us / 16 : us;
++
++        p[0] = 0x68;
++        for (unsigned i = 0; i < 3; i++) {
++            z63_imu_put16(m, &p[1 + 2 * i], accel[i]);
++            z63_imu_put16(m, &p[7 + 2 * i], gyro[i]);
++        }
++        p[13] = 0;                                  /* 25 C */
++        z63_imu_put16(m, &p[14], (int16_t)ts);
++        n = 16;
++    } else {
++        const int16_t *v = what == 1 ? accel : gyro;
++
++        p[0] = what == 1 ? 0x40 : 0x20;
++        for (unsigned i = 0; i < 3; i++) {
++            z63_imu_put16(m, &p[1 + 2 * i], v[i]);
++        }
++        p[7] = 0;
++        n = 8;
++    }
++    z63_imu_fifo_push(m, p, n);
++}
++
++/* Fill the FIFO up to now: one packet per ODR tick since the last call. */
++static void z63_imu_advance(Z63Imu *m)
++{
++    uint32_t key = z63_imu_fifo_key(m);
++    int64_t now = z63_imu_now();
++    uint8_t *r = m->regs[0];
++
++    if (key != m->fifo_key) {
++        m->fifo_key = key;
++        m->next_ns = 0;
++    }
++    if (!key) {
++        return;
++    }
++    int64_t gyro_ns = (r[Z63_IMU_FIFO_CONFIG1] & 2) && z63_imu_gyro_on(m)
++                      ? z63_imu_odr_ns(r[Z63_IMU_GYRO_CONFIG0]) : 0;
++    int64_t accel_ns = (r[Z63_IMU_FIFO_CONFIG1] & 1) &&
++                       (r[Z63_IMU_PWR_MGMT0] & 3) >= 2
++                       ? z63_imu_odr_ns(r[Z63_IMU_ACCEL_CONFIG0]) : 0;
++    int64_t period = gyro_ns && accel_ns ? MIN(gyro_ns, accel_ns)
++                                         : gyro_ns ? gyro_ns : accel_ns;
++    if (!period) {
++        return;
++    }
++    /* a fast sensor clock means a short period on the virtual clock */
++    period = period * 1000000 / (1000000 + m->clock_ppm);
++    if (!m->next_ns) {
++        m->next_ns = now + period;
++        return;
++    }
++    /* nothing older than a FIFO's worth can still be in it */
++    int64_t keep = (int64_t)(Z63_IMU_FIFO / 8 + 2) * period;
++    if (now - m->next_ns > keep) {
++        int64_t skip = (now - m->next_ns - keep) / period + 1;
++
++        m->fifo_dropped += skip;
++        m->next_ns += skip * period;
++        if (r[Z63_IMU_FIFO_CONFIG] >> 6 == 1) {
++            r[Z63_IMU_INT_STATUS] |= 0x02;
++        }
++    }
++    while (m->next_ns <= now) {
++        z63_imu_make_packet(m, m->next_ns);
++        m->next_ns += period;
++    }
++}
++
++static void z63_imu_latch_count(Z63Imu *m)
++{
++    uint8_t *r = m->regs[0];
++    unsigned count = m->fifo_len;
++
++    if (r[Z63_IMU_INTF_CONFIG0] & 0x40) {               /* in packets */
++        unsigned size = (r[Z63_IMU_FIFO_CONFIG1] & 3) == 3 ? 16 : 8;
++        count /= size;
++    }
++    if (r[Z63_IMU_INTF_CONFIG0] & 0x20) {
++        r[Z63_IMU_FIFO_COUNTH] = count >> 8;
++        r[Z63_IMU_FIFO_COUNTL] = count;
++    } else {
++        r[Z63_IMU_FIFO_COUNTH] = count;
++        r[Z63_IMU_FIFO_COUNTL] = count >> 8;
++    }
++}
++
++/* The bank-0 reset values the model gives a meaning to. */
++static void z63_imu_reset_bank0(Z63Imu *m)
++{
++    uint8_t *r = m->regs[0];
++
++    r[Z63_IMU_FIFO_CONFIG] = 0x00;
++    r[Z63_IMU_INT_STATUS] = 0x10;           /* RESET_DONE */
++    r[Z63_IMU_INTF_CONFIG0] = 0x30;
++    r[Z63_IMU_PWR_MGMT0] = 0x00;
++    r[Z63_IMU_GYRO_CONFIG0] = 0x06;
++    r[Z63_IMU_ACCEL_CONFIG0] = 0x06;
++    r[Z63_IMU_TMST_CONFIG] = 0x23;
++    r[Z63_IMU_FIFO_CONFIG1] = 0x00;
++    r[Z63_IMU_WHO_AM_I] = 0x47;
++    z63_imu_fifo_flush(m);
++    m->fifo_key = 0;
++    m->next_ns = 0;
+ }
+ 
+ static bool z63_imu_start(void *opaque, unsigned bank, uint16_t address,
+@@ -75,11 +392,16 @@ static bool z63_imu_start(void *opaque, unsigned bank, uint16_t address,
+     }
+     m->selected = true;
+     m->receive = receive;
++    z63_imu_advance(m);
+     if (!receive) {
+         m->pointer_set = false;
+     }
+     if (receive) {
+         z63_imu_fill(m);
++        if (m->bank_sel == 0 && (m->pointer == Z63_IMU_FIFO_COUNTH ||
++                                 m->pointer == Z63_IMU_FIFO_COUNTL)) {
++            z63_imu_latch_count(m);
++        }
+     }
+     return true;
+ }
+@@ -99,7 +421,36 @@ static bool z63_imu_write(void *opaque, unsigned bank, uint8_t byte)
+     if (m->pointer == 0x76) {
+         m->bank_sel = byte & 7;
+     }
+-    m->regs[m->pointer == 0x76 ? 0 : m->bank_sel][m->pointer] = byte;
++    unsigned b = m->pointer == 0x76 ? 0 : m->bank_sel;
++    bool gyro_was = z63_imu_gyro_on(m);
++
++    m->regs[b][m->pointer] = byte;
++    if (b == 0) {
++        switch (m->pointer) {
++        case Z63_IMU_DEVICE_CONFIG:
++            if (byte & 1) {
++                z63_imu_reset_bank0(m);
++                m->regs[0][Z63_IMU_DEVICE_CONFIG] = 0;
++            }
++            break;
++        case Z63_IMU_SIGNAL_PATH_RESET:
++            if (byte & 0x02) {
++                z63_imu_fifo_flush(m);
++            }
++            m->regs[0][Z63_IMU_SIGNAL_PATH_RESET] = 0;  /* self-clearing */
++            break;
++        case Z63_IMU_FIFO_CONFIG:
++            if ((byte >> 6) == 0) {
++                z63_imu_fifo_flush(m);              /* bypass: no FIFO */
++            }
++            break;
++        case Z63_IMU_PWR_MGMT0:
++            if (!gyro_was && z63_imu_gyro_on(m)) {
++                m->gyro_on_ns = z63_imu_now();
++            }
++            break;
++        }
++    }
+     m->pointer = (m->pointer + 1) & 0x7f;
+     m->writes++;
+     return true;
+@@ -112,7 +463,25 @@ static bool z63_imu_read(void *opaque, unsigned bank, uint8_t *byte)
+     if (!m->selected) {
+         return false;
+     }
++    if (m->bank_sel == 0 && m->pointer == Z63_IMU_FIFO_DATA) {
++        if (m->fifo_len) {
++            if (!m->head_left) {
++                m->head_left = z63_imu_packet_bytes(m->fifo[m->fifo_head]);
++            }
++            *byte = m->fifo[m->fifo_head];
++            m->fifo_head = (m->fifo_head + 1) % Z63_IMU_FIFO;
++            m->fifo_len--;
++            m->head_left--;
++        } else {
++            *byte = 0xff;
++        }
++        m->reads++;
++        return true;                        /* FIFO_DATA does not advance */
++    }
+     *byte = m->regs[m->bank_sel][m->pointer];
++    if (m->bank_sel == 0 && m->pointer == Z63_IMU_INT_STATUS) {
++        m->regs[0][Z63_IMU_INT_STATUS] = 0;         /* clear on read */
++    }
+     m->pointer = (m->pointer + 1) & 0x7f;
+     m->reads++;
+     return true;
+@@ -125,32 +494,56 @@ static void z63_imu_stop(void *opaque, unsigned bank)
+     m->selected = false;
+ }
+ 
+-/* "x:y:z" in milligravity. */
+-static bool z63_imu_set_mg(Z63Imu *m, const char *text, Error **errp)
++/* "x:y:z" -> v[3]; false with errp set when it is not three numbers in
++ * [lo, hi]. */
++static bool z63_imu_parse3(const char *text, int64_t lo, int64_t hi,
++                           const char *what, int32_t out[3], Error **errp)
+ {
+     g_auto(GStrv) parts = g_strsplit_set(text ? text : "", ":,", -1);
+     int64_t v[3];
+ 
+     if (g_strv_length(parts) != 3) {
+-        error_setg(errp, "imu-mg wants x:y:z in milligravity");
++        error_setg(errp, "%s wants x:y:z", what);
+         return false;
+     }
+     for (unsigned i = 0; i < 3; i++) {
+-        if (qemu_strtoi64(parts[i], NULL, 0, &v[i]) ||
+-            v[i] < -16000 || v[i] > 16000) {
+-            error_setg(errp, "imu-mg: '%s' is not a value in -16000..16000",
+-                       parts[i]);
++        if (qemu_strtoi64(parts[i], NULL, 0, &v[i]) || v[i] < lo || v[i] > hi) {
++            error_setg(errp, "%s: '%s' is not a value in %" PRId64 "..%" PRId64,
++                       what, parts[i], lo, hi);
+             return false;
+         }
+     }
+     for (unsigned i = 0; i < 3; i++) {
+-        m->mg[i] = v[i];
++        out[i] = v[i];
++    }
++    return true;
++}
++
++/* "x:y:z" in milligravity. */
++static bool z63_imu_set_mg(Z63Imu *m, const char *text, Error **errp)
++{
++    if (!z63_imu_parse3(text, -16000, 16000, "imu-mg", m->mg, errp)) {
++        return false;
+     }
+     m->mg_set = true;
+     z63_imu_fill(m);
+     return true;
+ }
+ 
++/* "x:y:z" in millidegrees per second, or "sine" for the synthetic motion. */
++static bool z63_imu_set_dps(Z63Imu *m, const char *text, Error **errp)
++{
++    if (text && !strcmp(text, "sine")) {
++        m->mdps_set = false;
++        return true;
++    }
++    if (!z63_imu_parse3(text, -2000000, 2000000, "imu-dps", m->mdps, errp)) {
++        return false;
++    }
++    m->mdps_set = true;
++    return true;
++}
++
+ static const Z63I2cEndpoint z63_imu_endpoint = {
+     .start = z63_imu_start,
+     .write = z63_imu_write,
+@@ -160,7 +553,8 @@ static const Z63I2cEndpoint z63_imu_endpoint = {
+ 
+ static void z63_imu_init(Z63Imu *m)
+ {
+-    m->regs[0][0x75] = 0x47;
++    z63_imu_reset_bank0(m);
++    m->regs[0][Z63_IMU_INT_STATUS] = 0;
+     if (!m->mg_set) {
+         m->mg[2] = 1000;
+     }
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 327cfac..a122161 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -5487,11 +5487,76 @@ static void z63_prop_set_imu_mg(Object *obj, const char *value, Error **errp)
+     z63_imu_set_mg(&NIKON_Z63(obj)->imu, value, errp);
+ }
+ 
++static char *z63_prop_get_imu_dps(Object *obj, Error **errp)
++{
++    Z63Imu *m = &NIKON_Z63(obj)->imu;
++
++    if (!m->mdps_set) {
++        return g_strdup("sine");
++    }
++    return g_strdup_printf("%d:%d:%d", m->mdps[0], m->mdps[1], m->mdps[2]);
++}
++
++static void z63_prop_set_imu_dps(Object *obj, const char *value, Error **errp)
++{
++    z63_imu_set_dps(&NIKON_Z63(obj)->imu, value, errp);
++}
++
++static void z63_prop_get_i2c_ns(Object *obj, Visitor *v, const char *name,
++                                void *opaque, Error **errp)
++{
++    uint32_t value = NIKON_Z63(obj)->i2c.step_ns;
++
++    if (!value) {
++        value = Z63_I2C_STEP_NS;
++    }
++    visit_type_uint32(v, name, &value, errp);
++}
++
++static void z63_prop_set_i2c_ns(Object *obj, Visitor *v, const char *name,
++                                void *opaque, Error **errp)
++{
++    uint32_t value;
++
++    if (!visit_type_uint32(v, name, &value, errp)) {
++        return;
++    }
++    if (value < 1000 || value > 1000000) {
++        error_setg(errp, "i2c-byte-ns: %u is not in 1000..1000000", value);
++        return;
++    }
++    NIKON_Z63(obj)->i2c.step_ns = value;
++}
++
++static void z63_prop_get_imu_ppm(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    int32_t value = NIKON_Z63(obj)->imu.clock_ppm;
++
++    visit_type_int32(v, name, &value, errp);
++}
++
++static void z63_prop_set_imu_ppm(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    int32_t value;
++
++    if (!visit_type_int32(v, name, &value, errp)) {
++        return;
++    }
++    if (value < -100000 || value > 100000) {
++        error_setg(errp, "imu-clock-ppm: %d is not in -100000..100000", value);
++        return;
++    }
++    NIKON_Z63(obj)->imu.clock_ppm = value;
++}
++
+ static char *z63_prop_get_mcu_keys(Object *obj, Error **errp)
+ {
+     return g_strdup(NIKON_Z63(obj)->mcu_keys ? NIKON_Z63(obj)->mcu_keys : "");
+ }
+ 
++
+ static bool z63_prop_get_usb_cable(Object *obj, Error **errp)
+ {
+     return NIKON_Z63(obj)->usb_cable;
+@@ -5980,6 +6045,29 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "The posture sensor's input, x:y:z in milligravity; default 0:0:1000, "
+         "a body at rest. Settable at run time with qom-set. See "
+         "nikon-z63-imu.h.");
++    object_class_property_add_str(oc, "imu-dps",
++                                  z63_prop_get_imu_dps,
++                                  z63_prop_set_imu_dps);
++    object_class_property_set_description(oc, "imu-dps",
++        "The posture sensor's gyroscope input, x:y:z in millidegrees per "
++        "second, or 'sine' (default): a declared synthetic motion. Only seen "
++        "once something powers the gyroscope, which stock firmware never "
++        "does. Settable at run time with qom-set. See nikon-z63-imu.h.");
++    object_class_property_add(oc, "i2c-byte-ns", "uint32",
++                              z63_prop_get_i2c_ns,
++                              z63_prop_set_i2c_ns, NULL, NULL);
++    object_class_property_set_description(oc, "i2c-byte-ns",
++        "Virtual time the I2C masters take per bus step (a byte, an address); "
++        "default 100000. A test input, not a measured rate: the driver's "
++        "divisors give about 24000 at an unmeasured 100 MHz pclk. See "
++        "nikon-z63-i2c.h.");
++    object_class_property_add(oc, "imu-clock-ppm", "int32",
++                              z63_prop_get_imu_ppm,
++                              z63_prop_set_imu_ppm, NULL, NULL);
++    object_class_property_set_description(oc, "imu-clock-ppm",
++        "How many parts per million the posture sensor's own clock (its ODR "
++        "and FIFO timestamps) runs fast against the virtual clock; default "
++        "0. A declared test input, not a measurement.");
+     object_class_property_add_bool(oc, "usb-cable", z63_prop_get_usb_cable,
+                                    z63_prop_set_usb_cable);
+     object_class_property_set_description(oc, "usb-cable",
+-- 
+2.55.0
+

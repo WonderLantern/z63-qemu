@@ -1,7 +1,7 @@
-From a229b72057386d5743271001b92abf98a091f07e Mon Sep 17 00:00:00 2001
+From be016231e728b848ff8fd1e46bfae74e067a6ad1 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Wed, 14 Oct 2026 23:35:12 +0800
-Subject: [PATCH 47/47] Z 6III: a buffer may run from one NoC window into the
+Subject: [PATCH 48/57] Z 6III: a buffer may run from one NoC window into the
  next
 
 The graphics driver programs group 15's 512 MiB windows back to back (bus

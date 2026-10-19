@@ -1,7 +1,7 @@
 From d39426757f0ec52277a36e26b56856cf6bc932f3 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Sun, 11 Oct 2026 17:32:19 +0000
-Subject: [PATCH 07/47] Z 6III: capture-sync wired to the MCU; the multi-IO
+Subject: [PATCH 07/57] Z 6III: capture-sync wired to the MCU; the multi-IO
  timer counts
 
 Capture sync. CAPCOM's request/completion pair now reaches the body

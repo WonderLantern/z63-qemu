@@ -1,7 +1,7 @@
 From 138eb41ff8f9f247138c8493f6b5d2c77d0b0902 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 14:43:47 +0000
-Subject: [PATCH 32/47] Z 6III: the still capture's sensor wait -- aux1 and
+Subject: [PATCH 32/57] Z 6III: the still capture's sensor wait -- aux1 and
  global0 bit 26 at the frame boundary
 
 With the release firing (72eba8f) and the readout descriptor index in

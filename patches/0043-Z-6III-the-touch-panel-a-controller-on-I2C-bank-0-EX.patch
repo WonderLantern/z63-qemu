@@ -1,7 +1,7 @@
 From 678f77b35384b7918605e20f5c0b7e3593cd8dae Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Tue, 13 Oct 2026 03:52:03 +0000
-Subject: [PATCH 43/47] Z 6III: the touch panel -- a controller on I2C bank 0,
+Subject: [PATCH 43/57] Z 6III: the touch panel -- a controller on I2C bank 0,
  EXT_INT_14, and -machine touch
 
 The rear monitor's touch panel had no device. Its driver

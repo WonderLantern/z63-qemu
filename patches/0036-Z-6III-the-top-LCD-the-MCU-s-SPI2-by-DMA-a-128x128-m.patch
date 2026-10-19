@@ -1,7 +1,7 @@
 From d8c6b11199a0063fbda1f2651c4aae49ac2eb3d7 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 15:42:54 +0000
-Subject: [PATCH 36/47] Z 6III: the top LCD -- the MCU's SPI2 by DMA, a 128x128
+Subject: [PATCH 36/57] Z 6III: the top LCD -- the MCU's SPI2 by DMA, a 128x128
  memory LCD
 
 The control panel on the right shoulder never showed anything: the body

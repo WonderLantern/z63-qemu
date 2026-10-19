@@ -1,7 +1,7 @@
 From 31ecef4bc1dfbdd3cd015852dca4bb5f90d8fafd Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 03:49:15 +0000
-Subject: [PATCH 12/47] Z 6III: the sensor interface acknowledges a lane-0
+Subject: [PATCH 12/57] Z 6III: the sensor interface acknowledges a lane-0
  request (global0 bit 10)
 
 Error 0x40 ("Error. Turn the camera off and on again" over live view) is

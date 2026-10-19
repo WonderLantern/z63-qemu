@@ -1,7 +1,7 @@
 From 717d8cc8f8c580f8d70d966508d891665bc079e7 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 13:35:27 +0000
-Subject: [PATCH 31/47] Z 6III tools: snor_user_capture_index.py -- a readout
+Subject: [PATCH 31/57] Z 6III tools: snor_user_capture_index.py -- a readout
  descriptor index for the photo
 
 With the release firing, CAPSVC took a data abort at 0x411791A4 (FAR

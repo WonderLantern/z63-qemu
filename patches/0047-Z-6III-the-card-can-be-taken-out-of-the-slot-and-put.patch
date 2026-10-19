@@ -1,0 +1,116 @@
+From 5074148f314150c874698c9d77799a9bb0a451de Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Sat, 17 Oct 2026 08:12:40 +0000
+Subject: [PATCH 47/57] Z 6III: the card can be taken out of the slot and put
+ back
+
+A photographer opens the slot and swaps the card while the camera is on,
+and the camera notices by itself: the CFexpress slot's detect line is
+polled by the firmware's card-detect service every 50 ms, which runs the
+remove path and unmounts the volume as soon as the sample has held for two
+polls.
+
+The slot reported a card for as long as cfexpress=on, so nothing of that
+could be reached. The detect bit of EXS +0x044 now follows -machine
+cfexpress-card, which qom-set may change while the camera runs: false
+takes the card out, true puts it back. The NVMe endpoint on the port is
+left where it is, as the card in a body is -- only the detect line
+changes, and the firmware powers the card again itself.
+
+Checked on the emulated body: with the card, slot 0 samples 1 (stable 2)
+and the volume is "A:", mounted. A second after the line is cleared, the
+sample is 0, the volume's name is gone and its mounted bit is clear. A
+second after it is set again, the sample is 1 and "A:" is mounted; the
+camera carried on throughout. Research in the loader's notes had found the
+remove path by pointing the firmware's own sample function at a stub, and
+could not get the card back at all.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-usb.h | 22 +++++++++++++++++++++-
+ hw/arm/nikon-z63.c     | 22 ++++++++++++++++++++++
+ 2 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/nikon-z63-usb.h b/hw/arm/nikon-z63-usb.h
+index ee0833a..ceecdf5 100644
+--- a/hw/arm/nikon-z63-usb.h
++++ b/hw/arm/nikon-z63-usb.h
+@@ -320,6 +320,13 @@ typedef struct Z63Usb {
+     /* -machine cfexpress=on: a card in the CFexpress slot, behind PCIe
+      * port 2 (../z9-qemu's adapter, nikon-z9-pcie.h). */
+     bool cfexpress;
++    /* Set while the slot's detect says the card has been taken out
++     * (-machine cfexpress-card=off, or qom-set at run time to take it out
++     * and put it back). Absence is what is stored, so the quiet default
++     * stays "a card is in the slot". The card itself -- the NVMe endpoint
++     * on the port -- is left where it is: this is the detect line, which
++     * is what the firmware's card-detect service polls. */
++    bool cfexpress_card_out;
+ } Z63Usb;
+ 
+ /* ------------------------------------------------------------------ */
+@@ -516,7 +523,20 @@ static uint64_t z63_exs_read(void *opaque, hwaddr off, unsigned size)
+          * card is there and its link is up -- ../z9-qemu answers the same
+          * word 2 (pcie-link-diagnostic-mask), and its wrapper input then
+          * reports the trained link (+0xb4 = 0x11) once an endpoint sits on
+-         * the port's bus. */
++         * the port's bus.
++         *
++         * While cfexpress-card is off the bit reads 0, which is the one
++         * thing a photographer does that this slot can report: the card
++         * taken out. The camera's own card-detect service polls this every
++         * 50 ms, needs the sample to hold for two polls, and then runs its
++         * remove path -- the volume goes away and the firmware posts its
++         * own card-out event. Putting it back reports an insert the same
++         * way. Nothing else of the port is touched: the endpoint and its
++         * link stay as they are, so a card the firmware re-powers answers
++         * again. */
++        if (u->cfexpress_card_out) {
++            return u->exs_regs[off / 4] & ~2u;
++        }
+         return u->exs_regs[off / 4] | 2;
+     }
+ 
+diff --git a/hw/arm/nikon-z63.c b/hw/arm/nikon-z63.c
+index 3005f27..7f84519 100644
+--- a/hw/arm/nikon-z63.c
++++ b/hw/arm/nikon-z63.c
+@@ -5372,6 +5372,19 @@ static void z63_prop_set_cfexpress(Object *obj, bool value, Error **errp)
+     NIKON_Z63(obj)->cfexpress = value;
+ }
+ 
++/* The slot's detect line, which a run may change: taking the card out and
++ * putting it back is the one thing about this slot the firmware watches
++ * for by itself. */
++static bool z63_prop_get_cfexpress_card(Object *obj, Error **errp)
++{
++    return !NIKON_Z63(obj)->usb.cfexpress_card_out;
++}
++
++static void z63_prop_set_cfexpress_card(Object *obj, bool value, Error **errp)
++{
++    NIKON_Z63(obj)->usb.cfexpress_card_out = !value;
++}
++
+ static bool z63_prop_get_z9_capture(Object *obj, Error **errp)
+ {
+     return NIKON_Z63(obj)->z9_capture;
+@@ -5892,6 +5905,15 @@ static void z63_machine_class_init(ObjectClass *oc, const void *data)
+         "the card itself as an NVMe device on that port: -drive "
+         "if=none,id=cf,file=<image>,format=raw -device "
+         "nvme,drive=cf,serial=<s>,bus=dw-pcie,addr=0. Needs z9-capture=on.");
++    object_class_property_add_bool(oc, "cfexpress-card",
++                                   z63_prop_get_cfexpress_card,
++                                   z63_prop_set_cfexpress_card);
++    object_class_property_set_description(oc, "cfexpress-card",
++        "Whether the CFexpress slot's detect line says a card is in it. On "
++        "by default with cfexpress=on; set it at run time with qom-set "
++        "/machine cfexpress-card false to take the card out and true to put "
++        "it back, which is what the camera's card-detect service polls for. "
++        "The NVMe endpoint itself is left alone.");
+     object_class_property_add_str(oc, "z9-capture-props",
+                                   z63_prop_get_z9_capture_props,
+                                   z63_prop_set_z9_capture_props);
+-- 
+2.55.0
+

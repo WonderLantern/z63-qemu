@@ -1,7 +1,7 @@
 From c6e2ed4c166d7db0a3f1ba8eae54348346cd6d72 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Sat, 10 Oct 2026 10:58:39 +0000
-Subject: [PATCH 03/47] Z 6III: hand Linux over when the RTOS is ready, not at
+Subject: [PATCH 03/57] Z 6III: hand Linux over when the RTOS is ready, not at
  reset
 
 LaMainApp attaches to the share_mem directory the RTOS builds: sub_405B08

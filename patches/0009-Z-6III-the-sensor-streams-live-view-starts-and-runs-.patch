@@ -1,7 +1,7 @@
 From cf35437fbcc39dac3786ec48515cc8d62bc81b8b Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 01:50:09 +0000
-Subject: [PATCH 09/47] Z 6III: the sensor streams -- live view starts and runs
+Subject: [PATCH 09/57] Z 6III: the sensor streams -- live view starts and runs
  frame by frame
 
 CaptureSequence powers the sensor and gives the front end 1 s to report

@@ -1,7 +1,7 @@
 From e3012061e7eb0ce7802776deddd1933b39a4a650 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 13:35:27 +0000
-Subject: [PATCH 30/47] Z 6III: the shutter button's contacts on the EXPEED --
+Subject: [PATCH 30/57] Z 6III: the shutter button's contacts on the EXPEED --
  the release fires
 
 A full press showed on screen (SW0 bit 30 in the MCU's key report,

@@ -1,7 +1,7 @@
 From 23436d504ea056e70be2f5d66c3384142263c2d7 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 02:05:49 +0000
-Subject: [PATCH 10/47] Z 6III: engine 0x150c's primary path ends its frames on
+Subject: [PATCH 10/57] Z 6III: engine 0x150c's primary path ends its frames on
  its own
 
 The engine reports a finished frame on its upper paths as +0x210 bit 29

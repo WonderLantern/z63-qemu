@@ -1,0 +1,50 @@
+From 9227b6cfc445b6bacc3607591118f9ed382a0735 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 19 Oct 2026 11:17:37 +0800
+Subject: [PATCH 52/57] Z 6III: XDMAC -- a NoC window may land in BUFFER_EXT,
+ not only DRAM
+
+The EXS controller's upper four windows (bus 0x80000000-0xffffffff) are
+retargeted by sub_40CB8098 to BUFFER_EXT, 0x840000000-0x8c0000000 in the
+firmware's own table at 0xa02814458. The card's file cache lives there:
+the card scan's and playback's copy of a movie's moov box (sub_40CAAF20,
+bus 0xf2096e3c -> 0xf02c1168) went through it, and z63_xdmac_addr, which
+accepted DRAM only, stopped the camera as soon as an MP4 was on the card.
+A window may now land in any RAM the board backs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-xdmac.h | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/nikon-z63-xdmac.h b/hw/arm/nikon-z63-xdmac.h
+index d4bc2ff..63fba37 100644
+--- a/hw/arm/nikon-z63-xdmac.h
++++ b/hw/arm/nikon-z63-xdmac.h
+@@ -81,6 +81,14 @@
+  * DRAM buffer reached this model untranslated, which only worked because
+  * the failed window lookup left the CPU address in place.
+  *
++ * A window may land in any RAM, not only DRAM: the EXS controller's upper
++ * four windows (bus 0x80000000-0xffffffff) are retargeted by sub_40CB8098
++ * to BUFFER_EXT, 0x840000000-0x8c0000000 in the firmware's own table at
++ * 0xa02814458. The card's file cache lives there -- playback's and the
++ * card scan's copy of a movie's moov box (sub_40CAAF20, bus 0xf2096e3c ->
++ * 0xf02c1168) -- and refusing anything outside DRAM stopped the camera on
++ * the first MP4 on the card.
++ *
+  * One DECLARED CHOICE: a source inside the image window
+  * (0x40000000-0x48000000) that no window turns into DRAM is read where it
+  * stands. That is sub_40D710DC's copy of 0x40195000, through windows the
+@@ -179,7 +187,7 @@ static bool z63_xdmac_addr(Z63XdmacCtrl *c, uint32_t bus, uint64_t len,
+         return z63_xdmac_backed(bus, len);
+     }
+     if (z63_noc_translate(c->noc, c->noc_group, write, bus, len, pa) &&
+-        *pa >= Z63_DRAM_BASE && *pa + len <= Z63_DRAM_BASE + Z63_DRAM_SIZE) {
++        z63_xdmac_backed(*pa, len)) {
+         return true;
+     }
+     if (!write && (uint64_t)bus + len <= 0x48000000) {
+-- 
+2.55.0
+

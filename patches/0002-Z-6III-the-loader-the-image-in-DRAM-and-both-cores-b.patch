@@ -1,7 +1,7 @@
 From 59642799fcbbd93ae43caf806e6cbefe7703dfb4 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Sat, 10 Oct 2026 10:06:53 +0000
-Subject: [PATCH 02/47] Z 6III: the loader, the image in DRAM, and both cores
+Subject: [PATCH 02/57] Z 6III: the loader, the image in DRAM, and both cores
  booting
 
 smoke.sh now passes both checks: the RTOS runs 45 s with nothing stopping,

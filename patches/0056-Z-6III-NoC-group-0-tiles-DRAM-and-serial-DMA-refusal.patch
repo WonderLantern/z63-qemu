@@ -1,0 +1,121 @@
+From b617443ab5244d047da8ead2b4273e11b3883445 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 19 Oct 2026 11:17:37 +0800
+Subject: [PATCH 56/57] Z 6III: NoC group 0 tiles DRAM, and serial DMA refusals
+ are always named
+
+Group 0 is the HDMAC's, so the serial controllers' DMA, and it has the
+DSP groups' layout. Its eight read windows were all left at target 0,
+DRAM's first 128 MiB, so the firmware's lookup sub_40CB8280 -- which
+reports success with bus address 0 when no window holds a buffer -- gave
+any buffer above that bus 0: the lens link's time-stamp command 0x21
+sends from 0xa1cea5840, and its DMA never moved. Read window k and its
+write sibling now target k * 128 MiB, as for the DSPs; a buffer below
+128 MiB still finds window 0 first.
+
+nikon-z63-sio.h named a DMA enable once per instance, so after the first
+success every later refusal was silent. Successes and refusals are now
+counted apart, up to Z63_SIO_DMA_REPORTS each, and a buffer the NoC does
+not put in DRAM is named with both bus addresses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-hdmac.h |  7 ++++++-
+ hw/arm/nikon-z63-noc.h   | 11 ++++++++---
+ hw/arm/nikon-z63-sio.h   | 12 +++++++-----
+ 3 files changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/hw/arm/nikon-z63-hdmac.h b/hw/arm/nikon-z63-hdmac.h
+index 07026d7..2514fa2 100644
+--- a/hw/arm/nikon-z63-hdmac.h
++++ b/hw/arm/nikon-z63-hdmac.h
+@@ -165,7 +165,12 @@ static const char *z63_hdmac_pair(Z63Hdmac *h, uint32_t fifo, unsigned *tx,
+     *units = (a[0] & 0xffff) + 1;
+     if (!z63_hdmac_bus(h, a[4], *units * 2, false, src) ||
+         !z63_hdmac_bus(h, b[6], *units * 2, true, dst)) {
+-        return "a buffer NoC group 0 does not put in DRAM";
++        static char why[96];
++
++        snprintf(why, sizeof(why), "a buffer NoC group 0 does not put in "
++                 "DRAM (source bus 0x%08x, destination bus 0x%08x)", a[4],
++                 b[6]);
++        return why;
+     }
+     *tx = t;
+     *rx = r;
+diff --git a/hw/arm/nikon-z63-noc.h b/hw/arm/nikon-z63-noc.h
+index aaeac96..181ea68 100644
+--- a/hw/arm/nikon-z63-noc.h
++++ b/hw/arm/nikon-z63-noc.h
+@@ -62,8 +62,13 @@
+  * above. So for those three groups only, read window k and its write
+  * sibling are given target k * 128 MiB: DSP 0's and DSP 1's eight windows
+  * tile the 1 GiB below the RTOS's limit exactly, DSP 2's six the first
+- * 768 MiB. The other groups' targets stay 0, as before: their drivers
+- * retarget the windows they use (sub_40CB8098).
++ * 768 MiB. Group 0 -- the HDMAC's, so the serial controllers' DMA --
++ * has the same layout and gets the same targets: its users only look a
++ * buffer up (sub_40CB8280, which reports success with bus address 0 when
++ * no window holds the buffer), and the lens link's time-stamp command 0x21
++ * sends from 0xa1cea5840, 476 MiB in, which went out as bus 0 and never
++ * moved (nikon-z63-lens.h). The other groups' targets stay 0, as before:
++ * their drivers retarget the windows they use (sub_40CB8098).
+  */
+ 
+ #ifndef HW_ARM_NIKON_Z63_NOC_H
+@@ -134,7 +139,7 @@ static void z63_noc_provision(Z63Noc *n)
+                 w[1] = start >> 32;
+                 w[2] = (uint32_t)-size;
+                 w[3] = (-size >> 32) & 0xf;        /* a 36-bit field */
+-                if (g >= 3 && g <= 5) {         /* the DSPs' windows */
++                if (g == 0 || (g >= 3 && g <= 5)) {     /* see above */
+                     w[4] = (((start & ~0x3fULL) - 0x40000000) >> 28) << 27;
+                     w[5] = 0;
+                 }
+diff --git a/hw/arm/nikon-z63-sio.h b/hw/arm/nikon-z63-sio.h
+index fe03f75..b6ad035 100644
+--- a/hw/arm/nikon-z63-sio.h
++++ b/hw/arm/nikon-z63-sio.h
+@@ -78,6 +78,7 @@
+ #define HW_ARM_NIKON_Z63_SIO_H
+ 
+ #define Z63_SIO_FIFO    64
++#define Z63_SIO_DMA_REPORTS 8    /* DMA enables named per instance */
+ 
+ typedef struct Z63SioPio {
+     bool active;
+@@ -95,7 +96,8 @@ typedef struct Z63Sio {
+     Z63RegWindow win;                   /* storage and tripwire */
+     Z63SioPio pio[Z63_SPI_INST];
+     qemu_irq irq[Z63_SPI_INST];
+-    bool dma_reported[Z63_SPI_INST];
++    unsigned dma_reported[Z63_SPI_INST];  /* DMA enables reported so far */
++    unsigned dma_refused[Z63_SPI_INST];   /* ... and refusals */
+     Z63Hdmac *hdmac;                    /* for DMA mode */
+     bool idle_reported[Z63_SPI_INST];
+     /* The peer that clocks an instance, if any: told when words wait. */
+@@ -294,8 +296,8 @@ static void z63_sio_write(void *opaque, hwaddr addr, uint64_t value,
+                                          &next.src, &next.dst);
+                 }
+                 if (why) {
+-                    if (!s->dma_reported[inst]) {
+-                        s->dma_reported[inst] = true;
++                    if (s->dma_refused[inst] < Z63_SIO_DMA_REPORTS) {
++                        s->dma_refused[inst]++;
+                         error_report("Z63_SIO: instance %u enabled in DMA "
+                                      "mode, but %s -- the transfer waits "
+                                      "(pc=0x%" PRIx64 "); see "
+@@ -305,8 +307,8 @@ static void z63_sio_write(void *opaque, hwaddr addr, uint64_t value,
+                 } else {
+                     *p = next;
+                     z63_sio_dma_pump(s, inst);
+-                    if (!s->dma_reported[inst]) {
+-                        s->dma_reported[inst] = true;
++                    if (s->dma_reported[inst] < Z63_SIO_DMA_REPORTS) {
++                        s->dma_reported[inst]++;
+                         error_report("Z63_SIO: instance %u in DMA mode: "
+                                      "%u words, HDMAC channels %u/%u, "
+                                      "buffers 0x%" HWADDR_PRIx " / 0x%"
+-- 
+2.55.0
+

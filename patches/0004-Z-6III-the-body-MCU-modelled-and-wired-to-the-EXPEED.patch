@@ -1,7 +1,7 @@
 From c7d7bd994e2030ad3a71486fab7fd47956a9edaa Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Sun, 11 Oct 2026 22:13:30 +0800
-Subject: [PATCH 04/47] Z 6III: the body MCU, modelled and wired to the EXPEEDs
+Subject: [PATCH 04/57] Z 6III: the body MCU, modelled and wired to the EXPEEDs
 
 The machine so far had one processor. The body has two: an A53 cluster
 running the RTOS and a Cortex-M4 that owns power, switches, the lens and

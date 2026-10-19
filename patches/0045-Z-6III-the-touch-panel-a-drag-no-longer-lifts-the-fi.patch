@@ -1,7 +1,7 @@
 From 203840a05fa7c553b1b7ce7170af7a769447adbe Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Tue, 13 Oct 2026 05:57:30 +0000
-Subject: [PATCH 45/47] Z 6III: the touch panel -- a drag no longer lifts the
+Subject: [PATCH 45/57] Z 6III: the touch panel -- a drag no longer lifts the
  finger half-way
 
 A drag in the menus ended as a tap on the item it started on, unless it

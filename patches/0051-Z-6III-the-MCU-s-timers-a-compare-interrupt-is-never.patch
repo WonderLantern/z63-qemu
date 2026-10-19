@@ -1,0 +1,85 @@
+From 49f04edf886aba2367af1596558f2a3996cc8960 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 19 Oct 2026 11:17:37 +0800
+Subject: [PATCH 51/57] Z 6III: the MCU's timers -- a compare interrupt is
+ never armed in the past
+
+The STM32F2xx timer model re-armed its host timer for every compare,
+however close. The virtual clock follows the host's, so a compare a few
+tens of nanoseconds ahead was already in the past by the time the
+callback ran, re-armed itself, and the main loop never left its timer
+list -- QMP and the gdbstub stopped answering with it. The host timer is
+now never set closer than STM32F2XX_CC_MIN_NS ahead, a DECLARED deviation
+that is named once per timer when it applies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/timer/stm32f2xx_timer.c         | 31 +++++++++++++++++++++++++++++-
+ include/hw/timer/stm32f2xx_timer.h |  1 +
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/hw/timer/stm32f2xx_timer.c b/hw/timer/stm32f2xx_timer.c
+index 68bb1fd..cd3f8dd 100644
+--- a/hw/timer/stm32f2xx_timer.c
++++ b/hw/timer/stm32f2xx_timer.c
+@@ -80,7 +80,18 @@ static void stm32f2xx_timer_set_alarm(STM32F2XXTimerState *s, int64_t now);
+  * that were in force. Only channels whose interrupt is enabled get a host
+  * timer (cc_timer, at the next match); a flag that is only polled is set
+  * when SR is read, so free-running PWM channels cost nothing per period.
++ *
++ * A second declared deviation: the host timer is never set closer than
++ * STM32F2XX_CC_MIN_NS ahead. The virtual clock follows the host's, so a
++ * compare interrupt every few tens of nanoseconds re-arms itself in the past
++ * on every callback and the main loop never leaves its timer list -- the
++ * whole machine, QMP and gdbstub included, stops answering. That happened
++ * the first time the Z 6III's body MCU was told to start a movie recording.
++ * Matches inside the interval are still all settled, as one CCxIF and one
++ * interrupt, which is what the part does when its handler is slower than
++ * the period. The first time a timer needs it, its settings go to stderr.
+  */
++#define STM32F2XX_CC_MIN_NS 10000
+ static uint32_t stm32f2xx_timer_ccr(STM32F2XXTimerState *s, unsigned ch)
+ {
+     switch (ch) {
+@@ -186,7 +197,25 @@ static void stm32f2xx_timer_set_cc_alarm(STM32F2XXTimerState *s)
+         }
+     }
+     if (best) {
+-        timer_mod(s->cc_timer, stm32f2xx_ticks_to_ns(s, now_t + best));
++        int64_t at = stm32f2xx_ticks_to_ns(s, now_t + best);
++
++        if (at - s->cc_seen_ns < STM32F2XX_CC_MIN_NS) {
++            if (!s->cc_min_named) {
++                g_autofree char *path = object_get_canonical_path(OBJECT(s));
++
++                s->cc_min_named = true;
++                warn_report("%s: compare match due in %" PRId64 " ns "
++                            "(ARR %u PSC %u CCR %u/%u/%u/%u DIER 0x%x CCMR "
++                            "0x%x/0x%x, %" PRIu64 " Hz); interrupts held to "
++                            "one per %d ns from here on",
++                            path, at - s->cc_seen_ns, s->tim_arr, s->tim_psc,
++                            s->tim_ccr1, s->tim_ccr2, s->tim_ccr3, s->tim_ccr4,
++                            s->tim_dier, s->tim_ccmr1, s->tim_ccmr2,
++                            s->freq_hz, STM32F2XX_CC_MIN_NS);
++            }
++            at = s->cc_seen_ns + STM32F2XX_CC_MIN_NS;
++        }
++        timer_mod(s->cc_timer, at);
+     }
+ }
+ 
+diff --git a/include/hw/timer/stm32f2xx_timer.h b/include/hw/timer/stm32f2xx_timer.h
+index 22daee6..121e476 100644
+--- a/include/hw/timer/stm32f2xx_timer.h
++++ b/include/hw/timer/stm32f2xx_timer.h
+@@ -86,6 +86,7 @@ struct STM32F2XXTimerState {
+     qemu_irq cc_irq;            /* sysbus IRQ 1; IRQ 0 when not connected */
+     bool ccr_wraps;             /* "ccr-wraps": see stm32f2xx_timer_oc() */
+     uint8_t ccr_wraps_named;    /* channels that have used it, for the log */
++    bool cc_min_named;          /* held to STM32F2XX_CC_MIN_NS, logged */
+     qemu_irq irq;
+ 
+     int64_t tick_offset;
+-- 
+2.55.0
+

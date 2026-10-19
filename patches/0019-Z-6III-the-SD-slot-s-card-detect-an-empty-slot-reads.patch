@@ -1,7 +1,7 @@
 From 21f861686ac6b6d215651701becc9158a128b82c Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 06:34:26 +0000
-Subject: [PATCH 19/47] Z 6III: the SD slot's card detect -- an empty slot
+Subject: [PATCH 19/57] Z 6III: the SD slot's card detect -- an empty slot
  reads empty
 
 After boot the camera said "This memory card cannot be accessed. Insert

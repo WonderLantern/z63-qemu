@@ -1,7 +1,7 @@
 From 4b84a7e0c81629a7f233e1fe16beba7ba796d2d2 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 13:35:20 +0000
-Subject: [PATCH 27/47] Z 6III: a RAW frame owed by a capture tick is delivered
+Subject: [PATCH 27/57] Z 6III: a RAW frame owed by a capture tick is delivered
  after group 0 stops
 
 847c7f4 gated raw_pipeline_tick() on the sensor's capture timing

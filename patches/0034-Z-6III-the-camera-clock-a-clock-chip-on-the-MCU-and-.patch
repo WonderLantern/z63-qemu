@@ -1,7 +1,7 @@
 From 4a44ed8181aa494ee02843c29012db03f6b44cdf Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 14:43:48 +0000
-Subject: [PATCH 34/47] Z 6III: the camera clock -- a clock chip on the MCU,
+Subject: [PATCH 34/57] Z 6III: the camera clock -- a clock chip on the MCU,
  and -machine mcu-rtc
 
 Every start showed the clock as not set and the camera's default date,

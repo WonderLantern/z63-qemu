@@ -1,7 +1,7 @@
 From ba55ee06882150de910e09b85307299b48bad9b2 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 03:49:38 +0000
-Subject: [PATCH 13/47] Z 6III: the movie live-view restart -- TENC, TDEC, the
+Subject: [PATCH 13/57] Z 6III: the movie live-view restart -- TENC, TDEC, the
  YUV codecs, device 0x190
 
 With the stop acknowledged, CaptureSequence's restart in movie mode

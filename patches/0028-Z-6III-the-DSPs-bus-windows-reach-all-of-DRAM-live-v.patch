@@ -1,7 +1,7 @@
 From 7507082665ea08cf32b5494b96732b690ee2601a Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 13:35:20 +0000
-Subject: [PATCH 28/47] Z 6III: the DSPs' bus windows reach all of DRAM -- live
+Subject: [PATCH 28/57] Z 6III: the DSPs' bus windows reach all of DRAM -- live
  view no longer stalls
 
 Live view ran for some seconds and then stopped, later with camera error

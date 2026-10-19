@@ -1,7 +1,7 @@
 From 053c57c959214e373d21d30c5e74d4b48cc48538 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 06:08:12 +0000
-Subject: [PATCH 18/47] Z 6III: the power-down register dump reads through
+Subject: [PATCH 18/57] Z 6III: the power-down register dump reads through
 
 Left alone in a menu, the camera powered down after its standby timer and
 the run ended on SENSOR-IF reads of +0x4c, +0x58, +0x60 from 0x40c07914.

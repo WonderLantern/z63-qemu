@@ -1,7 +1,7 @@
 From 5c25334788b58c57b0230078d8fa759fc023a4bb Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 05:47:20 +0000
-Subject: [PATCH 16/47] Z 6III: z63-tools/snor_user_sensor_tables.py -- empty
+Subject: [PATCH 16/57] Z 6III: z63-tools/snor_user_sensor_tables.py -- empty
  record 0x63's register tables
 
 CAPTG took a data abort (PC 0x4115bc40, FAR 0x48000000) whenever live

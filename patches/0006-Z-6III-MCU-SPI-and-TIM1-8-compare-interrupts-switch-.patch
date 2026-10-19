@@ -1,7 +1,7 @@
 From a33ec2b27e85f6b28260619b07c222eb44ef6cae Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Sun, 11 Oct 2026 15:51:04 +0000
-Subject: [PATCH 06/47] Z 6III MCU: SPI and TIM1/8 compare interrupts, switch
+Subject: [PATCH 06/57] Z 6III MCU: SPI and TIM1/8 compare interrupts, switch
  snapshot, live view starts
 
 With these the body MCU's own firmware takes the camera as far as the

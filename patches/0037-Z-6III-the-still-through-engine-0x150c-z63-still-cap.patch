@@ -1,7 +1,7 @@
 From 185fb661ad197d4cb3084ddcb91d4932e7b48d66 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 17:49:43 +0000
-Subject: [PATCH 37/47] Z 6III: the still through engine 0x150c --
+Subject: [PATCH 37/57] Z 6III: the still through engine 0x150c --
  z63-still-capture, and the capture models' timers
 
 A release now runs engine 0x150c through a still: the units reset, stop

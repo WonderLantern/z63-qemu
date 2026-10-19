@@ -1,7 +1,7 @@
 From b451b71ab8760eb7c3dde012e12e32568f582016 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 11:29:02 +0000
-Subject: [PATCH 25/47] Z 6III tools: gdb_probe REGS= and read watchpoints,
+Subject: [PATCH 25/57] Z 6III tools: gdb_probe REGS= and read watchpoints,
  make_raw bit depth
 
 gdb_probe.py: REGS=19,20 adds registers to LIGHT mode's one-line hits

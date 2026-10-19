@@ -1,7 +1,7 @@
 From 0d45ccbd8e9606e575fc6065f663fe39f4143aad Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 15:42:38 +0000
-Subject: [PATCH 35/47] Z 6III: -machine scanout-live -- every composed frame,
+Subject: [PATCH 35/57] Z 6III: -machine scanout-live -- every composed frame,
  in a file a viewer maps
 
 scanout-dump writes a PPM about once a second, which is enough to look at

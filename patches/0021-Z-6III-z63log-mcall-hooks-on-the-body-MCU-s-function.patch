@@ -1,7 +1,7 @@
 From 941dda61d872741ff24081a4ad045b01294bccf5 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 06:54:41 +0000
-Subject: [PATCH 21/47] Z 6III: z63log mcall= -- hooks on the body MCU's
+Subject: [PATCH 21/57] Z 6III: z63log mcall= -- hooks on the body MCU's
  functions too
 
 call= took A53 entries only. mcall= takes the M4's (the Thumb bit is

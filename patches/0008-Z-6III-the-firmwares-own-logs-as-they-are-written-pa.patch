@@ -1,7 +1,7 @@
 From 991ad39f57d27606bc8bc744e5c35923f9646f39 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Sun, 11 Oct 2026 18:14:16 +0000
-Subject: [PATCH 08/47] Z 6III: the firmwares' own logs as they are written;
+Subject: [PATCH 08/57] Z 6III: the firmwares' own logs as they are written;
  past the GUI draws
 
 Logs. Neither processor prints a boot log, but both keep binary ones:

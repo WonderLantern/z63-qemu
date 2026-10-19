@@ -1,7 +1,7 @@
 From 4b20732c81c23beba521640dfd5fa460a7710702 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 14:43:47 +0000
-Subject: [PATCH 33/47] Z 6III MCU: I2C v1 receive has a shift register -- the
+Subject: [PATCH 33/57] Z 6III MCU: I2C v1 receive has a shift register -- the
  last bytes of a read
 
 The model received one byte per DR read and NACKed the byte it fetched

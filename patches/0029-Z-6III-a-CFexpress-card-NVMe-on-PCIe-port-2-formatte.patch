@@ -1,7 +1,7 @@
 From f3cc6f5c71622c5ea857c39c780618227d8a6e4b Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 13:35:27 +0000
-Subject: [PATCH 29/47] Z 6III: a CFexpress card -- NVMe on PCIe port 2,
+Subject: [PATCH 29/57] Z 6III: a CFexpress card -- NVMe on PCIe port 2,
  formatted by the camera
 
 -machine cfexpress=on puts ../z9-qemu's PCIe port-2 adapter

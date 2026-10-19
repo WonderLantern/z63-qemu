@@ -1,7 +1,7 @@
 From 979480168dace6633cf6bec050eef74b555d6562 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 11:28:08 +0000
-Subject: [PATCH 22/47] Z 6III: the vector DSPs -- mailboxes, a boot message,
+Subject: [PATCH 22/57] Z 6III: the vector DSPs -- mailboxes, a boot message,
  and run/stop
 
 Live view was refused frame by frame: the display module's frame entry,

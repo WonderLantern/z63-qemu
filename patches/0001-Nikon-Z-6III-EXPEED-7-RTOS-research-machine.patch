@@ -1,7 +1,7 @@
 From 5be88d557ffe9c07ad8cabaadf54062837f40efe Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Fri, 9 Oct 2026 22:12:42 +0800
-Subject: [PATCH 01/47] Nikon Z 6III (EXPEED 7) RTOS research machine
+Subject: [PATCH 01/57] Nikon Z 6III (EXPEED 7) RTOS research machine
 
 Add one new TCG-only machine, `nikon-z63`, which boots the factory RTOS
 image ("eg") of a Nikon Z 6III, on top of QEMU 10.2.4:

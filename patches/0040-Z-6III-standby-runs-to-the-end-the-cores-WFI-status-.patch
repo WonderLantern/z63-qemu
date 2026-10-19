@@ -1,7 +1,7 @@
 From c5a36c428594c2f62b8c5c5858416b89877fd118 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Tue, 13 Oct 2026 02:04:29 +0000
-Subject: [PATCH 40/47] Z 6III: standby runs to the end -- the cores' WFI
+Subject: [PATCH 40/57] Z 6III: standby runs to the end -- the cores' WFI
  status, core hold, DDR self-refresh, the power-hold line
 
 An untouched boot stopped at kernel ~68 s on

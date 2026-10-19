@@ -1,7 +1,7 @@
 From 48eac19e39ad66a47fb43608b59f3928fb197aa4 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Tue, 13 Oct 2026 08:55:58 +0000
-Subject: [PATCH 46/47] Z 6III: USB -- a device-mode DWC3, a host behind
+Subject: [PATCH 46/57] Z 6III: USB -- a device-mode DWC3, a host behind
  USB/IP, PTP from outside
 
 The camera now enumerates on its USB-C port and answers PTP: with

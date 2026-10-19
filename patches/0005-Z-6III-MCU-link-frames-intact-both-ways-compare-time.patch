@@ -1,7 +1,7 @@
 From 1ffe25873ea6f49f0c8aee485f31612c1cea49c9 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Sun, 11 Oct 2026 15:14:08 +0000
-Subject: [PATCH 05/47] Z 6III MCU link: frames intact both ways, compare
+Subject: [PATCH 05/57] Z 6III MCU link: frames intact both ways, compare
  timers, M4 debuggable
 
 With the body MCU's image on the M4 and SPI1/SPI4 bridged to serial

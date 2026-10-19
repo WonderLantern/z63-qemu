@@ -1,7 +1,7 @@
 From 756c2cab1d865faf79b76d1fdd4747718e1d776e Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 05:58:30 +0000
-Subject: [PATCH 17/47] Z 6III: z63watch, and z63log names camera errors and
+Subject: [PATCH 17/57] Z 6III: z63watch, and z63log names camera errors and
  any function's callers
 
 Two questions kept costing a debugger session each: who writes this word,

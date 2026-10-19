@@ -1,7 +1,7 @@
 From d93a8acc7c1279bc9a541b273ce88a0bab24f351 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 11:48:17 +0000
-Subject: [PATCH 26/47] Z 6III: ../z9-qemu's capture models, revision deb3a75
+Subject: [PATCH 26/57] Z 6III: ../z9-qemu's capture models, revision deb3a75
 
 ../z9-qemu moved from 2749873 to deb3a75 ("Implement full RAW capture,
 virtual card writing and post-shot recovery"): the Z 9's shutter path end

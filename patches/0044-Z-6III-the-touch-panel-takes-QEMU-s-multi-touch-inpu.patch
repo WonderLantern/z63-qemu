@@ -1,7 +1,7 @@
 From a8e0c8f48f4304eef1a6c95967d4fc3606cb6458 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Tue, 13 Oct 2026 03:57:18 +0000
-Subject: [PATCH 44/47] Z 6III: the touch panel takes QEMU's multi-touch input
+Subject: [PATCH 44/57] Z 6III: the touch panel takes QEMU's multi-touch input
  -- what z63ui sends
 
 z63ui sends the monitor's pointers as QEMU multi-touch input

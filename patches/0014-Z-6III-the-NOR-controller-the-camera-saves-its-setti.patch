@@ -1,7 +1,7 @@
 From d2b2f865333a52b3fd8871ff9b70a1573a60711d Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 03:49:38 +0000
-Subject: [PATCH 14/47] Z 6III: the NOR controller -- the camera saves its
+Subject: [PATCH 14/57] Z 6III: the NOR controller -- the camera saves its
  settings to SNOR_USER
 
 After the restart the firmware saves state: it runs helpers it keeps in

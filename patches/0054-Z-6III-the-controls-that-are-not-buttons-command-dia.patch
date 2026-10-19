@@ -1,0 +1,314 @@
+From 58c76482d732b72722b840bad341682c64f4dab5 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 19 Oct 2026 11:17:37 +0800
+Subject: [PATCH 54/57] Z 6III: the controls that are not buttons -- command
+ dials, mode dial, lever, power switch
+
+-machine mcu-keys= (and qom-set /machine mcu-keys at run time) takes
+NAME=VALUE tokens beside the key names: dial-main=+N / -N and dial-sub=+N
+/ -N turn a command dial by N detents, mode=AUTO|P|S|A|M|U1|U2|U3 sets the
+mode dial, lever=photo|video the photo/video lever, power=on|off the power
+switch. Each is driven where the body MCU's own key service reads it
+(nikon-z63-mcukeys.h names the functions and pins), and keeps its position
+until changed. A token list without keys leaves the held keys alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/nikon-z63-mcukeys.h | 263 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 262 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/nikon-z63-mcukeys.h b/hw/arm/nikon-z63-mcukeys.h
+index bfeba29..2bac1bb 100644
+--- a/hw/arm/nikon-z63-mcukeys.h
++++ b/hw/arm/nikon-z63-mcukeys.h
+@@ -116,11 +116,256 @@ static void z63_mcukeys_init(Z63Stm32 *m)
+     }
+ }
+ 
+-/* Hold exactly the named keys (':'-separated; empty releases all). */
++/*
++ * The controls that are not buttons: the two command dials, the mode dial,
++ * the photo/video lever and the power switch. They go through the same
++ * property as NAME=VALUE tokens beside the keys (-machine mcu-keys=, or
++ * qom-set /machine mcu-keys at run time):
++ *
++ *   dial-main=+N  dial-main=-N  dial-sub=+N  dial-sub=-N
++ *                 N detents of a command dial (queued behind a turn
++ *                 the same way; one the other way is refused until the
++ *                 dial stops)
++ *   mode=AUTO|P|S|A|M|U1|U2|U3  (or mode=<0..4095>, the ladder's level)
++ *   lever=photo|video
++ *   power=on|off
++ *
++ * A list of such tokens alone leaves the held keys as they are; a list
++ * with any key in it holds exactly its keys, as before, and an empty one
++ * releases them all. Each lasts until changed: the mode dial, the lever
++ * and the power switch keep the position they were given.
++ *
++ * Command dials. The key service arms a compare callback on its timer
++ * every 500 ticks (sub_8042EC8 with sub_80444E4), which reads each dial as
++ * two inputs making a 2-bit phase, (a << 1) | b: the main dial PE7 (a) and
++ * PE13 (b) (sub_8044D3C, count at 0x20019343), the sub dial PF11 (a) and
++ * PF14 (b) (sub_8044D94, count at 0x20019344). The main dial counts -1 on
++ * the phase change 0 -> 2 and +1 on 2 -> 0, the sub dial -1 on 1 -> 0 and
++ * +1 on 0 -> 1; every other change is ignored. A full cycle through the
++ * phases in the order 0, 1, 3, 2 is therefore +1 on either dial, and the
++ * reverse order -1, from whichever phase the pins rest at. The counts go
++ * out as state bytes 67 and 68 of message 0x20C0081 (sub_8044808 ->
++ * sub_8043D60), the switch report's bytes 11 and 12, which the EXPEED adds
++ * to ID_ROTSW0/1, the scan object's first two dial words: +N here is +N
++ * there, burst for burst (watched at 0xa03367c60, 8 bursts of +-25 on both
++ * dials at once, none lost). One detent is modelled as one full cycle, a
++ * phase every Z63_MCU_DIAL_PHASE_NS of virtual time -- at 4 ms a phase,
++ * now and then one count in a burst went missing (the M4 shares its TCG
++ * thread with the four A53s, so its sampling is not always on time).
++ * DECLARED: the detent (one cycle) and the rate. Which way a hand would
++ * call clockwise the MCU cannot say (the wiring decides it); what the
++ * stock firmware does with +1 on the main dial: in M, a shutter speed a
++ * third of a stop shorter (item 0x0205 +8); with ISO held, a third of a
++ * stop more ISO (0x0208 +8); with exposure compensation held, +1/3 EV
++ * (0x0204 +2); with the release-mode button held, the next continuous
++ * mode (0x020B 2 -> 6). The sub dial with ISO held turns Auto ISO off
++ * (0x0509 1 -> 0); with no lens there is no aperture to turn.
++ *
++ * Mode dial. A resistor ladder on ADC1 channel 1, converted four times
++ * every 8 ms (the cyclic "SwichCy8" -> sub_8044894 -> sub_8044C88); the
++ * mean selects a position code by range (below), which goes out as state
++ * byte 6 of message 0x20C0083, the report's byte 15. The level this board
++ * gives an unset channel, 0x800, is code 5. The names are the EXPEED's
++ * reading of each code (store item 0x0000), measured on this model.
++ *
++ * Photo/video lever. Expander 0x23 bit 10 (state byte 46 through the table
++ * at 0x80578d6, sub_8044218), one of the bits the key task passes through
++ * as a level rather than latching like a button (mask 0x1ef4f8 at
++ * 0x80577c8); the report carries (state == 0) at byte 87.
++ *
++ * Power switch. PC5, read with PB11 and PC2 into state bytes 0, 66 and 11
++ * of message 0x20C0083 (table at 0x80577d4); state byte 0 is the report's
++ * byte 4, which the EXPEED decodes as SW0 bit 9 (0x200, the switch name
++ * table's power switch). Low is on: this board reads an undriven PC5 as
++ * low, and the camera starts switched on. power=off starts the camera's own
++ * power-down (family 1 route 3 kind 6 with byte 5 = 0, where the standby
++ * timer's has 1) and ends at the power-hold line like a standby does.
++ * power=on afterwards changes nothing: the MCU's side of starting the
++ * EXPEED again is not modelled (nor is waking from standby).
++ */
++#define Z63_MCU_DIAL_PHASE_NS   (8 * SCALE_MS)
++
++typedef struct Z63McuDial {
++    const char *name;
++    uint8_t port, pin_a, pin_b;
++    int pending;                /* detents still to turn, signed */
++    uint8_t phases;             /* phases already done of the current one */
++} Z63McuDial;
++
++/* The ladder, in rising level: each position's range of the 12-bit mean
++ * (sub_8044C88), the MCU's code for it, and what the EXPEED makes of that
++ * code -- store item 0x0000 (also 0x0001 and 0x2101) and the shooting
++ * screen's mode icon, seen on this model with the stock firmware. The
++ * level sent is the middle of the range. */
++static const struct {
++    const char *name;
++    uint8_t code;               /* state byte 6, report byte 15 */
++    uint8_t item;               /* store item 0x0000 */
++    uint16_t lo, hi;
++} z63_mcu_mode_ladder[] = {
++    { "S",     1, 1,    0,  282 },
++    { "A",     2, 2,  283,  846 },
++    { "M",     3, 3,  847, 1435 },
++    { "U3",    6, 9, 1436, 2028 },
++    { "U2",    5, 8, 2029, 2603 },      /* 0x800, the unset level */
++    { "U1",    4, 7, 2604, 3187 },
++    { "AUTO", 10, 4, 3188, 3789 },
++    { "P",     0, 0, 3790, 4095 },
++};
++
++static struct {
++    QEMUTimer *timer;
++    Z63McuDial dial[2];
++} z63_mcuin = {
++    .dial = {
++        { "dial-main", 4, 7, 13 },      /* PE7, PE13 */
++        { "dial-sub", 5, 11, 14 },      /* PF11, PF14 */
++    },
++};
++
++#define Z63_MCU_MODE_ADC        0       /* ADC1 */
++#define Z63_MCU_MODE_CHANNEL    1
++#define Z63_MCU_LEVER_EXPANDER  0x23
++#define Z63_MCU_LEVER_BIT       10
++#define Z63_MCU_POWER_PORT      2       /* PC5 */
++#define Z63_MCU_POWER_PIN       5
++
++static unsigned z63_mcudial_phase(Z63Stm32 *m, const Z63McuDial *d)
++{
++    uint16_t idr = z63_stm32_gpio_idr(&m->gpio[d->port]);
++
++    return ((idr >> d->pin_a) & 1) << 1 | ((idr >> d->pin_b) & 1);
++}
++
++static void z63_mcudial_tick(void *opaque)
++{
++    static const uint8_t gray[4] = { 0, 1, 3, 2 };
++    Z63Stm32 *m = opaque;
++    bool more = false;
++
++    for (unsigned i = 0; i < ARRAY_SIZE(z63_mcuin.dial); i++) {
++        Z63McuDial *d = &z63_mcuin.dial[i];
++        unsigned k = 0, at, next;
++
++        if (!d->pending) {
++            continue;
++        }
++        at = z63_mcudial_phase(m, d);
++        while (gray[k] != at) {
++            k++;
++        }
++        next = gray[(k + (d->pending > 0 ? 1 : 3)) & 3];
++        z63_stm32_gpio_drive(&m->gpio[d->port], d->pin_a, next >> 1);
++        z63_stm32_gpio_drive(&m->gpio[d->port], d->pin_b, next & 1);
++        if (++d->phases == 4) {
++            d->phases = 0;
++            d->pending += d->pending > 0 ? -1 : 1;
++        }
++        more |= d->pending != 0;
++    }
++    if (more) {
++        timer_mod(z63_mcuin.timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  Z63_MCU_DIAL_PHASE_NS);
++    }
++}
++
++/* One NAME=VALUE token; with `apply` false it is only checked. */
++static bool z63_mcuin_token(Z63Stm32 *m, const char *token, bool apply,
++                            Error **errp)
++{
++    g_autofree char *name = g_strdup(token);
++    char *value = strchr(name, '=');
++    long n;
++
++    *value++ = 0;
++    for (unsigned i = 0; i < ARRAY_SIZE(z63_mcuin.dial); i++) {
++        Z63McuDial *d = &z63_mcuin.dial[i];
++
++        if (strcmp(name, d->name)) {
++            continue;
++        }
++        if (qemu_strtol(value, NULL, 10, &n) || !n || n < -127 || n > 127) {
++            error_setg(errp, "mcu-keys: %s wants +N or -N detents, 1..127",
++                       name);
++            return false;
++        }
++        /* Turns the same way queue up; a turn back while one is still
++         * playing would cut a detent short, so it waits its turn. */
++        if (d->pending && (n > 0) != (d->pending > 0)) {
++            error_setg(errp, "mcu-keys: %s is still turning the other way "
++                       "(%d detents left)", name, d->pending);
++            return false;
++        }
++        if (apply) {
++            if (!z63_mcuin.timer) {
++                z63_mcuin.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                               z63_mcudial_tick, m);
++            }
++            d->pending += n;
++            if (!timer_pending(z63_mcuin.timer)) {
++                z63_mcudial_tick(m);
++            }
++        }
++        return true;
++    }
++    if (!strcmp(name, "mode")) {
++        long level = -1;
++
++        for (unsigned i = 0; i < ARRAY_SIZE(z63_mcu_mode_ladder); i++) {
++            if (!g_ascii_strcasecmp(value, z63_mcu_mode_ladder[i].name)) {
++                level = (z63_mcu_mode_ladder[i].lo +
++                         z63_mcu_mode_ladder[i].hi) / 2;
++            }
++        }
++        if (level < 0 && (qemu_strtol(value, NULL, 0, &level) ||
++                          level < 0 || level > 4095)) {
++            error_setg(errp, "mcu-keys: mode=%s is not a position or a "
++                       "level 0..4095", value);
++            return false;
++        }
++        if (apply) {
++            m->adc.input[Z63_MCU_MODE_ADC][Z63_MCU_MODE_CHANNEL] = level;
++        }
++        return true;
++    }
++    if (!strcmp(name, "lever")) {
++        bool video = !strcmp(value, "video");
++
++        if (!video && strcmp(value, "photo")) {
++            error_setg(errp, "mcu-keys: lever=photo or lever=video");
++            return false;
++        }
++        if (apply) {
++            z63_stm32_expander_set(m, Z63_MCU_LEVER_EXPANDER,
++                                   Z63_MCU_LEVER_BIT, video);
++        }
++        return true;
++    }
++    if (!strcmp(name, "power")) {
++        bool off = !strcmp(value, "off");
++
++        if (!off && strcmp(value, "on")) {
++            error_setg(errp, "mcu-keys: power=on or power=off");
++            return false;
++        }
++        if (apply) {
++            z63_stm32_gpio_drive(&m->gpio[Z63_MCU_POWER_PORT],
++                                 Z63_MCU_POWER_PIN, off);
++        }
++        return true;
++    }
++    error_setg(errp, "mcu-keys: unknown control '%s'", name);
++    return false;
++}
++
++/* Hold exactly the named keys (':'-separated; empty releases all), and set
++ * the controls named as NAME=VALUE. */
+ static bool z63_mcukeys_set(Z63Stm32 *m, const char *list, Error **errp)
+ {
+     g_auto(GStrv) names = g_strsplit_set(list ? list : "", ":,", -1);
+     bool held[ARRAY_SIZE(z63_mcu_key_map)] = { false };
++    bool keys = !list || !*list;
+ 
+     for (char **n = names; *n; n++) {
+         const Z63McuKey *k;
+@@ -128,6 +373,13 @@ static bool z63_mcukeys_set(Z63Stm32 *m, const char *list, Error **errp)
+         if (!**n) {
+             continue;
+         }
++        if (strchr(*n, '=')) {
++            if (!z63_mcuin_token(m, *n, false, errp)) {
++                return false;
++            }
++            continue;
++        }
++        keys = true;
+         k = z63_mcukey_find(*n);
+         if (!k) {
+             error_setg(errp, "mcu-keys: unknown key '%s'", *n);
+@@ -138,6 +390,15 @@ static bool z63_mcukeys_set(Z63Stm32 *m, const char *list, Error **errp)
+             held[z63_mcukey_find(k->also) - z63_mcu_key_map] = true;
+         }
+     }
++    for (char **n = names; *n; n++) {
++        if (strchr(*n, '=')) {
++            z63_mcuin_token(m, *n, true, &error_abort);
++        }
++    }
++    if (!keys) {
++        error_report("Z63_MCUKEYS: controls: %s", list);
++        return true;
++    }
+     for (size_t i = 0; i < ARRAY_SIZE(z63_mcu_key_map); i++) {
+         z63_mcukey_drive(m, &z63_mcu_key_map[i], held[i]);
+     }
+-- 
+2.55.0
+

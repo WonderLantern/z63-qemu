@@ -1,7 +1,7 @@
 From 999e757b4a7ec5434e9c348fcfb7160ad1c33846 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Tue, 13 Oct 2026 03:17:30 +0000
-Subject: [PATCH 42/47] docs/plan.md: where the Z 6III stands -- phases 0-6
+Subject: [PATCH 42/57] docs/plan.md: where the Z 6III stands -- phases 0-6
  worked through, what does not work, what is next
 
 The plan still described the display, input, CFexpress and capture as

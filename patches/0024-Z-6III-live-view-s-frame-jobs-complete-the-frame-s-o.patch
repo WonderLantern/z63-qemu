@@ -1,7 +1,7 @@
 From e232f9aa1ace2712eba039b899c9718555696a82 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 11:28:55 +0000
-Subject: [PATCH 24/47] Z 6III: live view's frame jobs complete -- the frame's
+Subject: [PATCH 24/57] Z 6III: live view's frame jobs complete -- the frame's
  other completions
 
 Each live-view frame is a job of four lanes (stage table 0xa02be8690;

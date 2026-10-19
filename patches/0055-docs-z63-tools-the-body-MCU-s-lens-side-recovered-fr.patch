@@ -1,0 +1,2107 @@
+From bab598b916d4aee413657bdfea3d73686a0b10c2 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 19 Oct 2026 11:17:37 +0800
+Subject: [PATCH 55/57] docs, z63-tools: the body MCU's lens side, recovered
+ from its own image
+
+docs/mcu-ex/lens.md (Chinese) reads ex2010_0200a0.bi's lens modules and
+the EXPEED's side of them. The MCU never talks to the lens: it detects it
+(PG0, active low, debounced), switches two power paths (PB0, PA9, make
+before break), sets PF12/PD15 and latches PG4, and speaks provider 13 to
+the EXPEED (kinds 1..5, replies 0x81..0x85, unsolicited 0x91 attach and
+0x96 boot power-up). The EXPEED runs the lens link itself: serial
+instance 3 at 8 MHz, pin 58 wake, pin 41 ready, 0x55 frames, and an
+83-step connect sequence. docs/mcu-ex/eg/ has the command dictionary and
+step tables; docs/mcu-ex-plan.md the plan.
+
+z63-tools/mcu-ex/: names.json and apply_names.py (214 names for the MCU
+image), pins.py and m4mem.py (read the MCU's runtime tables through the
+gdbstub's second inferior), lensfields.py (which reply byte a lens field
+is), egmem.py/steps.py/findq.py, and the run scripts used for the
+hot-plug and step traces.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/mcu-ex-plan.md             | 176 +++++++++++++
+ docs/mcu-ex/eg/eg-lens.md       | 327 ++++++++++++++++++++++++
+ docs/mcu-ex/eg/eg-lenscmd.txt   | 160 ++++++++++++
+ docs/mcu-ex/eg/eg-seq.txt       |  84 +++++++
+ docs/mcu-ex/eg/eg-steps.txt     | 156 ++++++++++++
+ docs/mcu-ex/lens.md             | 426 ++++++++++++++++++++++++++++++++
+ z63-tools/mcu-ex/apply_names.py |  46 ++++
+ z63-tools/mcu-ex/egmem.py       |  18 ++
+ z63-tools/mcu-ex/egread.py      |  22 ++
+ z63-tools/mcu-ex/findq.py       |  14 ++
+ z63-tools/mcu-ex/hotplug.sh     |  22 ++
+ z63-tools/mcu-ex/lensfields.py  |  80 ++++++
+ z63-tools/mcu-ex/lenssteps.sh   |  22 ++
+ z63-tools/mcu-ex/m4mem.py       |  57 +++++
+ z63-tools/mcu-ex/names.json     | 229 +++++++++++++++++
+ z63-tools/mcu-ex/pins.py        |  40 +++
+ z63-tools/mcu-ex/run.sh         |  15 ++
+ z63-tools/mcu-ex/steps.py       |  40 +++
+ 18 files changed, 1934 insertions(+)
+ create mode 100644 docs/mcu-ex-plan.md
+ create mode 100644 docs/mcu-ex/eg/eg-lens.md
+ create mode 100644 docs/mcu-ex/eg/eg-lenscmd.txt
+ create mode 100644 docs/mcu-ex/eg/eg-seq.txt
+ create mode 100644 docs/mcu-ex/eg/eg-steps.txt
+ create mode 100644 docs/mcu-ex/lens.md
+ create mode 100755 z63-tools/mcu-ex/apply_names.py
+ create mode 100644 z63-tools/mcu-ex/egmem.py
+ create mode 100644 z63-tools/mcu-ex/egread.py
+ create mode 100644 z63-tools/mcu-ex/findq.py
+ create mode 100755 z63-tools/mcu-ex/hotplug.sh
+ create mode 100644 z63-tools/mcu-ex/lensfields.py
+ create mode 100755 z63-tools/mcu-ex/lenssteps.sh
+ create mode 100755 z63-tools/mcu-ex/m4mem.py
+ create mode 100644 z63-tools/mcu-ex/names.json
+ create mode 100755 z63-tools/mcu-ex/pins.py
+ create mode 100755 z63-tools/mcu-ex/run.sh
+ create mode 100644 z63-tools/mcu-ex/steps.py
+
+diff --git a/docs/mcu-ex-plan.md b/docs/mcu-ex-plan.md
+new file mode 100644
+index 0000000..a7e91cd
+--- /dev/null
++++ b/docs/mcu-ex-plan.md
+@@ -0,0 +1,176 @@
++# 计划：从 MCU 固件（ex2010）恢复镜头协议与肩屏逻辑
++
++2026-10-18 起草。对象是固件包里的机身 MCU 镜像 `ex2010_0200a0.bi`
++（"Z6_3 Firmware Ex"，版本 02.00.a0）。目标两块：
++
++1. **镜头**：镜头接入/握手协议——触点检测、上电顺序、接口模式、MCU 与
++   EXPEED 之间的镜头消息（provider 13），以及真正和镜头交换数据的那一层
++   （它在哪颗芯片上，第一步就要定）。
++2. **肩屏**：EXPEED 送来的状态怎么变成像素（渲染）、MCU 自己决定的显示
++   行为、和用户操作的交互（照明、关机画面、模式等）。
++
++产出是文档 + 机器可读的表 + IDA 里的命名/注释 + 一个离线复现的肩屏渲染器，
++每个结论都标固件地址；推断出来、没法在机身上量的东西一律标"推断/声明"。
++
++---
++
++## 0. 已有基础（不重做）
++
++**镜像与芯片。** STM32F469（Cortex-M4，2 MiB flash，320 KiB SRAM + 64 KiB
++CCM）；0x08000000 是 64 KiB 引导程序，应用从 0x08020000 开始，向量表明文。
++RTOS 是 µT-Kernel（字符串 `tkdev semaphore eventflag mailbox mutex
++memorypool cyclichandler alarmhandler subsystem` 在 0x8054020）。
++
++**IDA 库。** 新分析过的库在 `~/LiBr/nikon/idb/mcu-ev/`（idasql 8088，属于
++events 那个会话；3419 个函数，除向量和 nullsub 外没有命名）。旧的
++`~/LiBr/nikon/idb/z63_mcu_ex2010.elf`（原 8087）只有 21 个函数，作废。
++
++**QEMU 里已经跑的。** `nikon-z63-stm32.h` 跑原版 MCU 镜像；
++`nikon-z63-mcu.h` 是 EXPEED↔MCU 的 256 字节帧（family/route/长度/分片/
++校验）；SPI1/SPI4 = EXPEED 链路，SPI2 = 肩屏，SPI3 = SbCtl。
++肩屏的**传输和面板已完成**（92df981，`nikon-z63-toplcd.h`）：Sharp 存储型
++LCD 128×128，SPI2 + DMA1 stream 4，M0 写行 / M2 全清，行地址表 0x8058A10，
++SCS/DISP/PD11/PD1 引脚；显示任务 sub_8032870 → 渲染 sub_8030E0C（2048 字节帧）
++→ 按行比对发送 sub_8032554。`-machine toplcd-live=` 能拿到面板画面。
++
++**Z8 的参考（`../n-research/z8-qemu`）。** 同一代 EX 代码，地址很接近：
++- 肩屏 = provider 8：subtype 1 是 20 字节配置，subtype 4 是 192 字节显示状态；
++  Z8 的 EX 接收 0x0802f92c、worker 0x0802f8b0、渲染器 0x0803096c、字段渲染
++  0x08032088、字形查找 0x08032310、字形 blit 0x080309dc、getter 表 0x2000ea48
++  （`runtime/ex-boot-evidence/provider8-findings.md`，`crates/shoulder/`，
++  Z8 面板 168×144）。Z8 那边是"在 QEMU 里调用原版渲染函数"，没有恢复语义。
++- 镜头 = provider 13：EX 派发 0x08036304、worker 0x08036eb4、6×10 模式表
++  0x08055e90、GPIO 0x08035e0c、冷启动 0x080367b0；事件 0x02060001/2；
++  回复 raw81/raw82（`original-ex-provider13-input-findings.md` 及 .asm/.tsv）。
++- Z8 的 EX 二进制本身不在这台机器上（只有 inventory.json 和摘出来的 .asm），
++  所以只能按指令片段/表结构对照，地址都要在 Z6III 上重新核实。
++
++**EXPEED 侧线索。** `eSyscController_Lens / _MlLens / _FLens`，命令
++`MlLensConnect → LensConnectCheckComplete → MlLensConnectStartupComplete →
++MlLensConnectComplete`、Disconnect/Shutdown 及 F 镜头（FTZ）对应命令，
++`eDSID_Error_LensFContactEvDownError`，`LensControl`；状态库里镜头项
++0x2C00 对焦距离、0x2C01 焦距×10、0x2C04 已接镜头、0x2C19 镜头名、0x2C1A
++转接环名、0x2C29/0x2C2A 焦段（状态库研究的 settings-map.json）。
++
++### 本次侦察得到的模块地图
++
++对象名字符串紧挨各模块的初始化函数，按它切出的范围（边界是近似值）：
++
++| 模块 | 范围 | 函数 | 代码 | 说明 |
++|---|---|---|---|---|
++| 引导程序 | 0x08000000–0x0801ffff | 125 | — | 0x0800408c 那个 114 KB "函数"是误分析 |
++| 内核胶水/向量 | 0x08020000– | 75 | 3.9 KB | |
++| CDSC | 0x08021000– | 61 | 2.3 KB | |
++| 10Pin | 0x08021a80– | 54 | 5.7 KB | 十针端子 |
++| Bat* | 0x08023000– | 655 | 47 KB | 电池 |
++| **DspTop** | 0x0802fa00–0x08032810 | 275 | 11 KB | **肩屏** |
++| **DspDa** | 0x08032810–0x08032b30 | 20 | 0.7 KB | **肩屏显示任务**（含 sub_8032870） |
++| Gps | 0x08032b30– | 39 | 2 KB | |
++| ExI2c / IoExp | 0x08033400–0x08034e00 | 82 | 6.2 KB | 外部 I2C、IO 扩展（按键） |
++| **LnMng** | 0x08034e00–0x08036770 | 133 | 5.5 KB | **镜头管理** |
++| **LnPrt** | 0x08036770–0x08036bc4 | 35 | 0.9 KB | **镜头（两个 alarm：LnPrtAlC/AlR）** |
++| **McuCm** | 0x08036bc4–0x08038c14 | 161 | 7.5 KB | **EXPEED 链路（provider 表）** |
++| McuMg | 0x08038c14– | 138 | 4.3 KB | |
++| MechHot / McMng | 0x08039f44–0x0803bc04 | 138 | 6.5 KB | 机械（快门） |
++| PowSv / PowMg | 0x0803bc04–0x0803f868 | 283 | 14 KB | 电源 |
++| RtcMg | 0x0803f868– | 66 | 2.8 KB | 时钟 |
++| SbCtl / SbMng | 0x080404c0–0x08042f38 | 144 | 9.8 KB | |
++| Swich / SwMng | 0x08042f38–0x08044f20 | 90 | 7.2 KB | 开关/拨盘 |
++| WatchDog / Rem* | 0x08044f20–0x08046800 | 101 | 5.7 KB | |
++| 驱动/HAL/内核 | 0x08046800–0x08054000 | 643 | 52 KB | STM32 HAL + µT-Kernel |
++| 数据 | 0x08054000–0x0807ffff | — | ~176 KB | 字库、图标、表 |
++
++**镜头侧第一眼。** LnMng 任务处理函数 sub_8035B80 由 19 个事件位驱动；
++sub_8035620 按逻辑引脚 id 16/9/92/96/63/100 取 GPIO、按资源 id 13 取一个
++定时器（周期 499）；LnMng/LnPrt 没有调用 SPI/UART 的 HAL。所以 MCU 这边
++像是"触点电源/检测/模式切换 + 计时"，**和镜头交换数据的那一层多半在
++EXPEED 的 SIO 上**（Z8 的 "Lens Platform transport" 就在 SIO）——这是 L0
++要确认的事，不是结论。
++
++框架函数（待命名）：sub_8021500 = 注册模块（对象、处理函数、事件掩码、参数），
++sub_80489BA = 写对象名，sub_8020A06 = 建 alarm，sub_8021552 = 发事件，
++sub_8046ED4 / sub_8021198 / sub_8046F14 = 逻辑引脚/资源 id → 句柄。
++
++---
++
++## 1. 准备（P0）
++
++1. **自己的 IDA 库。** 把 `mcu-ev` 复制到 `~/LiBr/nikon/idb/mcu-re/`，起
++   idasql 在 8089。不往 events 会话的 8088 写。
++2. **种子命名。** 把 qemu-z63 注释里引用过的所有 MCU 地址（stm32.h、
++   toplcd.h、mcukeys.h、mcu.h、nikon-z63.c）收成 `names.json` 先打进去。
++3. **认库函数。** STM32 HAL（HAL_GPIO_Init、HAL_SPI_*、HAL_TIM_*、HAL_DMA_*，
++   按外设基址和结构体偏移认；已知 HAL_SPI_Transmit_DMA = sub_804D580，
++   sub_80522C8 = TIM_Base_SetConfig 一类）、µT-Kernel 服务调用（tk_cre_tsk /
++   tk_set_flg / tk_wai_flg / tk_cre_cyc / tk_cre_alm …，按 SVC 号认）、libc。
++4. **两张底表。**
++   - 逻辑引脚表：id → 端口/位/方向/EXTI（解 sub_8046ED4 系列的 ROM/RAM 表），
++     输出 `pins.tsv`。镜头和肩屏的引脚都从这里来。
++   - 资源表：id → 定时器/SPI/DMA 句柄。
++5. **MCU 侧的链路（McuCm）。** provider 表（Z8 在 0x2000d3a4，每行
++   {发送回调, 接收回调}）、分片收集、序列化/发送包装；列出全部 provider
++   及其收发函数，输出 `providers.tsv`。这是镜头（13）和肩屏（8）的共同入口。
++6. **动态验证手段。** QEMU 跑原版 MCU（M4 是 gdb 的第 2 个 inferior）；
++   z63watch 盯 MCU RAM；链路帧日志；再做一个"在运行中的 M4 上调用原函数"
++   的小工具（参照 z8-qemu `crates/shoulder/src/renderer.rs` 的 Thumb call，
++   用现有 rspbrk.py 的 RSP 代码改），用来喂构造的输入、读输出。
++
++**关口：** 全部 provider、全部逻辑引脚有表；HAL/内核函数有名字。
++
++---
++
++## 2. 肩屏（T1–T6）——先做，自成一体、反馈快
++
++| 步 | 内容 | 产出 / 关口 |
++|---|---|---|
++| T1 输入契约 | MCU 侧 provider 8 接收函数和 worker：subtype 1（20 字节配置）、subtype 4（192 字节状态）及其余 subtype；MCU 回给 EXPEED 的 provider 8 事件。EXPEED 侧 provider 8 编码器（Z8 的 getter 0x4101a41c 在 Z6III 上的对应）。 | 两种报文的逐字节布局 |
++| T2 状态语义 | 192 字节里每个字节：被哪个字段 getter 读、取值范围、含义（快门、光圈、ISO、曝光补偿、剩余张数、电池、卡、白平衡、测光、对焦、释放模式、闪光……）。从 EXPEED 生产端反查每个字节来自状态库哪一项（0xGGII）。 | `toplcd-state.tsv`：偏移 → 状态项 → 含义 → 渲染字段 |
++| T3 渲染器 | sub_8030E0C 的结构：布局表（字段 → x/y/宽/字体/对齐）、字形查找与 blit、数字/字母/段码字库、图标位图（数据区 0x08054000 起）。把全部字形/图标导出成图集。 | 字形图集 PNG + 布局表 |
++| T4 显示逻辑 | 20 字节配置的每一位（显示模式、反色/信息关等）；MCU 自己画的画面：关机画面（存储型 LCD 断电保持）、低电量、无卡、待机、时钟；刷新调度（差分、每包 16 行、队列满就不画——已在 toplcd.h 记过一次）。 | 状态机图 |
++| T5 交互 | 用户操作对肩屏的影响：电源开关的照明档 → SwMng → 背光 LED（哪个引脚/定时器 PWM、几秒熄灭）；相机关机时 MCU 是否本地响应按键刷新肩屏；MCU 回报给 EXPEED 的事件。 | 交互表：输入 → 模块 → 引脚/报文 → 画面变化 |
++| T6 复现与核对 | 用恢复出的表写离线渲染器 `z63-tools/toplcd_render.py`（192 字节 + 配置 → 128×128）。与 (a) QEMU `toplcd-live` 同状态的画面、(b) Thumb call 原版 sub_8030E0C 对随机/边界状态的输出，**逐像素一致**。 | 渲染器 + 测试 |
++
++T6 的逐像素一致是肩屏这块"恢复完"的判据。
++
++---
++
++## 3. 镜头（L0–L6）
++
++| 步 | 内容 | 产出 / 关口 |
++|---|---|---|
++| **L0 触点归属** | 先定每根镜头触点接到哪颗芯片。MCU：LnMng/LnPrt 用到的所有逻辑引脚、EXTI（0x80356f0 / 0x80357a0 两个 EXTI 处理）、定时器 13 的用途（周期 499 是计时还是给镜头的时钟/PWM）。EXPEED：LensService / Lens platform 用的 SIO 通道和 GPIO。 | 触点表：检测、镜头电源（VBAT/VDD）使能、电平转换/切换、时钟/数据/握手线、FTZ。**决策点**：数据层在 EXPEED 的话，L4 转到 eg 上做 |
++| L1 LnMng 状态机 | sub_8035B80 的 19 个事件位各由谁发（EXTI、provider 13 接收、定时器、电源模块）；0x20013DE0 一带状态字节、0x2000E7F8..FA 配置字节；接入 → 去抖 → 上电顺序 → 接口模式 → 就绪 → 上报；拔出/关机；Z 镜头与 F 镜头（FTZ）两条路径；出错路径。 | 状态机图 + 时序（含每段延时） |
++| L2 LnPrt | sub_8036930 与两个 alarm（C/R：超时？重试？）；"Prt" 到底指什么（保护/端口），按代码定。 | 小节 |
++| L3 provider 13 | MCU↔EXPEED 的镜头报文全集：kind 1..4 请求与 0x81..0x84 回复、异步事件 0x0206000x；6×10 模式表在 Z6III 上的对应，每个模式驱动哪些引脚。EXPEED 侧 family 13 编解码表，以及 `eSyscController_Lens` 的命令流（Connect → CheckComplete → StartupComplete → Complete，Disconnect/Shutdown，F 镜头分支）。 | `lens-provider13.tsv` + 双边时序图 |
++| L4 镜头数据层 | 和镜头本身的握手：帧格式、时钟/握手线用法、初始识别（镜头 ID、名称 0x2C19、转接环 0x2C1A）、周期状态（焦距 0x2C01、对焦距离 0x2C00）、对焦驱动、光圈、VR、超时与重试。在 L0 定下的那颗芯片上做。 | `lens.md` 协议章节；命令码表 |
++| L5 对到状态库 | 固件里的镜头记录 → 状态库 0x2Cxx 项，和 settings-map.json 交叉核对。 | 映射表 |
++| L6 验证 | QEMU 里拨镜头检测输入，看 LnMng 状态迁移和 provider 13 报文是否与 L1/L3 的推演一致。没有镜头端模型，所以动态只能走到"检测到触点 → 上电 → 等镜头应答"；之后的部分是纯静态结论，标"未经机身验证"。 | 运行记录 |
++
++---
++
++## 4. 顺序与关口
++
++1. P0 准备（库、种子命名、HAL/内核、引脚表、provider 表）。
++2. 肩屏 T1 → T2 → T3 → T6（先拿到逐像素一致），再 T4、T5。
++3. 镜头 L0（定数据层归属）→ L1 → L2 → L3 → L4 → L5 → L6。
++4. 每步结束：文档更新、`names.json` 打回 IDA、`git status` 里只出现本计划的文件。
++
++规模参考：MCU 侧肩屏约 300 个函数 + 数据区，镜头约 170 个，链路 160 个，都不大；
++**最大的不确定是 L4**——如果数据层在 EXPEED 上，工作量取决于 eg 里
++LensService/SIO 那部分有多大，L0 之后再估。
++
++## 5. 默认做法（要改请说）
++
++- **EXPEED 侧只做到协议需要的程度**：镜头的命令流和数据层、肩屏状态字节的来源；
++  不做镜头 AF/VR 算法本身。
++- **只做逆向 + 文档 + 离线复现**，不新增 QEMU 设备模型（镜头端模型、背光
++  模型等）。L6 需要的镜头检测输入如果板子上没有，只加一个最小的输入开关。
++- 文档放 `docs/mcu-ex/`（`README.md` 地图、`link.md`、`toplcd.md`、`lens.md`），
++  表和脚本放 `z63-tools/mcu-ex/`；不提交，除非你说提交。
++
++## 6. 风险
++
++- 没有机身和逻辑分析仪：触点的物理含义、时序的真实值只能从代码推，
++  一律标"推断"。L4 若在 EXPEED 上，没有镜头端也无法动态验证报文。
++- Z8 的地址是 Z8 的；Z8 EX 二进制不在本机，只能按摘出的指令片段/表结构对照。
++- 8088 的库归 events 会话，不在上面写东西（P0 第 1 步就是为此）。
+diff --git a/docs/mcu-ex/eg/eg-lens.md b/docs/mcu-ex/eg/eg-lens.md
+new file mode 100644
+index 0000000..1983fcc
+--- /dev/null
++++ b/docs/mcu-ex/eg/eg-lens.md
+@@ -0,0 +1,327 @@
++# EXPEED (eg) side of the lens: MCU provider 13, the lens service, the lens link
++
++Source: z63_eg.elf (idasql 8084, read-only), decompile cache claude-work/dc.
++Every address is eg unless marked MCU. "inferred" marks what the code does
++not state outright. Machine-readable dumps beside this file:
++`eg-lenscmd.txt` (lens command dictionary), `eg-steps.txt` (all 155 step
++records), `eg-seq.txt` (the first 83 steps decoded), tools in `egtools/`.
++
++RAM <-> image: the initialised data the RTOS copies to RAM is at image
++VA = RAM - 0x9BD60F000 for the ranges used here (checked on the codec
++objects 0xA0298B5xx and the lens command table 0xA02B4B350, both
++structured). It is NOT valid everywhere: 0xA02AFF000-0xA02B2D000 maps onto
++UTF-16 Italian help text, so 0xA02AFF508 (the lens serial config, below) has
++to be read from a running machine.
++
++---
++
++## 1. Family 13 codec (MCU provider 13)
++
++Provider table 0x441b5f58, 32-byte rows {id, register, recv, codec getter}
++(family 1 = {1, 0x4117edb8, 0x4117ede4, 0x4100cc78}, family 9 =
++{9, 0x4117cf44, 0x4117cf48, 0x41011148}, family 10 = {0xa, 0x41185d94,
++0x41185dc0, 0x41010bd8} -- these match nikon-z63-mcu.h). Family 13 row
++0x441b60d8: register **0x411832d0** (stores the transport send fn/ctx at
++0xA04CED460/468), recv **0x411832fc**, codec getter **0x4100fcb8** ->
++object 0xA0298B5F0 (image 0x4537C5F0) = {encode 0x4100fccc, meta
++0x4100fdc4, decode 0x4100fdf4}. Row table off_441B7010, 24-byte rows
++{encoder, meta, decoder}:
++
++| row | kind | encoder / decoder | notes |
++|---|---|---|---|
++| 1 | 0x01 | enc 0x4100fea4 | 16 B |
++| 2 | 0x02 | enc 0x4100ff24 | 16 B |
++| 3 | 0x03 | enc 0x4100ffa4 | 16 B, three params |
++| 4 | 0x04 | enc 0x41010030 | 16 B |
++| 5 | 0x05 | enc 0x410100b0 | 12 B |
++| 6..10 | 0x81..0x85 | dec 0x41010130, 0x410101a0, 0x41010210, 0x41010280, 0x410102f0 | |
++| 11 | 0x91 | dec 0x41010370 | |
++| 12 | 0x96 | dec 0x410103e8 | |
++
++Encoders: input descriptor {u8 kind, ptr S}; S is the 16-byte request the
++callers build on the stack and pass by value:
++
++```
++S+0  u8  kind            -> wire[0]
++S+1  u8  sequence id     -> wire[4]
++S+4  u32 (0)             -> wire[5]   (low byte)
++S+8  u16 (0)             -> wire[6..7]
++S+10 u16 (0x0100)        -> wire[8..9]   (the constant [9]=1)
++S+12 u32 param           -> wire[12]  (kinds 1, 2, 4)
++kind 3: S+12 -> [12], S+16 -> [13], S+20 -> [14]
++kind 5: 12 bytes; S+8 -> [6..7], S[10] -> [8], S[11] -> [9]
++```
++Output {0xA0406DC70, u32 length 16 (12 for kind 5), u32 queue class 1,
++u32 type = kind}. Queue class 1 = frame route 2 (as on the Z 8, and as
++logged).
++
++Decoders: each copies kind, [4] seq, [5] status (u32), [6..9] into a record
++(0x81: 0xA0406DB88, 0x82: 0xA0406DBA8, 0x85: 0xA0406DC08, 0x91:
++0xA0406DC30, 0x96: 0xA0406DC50) and returns {type, ptr record}. 0x85 adds
++[12] -> rec+12 and [13] -> rec+16; 0x91 and 0x96 add [12] -> rec+12.
++
++Recv 0x411832fc: 0x81..0x85 -> loc_411836f4(index 0..4, rec) = the
++completion callback stored for that kind by sub_411836b8 (slots
++0xA04CED4A8[0..4]); 0x91 -> callback 0xA04CED470(0x03070011, rec); 0x96 ->
++callback(0x03070012, rec).
++
++## 2. Lens-MCU control module 0x41182064..0x41185300 (inferred name "LMC")
++
++Senders (one per kind): 0x411833fc (1), 0x41183474 (2), 0x411834ec (3),
++0x41183558 (4), 0x411835d0 (5); each stores its completion callback and
++calls the transport (0xA04CED460). They have no static callers: they are
++reached through the interface object at 0xA04CED448 (+32 kind 1, +40 kind 2,
+++48 kind 3, +56 kind 4, +64 kind 5), built at run time.
++
++Public API (called by the lens service): 0x41182ec0 (kind 1), 0x41182f08
++(kind 2), 0x41182f50 (kind 3, 24-byte arg), 0x41182f9c (kind 4), 0x41182fe4
++(kind 5): copy the request to 0xA02AFF9E8.. / 9F8 / A08 / A20 / A30, save
++the caller's callback (sub_4118364c slot n), set bit 1<<n on event flag
++0xA04CED3C0. Task entry 0x4118272c (created by 0x41182684, mask 0x1fff):
++
++* bits 0x01..0x10: send kind 1..5 through 0xA04CED448, arm timer 0xA04CED418
++  for **100** ticks (sub_40d32150), current kind in 0xA04CED450;
++* bits 0x20..0x200: a reply came (0x81..0x85): stop the timer and call the
++  caller's callback with event **0x03070020 | n** (sub_41183688) and the
++  decoded record;
++* bit 0x400 (0x91, set by sub_41182d48 on 0x03070011): forward
++  **0x03070001** + record (copied to 0xA02AFFA3C) to the callback registered
++  by sub_41182e58 (0xA04CED458);
++* bit 0x800 (0x96, 0x03070012): forward **0x03070010** + record (0xA02AFFA4C).
++
++Wrappers used by the lens service (build S, seq, callback): 0x4109521c
++kind 1 (mode), 0x41095258 kind 2 (level), 0x41087b08 -> 0x41182f50 kind 3,
++0x41095300 kind 4 (S+12 = arg != 0), 0x41095348 kind 5.
++
++The same module also carries the lens LINK request path: 0x4118302c
++(called from 0x41096398 and 0x41087a60) repacks a link request and hands it
++to the lens transport 0x4117afb4 (section 4), callback 0x41182e28.
++
++## 3. The lens service and its connect sequence
++
++Top-level: 0x41062940 (called from 0x41069338 when its arg is 2) registers
++the MCU event callback **0x41062a58** with 0x41182e58, the sequence
++callbacks (sub_4107d014), and a debug shell command "lensdbg" (string at
++RAM 0xA02B4AB22: "lensdbg", "LnsInf", "LnsPsInf"; sub_40c01534).
++
++0x41062a58 on 0x03070001 (MCU 0x91, lens attach report): rec+4 = MCU status
++([5]), rec+12 = attached ([12]); compares with the current lens state
++(sub_41069a7c: 0 none, 1 attached, 2 = a third state, inferred
++"attached-but-other"), records it (sub_41071bcc -> 0xA02995C18) and starts
++the connect (1) or disconnect (0) flow via sub_4107d05c -> sub_41071b14.
++A nonzero status store item 0x294 (sub_40d77928(0x294)) forces "attached"
++(inferred: a debug/demo setting). On 0x03070010 (MCU 0x96) with rec+12 == 1
++it calls sub_4107289c(2) and sets flag 2 on 0xA048313F8.
++
++### Sequence engine
++
++sub_4107d730 runs a step table at RAM **0xA02B44DE0** (image 0x45535de0),
++32-byte records {start fn, done fn, check fn, param}; current step index
++0xA02995F84 (valid 0..0x52; 155 records exist, the ones after 0x52 belong
++to other sequences, inferred). The start fn sends one request; the done fn
++reads the reply and writes the next step index. Failure path sub_4107daa0:
++the check fn fills {retries 0xA04843389, wait 0xA04843388} (for lens commands
++check 0x41096a3c reads the command record's +40/+44, e.g. 0x0a04 = 10
++retries, 4 ticks apart -- unit inferred ms); when retries run out the
++sequence ends with code 3 and step index 3. 80 (0x50) ends a sequence as
++done (the completion 0xA04843440 is called with {0}). Check fns:
++0x41083c04 = MCU kind 2 step, 0x41083bf4 = MCU kind 1, 0x41083c24 = MCU kind
++4, 0x41096a3c = lens command (param = command index), 0x4108a010/0x41083c14
++other.
++
++The ML (Z-mount) connect sequence, steps 0..82 decoded in `eg-seq.txt`.
++The head of it:
++
++| step | request | then |
++|---|---|---|
++| 0 | MCU kind 2 [12]=0 (0x41087b8c) | 1 (or 81) |
++| 1 | MCU kind 1 mode 0 (0x41087c80) | 3 |
++| 2 | MCU kind 4 arm (0x41087d20) | 3 |
++| 3 | MCU kind 1 mode 2 (0x41087dc8; also sub_41095028(6)) | next from done 0x41087e04 |
++| 4 | lens cmd idx 6, code 0x1F, after the wake handshake (0x41084230) | 11 / 5 / 80 |
++| 5 | cmd 0x1F again | 6 / 80 |
++| 6 / 11 | cmd 0x10 (28 B) | 7 / 12 |
++| 7 / 12 | cmd 0x11 (74 B) | 8 |
++| 8 | cmd 0x30 | 80 |
++| 9 | cmd 0x52 | 10 |
++| 10 | cmd 0x31 | 11 |
++| 13 | cmd 0x12 (66 B) | 80 / ... |
++| 14 | MCU kind 2 [12]=1 (0x41088af0) | 15 |
++| 15..20 | cmd 0x13, 0x24, 0x1024, 0x224, 0x1224, 0x15 | ... |
++| 32 | MCU kind 2 [12]=1 (0x4108a23c) | 33 |
++| 33..79 | mostly cmd 0x70 (the extended group) sub-commands, 0x78, 0x75, 0x7E, 0x76, 0x278 | ... |
++| 80 | MCU kind 2 [12]=0 (0x4108ea54) | 81 |
++| 81 | MCU kind 1 mode 0 (0x4108eb40) | 3 |
++
++So, from the EXPEED's side (inferred from order): **mode 2 is "lens powered
++for communication"**, set right before the first exchange; **mode 0 is
++off**; the MCU's kind 2 level (MCU PF12) goes to **1 only after the
++identification commands 0x10/0x11/0x12 succeeded** (step 14) and back to 0
++at power-down (steps 0, 80) -- inferred "second lens supply / full-power
++enable". Kind 1 mode 1 is used only outside steps 0..82 (0x41091224, step
++record 102), and kind 4/5 by 0x4107e8a8 / 0x4107e99c (lens-detect logic).
++
++**The QEMU loop explained:** steps 0 -> 1 -> 3 -> 4; step 4's wake handshake
++gets no answer from a lens (section 4), step 4 fails, and the flow powers
++down and retries -- the observed kind 2 0 / mode 0 / mode 2 repetition.
++
++### Sysc layer
++
++Sysc controller ids (table 0x4408a4b0, {id, name, handler}): 5 Lens ->
++0x40d6b7a0 (object 0x4408d2f8), 6 MlLens -> 0x40d6b91c (object 0x4408d320,
++"ML_LENS"), 7 FLens -> 0x40d6b154 ("F_LENS"). Commands (table 0x4408a5e8,
++0x58-byte rows): 0x2f MlLensConnect, 0x30 MlLensDisconnect, 0x31
++FLensConnect, 0x32 FLensDisconnect, 0x33 LensConnectCheckComplete, 0x34
++MlLensConnectStartupComplete, 0x35 MlLensConnectComplete, 0x36
++MlLensDisconnectComplete, 0x37 MlLensDisconnectShutdownComplete, 0x38..0x3a
++the F-lens completes; 0x2f-0x30, 0x33-0x37 go to controller 6, 0x31-0x32,
++0x38-0x3a to 7. The MlLens controller (state 0xA035CB2B8, handlers
++0x40d6bc7c, 0x40d6c0a8..0x40d6c1c8) takes the lens service's events
++0x04080005..0x04080009 and posts 0x34 / 0x35 / 0x36 (sub_40d66e7c(52/53/54,
++ok)); the FLens one takes 0x04080005/06 and 0x0408000a/b/c and posts
++0x31/0x32/0x38/0x39/0x3a (0x40d6b210, 0x40d6b694). Which service step
++raises which 0x0408000x was not traced (open).
++
++## 4. The lens link (the EXPEED talks to the lens itself)
++
++Transport task **0x4117a310** (flag 0xA04CE3648, created by 0x4117a23c),
++requests via 0x4117afb4 (copies an 0x58-byte request to 0xA04CE3708 and
++wakes the task). Hardware, opened by **0x4117ad38**:
++
++| what | id | resolved (inferred from the pin-id rule) | use |
++|---|---|---|---|
++| serial | resource 2 -> **instance 3** (sub_40c0040c, table 0x44b16448: 346-343) | one of the 12 controllers at 0x0e700000 | the lens data |
++| pin 41 | GPIO **port 3 bit 10** | interrupt input, ISR **0x4117b338** (config 0x44ae63f0) | lens -> body handshake ("ready") |
++| pin 58 | GPIO **port 4 bit 11** | output (sub_4117b148 / 0x4117b210) | body -> lens wake/request |
++| pin 59 | port 4 bit 12 | set to 1 at init (sub_40c15c7c) | inferred line enable |
++| pin 60 | port 4 bit 13 | set to 1 at init | inferred line enable |
++| timers | sub_40c003b8(4), (1) -> 0xA04CE36A0/A4 | hardware timers | inter-frame timing |
++
++Pin rule: the pin-id table (0x44b15e54, set via 0x41187a24 -> 0x40c00350)
++is the identity; the known ids give id + 1 = 16 * (port - 1) + bit (33 =
++port 3 bit 2, 34 = port 3 bit 3, 38 = port 3 bit 7, 43 = port 3 bit 12, 50
++= port 4 bit 3, all from nikon-z63-mcu.h). Resolving 41/58/59/60 with it
++is inferred; confirm on a running machine (handles 0xA02C29000[id], +4
++port, +8 bit).
++
++GPIO API (handle {+4 port, +8 bit, +12.. capability bytes, +32 irq}):
++0x40c15bb8 write data, 0x40c15bfc read data, 0x40c15c38 / 0x40c15c7c /
++0x40c15cc0 three other per-pin registers (tables 0xA02DC4280 / 4348 /
++4410+44D8; inferred pull / direction / function), 0x40c15dfc irq trigger
++config, 0x40c15f80 irq enable(1)/disable(0), 0x40c16148 irq off.
++
++**Wake handshake** (0x4117b210(1), used by every lens transaction when the
++link is idle, 0x41084230 / 0x41083c38): drive pin 58 (sub_40c15cc0(h,1,1),
++sub_40c15c7c(h,1)), then wait up to **200** ticks for flag bit 1 on
++0xA04CE36C8, which the pin-41 ISR 0x4117b338 sets. Release (arg 0):
++sub_40c15c7c(h,0), sub_40c15c38(h,1), sub_40c15cc0(h,0,1), drive 0. If no
++answer: sub_41083e20 (error) -- this is where the QEMU boot stops.
++
++**Frames** (0x4117b950 + 0x4117a310):
++
++```
++command header, 8 bytes at 0xA04CE37C0 (first 64-byte DMA block):
++  [0] 0x55
++  [1] link sequence counter (0xA04CE3700, ++ each frame)
++  [2] request byte +0x20 (1 or 2; 2 when 0xA04851D8A != 0 -- inferred speed/phase class)
++  [3] command code low byte, [4] high byte (sub-command)
++  [5..6] u16 payload length in 16-bit words = (tx length - 2) / 2
++  [7] checksum: 0x100 - (sum of [0..6]) & 0xff
++data block (0xA04CE5780, 8000-byte buffers):
++  [0] 0x55, payload ..., [last] = -(0x55 + sum of the payload) -- whole block sums to 0
++```
++The task: check pin 41 level (sub_40c15bfc == 0 = lens ready, inferred),
++build the header, set up both directions (sub_40d321bc/sub_40d322cc =
++cache maintenance on the TX/RX buffers), disable the pin-41 irq, start the
++serial transfer (**sub_40ca60e4**(instance, desc 0xA04CE3790), static
++config qword_44ae6400 = {4, 4, 3, 1000}), 5-tick watchdog (timer
++0xA04CE36A8), then wait up to **5010** ticks for completion bit 0 on
++0xA04CE36C8; RX checked by sub_4117bfe8; errors in 0xA04CE376C (1/3 start
++failed, 6 driver error, 9 wrong state). Request +0x2C == 1 selects the
++two-phase path (header, then a separate data phase sized by +0x0E).
++
++Serial setup: sub_40ca5e1c (claim instance), sub_40ca5f24(instance,
++config 0xA02AFF508): config[5] word length (1..8 via byte_42b65320),
++config[6] bit rate in Hz -> divider from an 80 MHz clock
++(div = ceil(80e6 / (2*rate)), actual = 40e6/div), config[7]
++extra bits. **The rate itself is in 0xA02AFF508, which must be read at run
++time** (see the RAM note at the top).
++
++**Command dictionary** (`eg-lenscmd.txt`): RAM table 0xA02B4B350, 48-byte
++records {u16 code, u16 tx length, u16 rx length, u32 +8, u32 +12 (transfer
++type, < 6), u32 +16 (== 1: two-phase), u32 +20, builder fn +24, parser fn
+++32, u32 +40, u16 +44 = {wait, retries}}; index -> code: 0..0x5b, e.g. 0 =
++0x10 (28 B), 1 = 0x11 (74 B), 2 = 0x12 (66 B), 3 = 0x13, 6 = 0x1F, 7 = 0x20
++(258 B), 0xe/0xf = 0x24/0x224 (7426 B), 0x10/0x11 = 0x1024/0x1224 (3468 B),
++0x2c..0x33 = 0x0A0..0x7A0, 0x46.. = 0xE0.., 0x57 = 0xF7 (1026 B). Index
++0x1b = code 0x70 is a group: sub-table 0xA02B4C430 (64 records, 0x0370 ..
++0xE970, e.g. 0x3070 receives 7816 B, 0x2F70 194 B). The builder/parser fns
++(0x410987xx-0x4109a9xx / 0x4109a9xx-0x4109d0e4; 0x4109a910 = no payload,
++0x4109d0e4 = status-only reply) are where the field layouts live -- not yet
++read one by one (open). The request is assembled by 0x41096398 (seq,
++args, callback, command index) via 0x41083d70.
++
++## 5. Lens data -> status store
++
++Publisher **0x4106b568** diffs a cache and publishes: 0x2C04 (attached,
++from the lens kind 0xA04831F64 through table 0xA02B44BD8), 0x2C01 focal
++length (field 503 through the u32 table 0xA02B3447C), 0x2C00 focus
++distance (field 500 through 0xA02B31848), 0x2C29 / 0x2C2A min/max focal
++(fields 507 / 508 through 0xA02B3447C), 0x2C1A adapter name (built with a
++format string from bytes of the record at 0xA04831DD0 into 0xA04831CF8),
++0x2C19 lens name (string field 29, or 0xA04831F9C for kind 2) into
++0xA04831D38.
++
++Field getter 0x4109710c(id): descriptor table 0xA02B4D210, 40-byte records
++{mode, buf/offset for lens kind 1, buf/offset for other kinds, getter fn,
++arg}; mode 1 = not for kind 1, mode 2 = only kind 1. **Lens kind 1 = Z
++(ML) lens.** Fields 500/501/503/507/508 live in kind-1 buffer 4 at offsets
++0x0d/0x0e/0x10/0x14/0x15 (getter 0x41097de4); string field 29 (string
++table 0xA02B52EB8) in buffer 7 at +5, 64 bytes. Buffers come from
++sub_41095fbc(buf id): double-buffered images at 0xA04847780 (+0x51E3 or
+++0x1FBA per bank, bank bit 0xA04843744 & 1) -- the exact per-buffer offsets
++are in the jump targets at 0x41096010.. (partly read; open), i.e. which
++parser fills buffer 4 / 7 is not pinned yet (inferred: the 0x10/0x11/0x12
++identification replies).
++
++## 6. For the MCU-side names
++
++* MCU kind 1 mode 2 (MCU PB0, "A") = the state the EXPEED sets immediately
++  before the first lens handshake: name it "lens power on (comm)"; mode 0 =
++  off; mode 1 (PA9, "B") is used only by a different sequence
++  (0x41091224) -- inferred a second power level (e.g. motor / high current);
++  no string names it.
++* MCU PF12 (kind 2) = 1 only after identification succeeds, 0 at power-down
++  -> "lens second supply / full-power enable" (inferred).
++* PG4 latch (kind 4/5): armed by 0x4107e8a8 and queried by 0x4107e99c, both
++  next to the lens-detect logic; still unnamed.
++* The 0x91 report is the lens service's only attach trigger (0x41062a58).
++
++## Walls / asks for a run
++
++1. RAM 0xA02AFF508 (lens serial config: word length, bit rate) and
++   0xA02C29000[41], [58], [59], [60] (GPIO handles: port/bit) -- read on a
++   booted machine (hmp xp, A53 space).
++2. Which steps raise the Sysc events 0x04080005..0x0408000c.
++3. The builder/parser bodies per lens command (field layouts) and the
++   buffer-id -> offset map (0x41096010 jump targets).
++4. Dynamic: with a peer that answers pin 58 by pulsing pin 41 (EXPEED port
++   3 bit 10) and clocks serial instance 3, the 0x1F exchange would show
++   the first real frame; nothing in QEMU does that today.
++
++## Resolved after the fact (parent, 2026-10-19, QEMU run `egr`, hmp xp)
++
++* Wall 1. Lens serial config 0xA02AFF508 = u32 {1, 0, 0 (byte +8), 1, 1, 0, 8000000, 0x10}:
++  config[6] = **8 000 000 Hz** -> divider ceil(80e6 / 16e6) = 5 -> exactly 8 MHz; config[5] = 0
++  (outside 1..8, so the word-length table is not applied); byte +28 = 16 feeds the timeout.
++  Pin handles 0xA02C29000[id] -> {+0 id, +4 port, +8 bit}: 41 = port 3 bit 10 (has an irq
++  record at +0x20), 58 = port 4 bit 11, 59 = port 4 bit 12, 60 = port 4 bit 13 -- the inferred
++  pin rule holds.
++* Step 4 / 5 decisions. Field ids at RAM 0xA02B4A998 = {36, 37}; descriptors (40 bytes at
++  0xA02B4D210 + 40*id: {mode, buf kind1, off kind1, buf other, off other, -, getter, arg}):
++  36 = buffer 0 +0, 37 = buffer 0 +1 (the two bytes of the 0x1F reply, parser 0x4109adac),
++  56 = buffer 0 +0 through getter 0x41097de4 arg 0x27, 92 = buffer 1 +0x5e (byte 13 of the
++  0x10 reply, parser 0x4109a914). 0x1F's single payload byte is 1 at step 4 and 2 at step 5
++  (0x41084230). Step 4 done 0x41087ecc: f36 == 0 -> step 11; else (f56 & 0xFE) == 0 and
++  f37 != 0 -> step 5; else error 3 -> step 80. Step 5 done 0x4108805c: f36 == 0 and f37 != 0
++  -> step 6, else error 3 -> 80. Step 6 done 0x41088174: f92 != 0 -> error 0 -> 80, else 7.
+diff --git a/docs/mcu-ex/eg/eg-lenscmd.txt b/docs/mcu-ex/eg/eg-lenscmd.txt
+new file mode 100644
+index 0000000..61500b8
+--- /dev/null
++++ b/docs/mcu-ex/eg/eg-lenscmd.txt
+@@ -0,0 +1,160 @@
++# lens command table (cmd index -> record) at RAM a02b4b350 (file VA 4553c350)
++# idx  code len2 len4 | +8 +12 +16 +20 | builder parser | +40 +44
++  0 00  code 10  tx  28 rx  28 | 3 0 0 1 | 41098744 4109a914 | 1 a04
++  1 01  code 11  tx  74 rx  74 | 3 0 0 1 | 4109a910 4109aadc | 1 a04
++  2 02  code 12  tx  66 rx  66 | 3 0 0 1 | 41098770 4109ab60 | 1 a04
++  3 03  code 13  tx  14 rx  14 | 3 0 0 2 | 41098850 4109d0e4 | 1 a04
++  4 04  code 15  tx   6 rx   6 | 3 0 0 1 | 4109a910 4109acfc | 1 a04
++  5 05  code 16  tx   4 rx   4 | 3 0 0 1 | 41098920 4109ad64 | 1 a04
++  6 06  code 1f  tx   4 rx   4 | 3 0 0 1 | 4109892c 4109adac | 1 a04
++  7 07  code 20  tx 258 rx 258 | 3 0 0 0 | 41098938 4109add8 | 0 a10
++  8 08  code 120  tx  24 rx  24 | 3 0 0 0 | 4109a910 4109b4ec | 0 a10
++  9 09  code 220  tx   6 rx   6 | 3 0 0 2 | 4109a910 4109d0e4 | 0 a10
++ 10 0a  code 21  tx   6 rx   6 | 3 0 0 2 | 41098b44 4109d0e4 | 0 a04
++ 11 0b  code 1322  tx   4 rx   4 | 3 0 0 2 | 4109a910 4109d0e4 | 0 a04
++ 12 0c  code 2022  tx   4 rx   4 | 3 0 0 0 | 41098b6c 4109d0e4 | 0 a04
++ 13 0d  code a022  tx   6 rx   6 | 3 0 0 2 | 41098b70 4109d0e4 | 0 a04
++ 14 0e  code 24  tx 7426 rx 7426 | 3 1 0 1 | 4109a910 4109b5d0 | 1 a04
++ 15 0f  code 224  tx 7426 rx 7426 | 3 1 0 1 | 4109a910 4109b668 | 1 a04
++ 16 10  code 1024  tx 3468 rx 3468 | 3 1 0 1 | 4109a910 4109b704 | 1 a04
++ 17 11  code 1224  tx 3468 rx 3468 | 3 1 0 1 | 4109a910 4109b738 | 1 a04
++ 18 12  code 25  tx   6 rx   6 | 3 0 0 1 | 4109a910 4109b76c | 0 a04
++ 19 13  code 26  tx   6 rx   6 | 3 0 0 1 | 4109a910 4109b7e4 | 0 a04
++ 20 14  code 27  tx   6 rx   6 | 3 0 0 1 | 4109a910 4109b85c | 0 a04
++ 21 15  code 30  tx   6 rx   6 | 3 0 0 1 | 4109a910 4109b8d4 | 0 a04
++ 22 16  code 31  tx  22 rx  22 | 3 0 0 2 | 410987dc 4109d0e4 | 0 a04
++ 23 17  code 50  tx   4 rx   4 | 3 0 0 2 | 41098ba4 4109d0e4 | 0 a04
++ 24 18  code 51  tx   4 rx   4 | 3 0 0 1 | 4109a910 4109b910 | 0 a04
++ 25 19  code 52  tx   4 rx   4 | 3 0 0 2 | 41098bbc 4109d0e4 | 0 a04
++ 26 1a  code 53  tx   4 rx   4 | 3 0 0 2 | 4109a910 4109d0e4 | 1 a04
++ 27 1b  code 70  tx  14 rx  14 | 3 0 0 1 | 4109a910 4109b958 | 0 a04
++ 28 1c  code 71  tx  14 rx  14 | 3 0 0 2 | 4109a910 4109d0e4 | 0 a04
++ 29 1d  code ff71  tx  46 rx  46 | 3 0 0 1 | 4109a910 4109d0e4 | 0 a04
++ 30 1e  code 74  tx   8 rx   8 | 3 0 0 1 | 4109a910 4109b994 | 0 a04
++ 31 1f  code 75  tx   8 rx   8 | 3 0 0 2 | 41098bf8 4109d0e4 | 0 a04
++ 32 20  code 76  tx  12 rx  12 | 3 0 0 0 | 4109a910 4109b9e0 | 0 a04
++ 33 21  code 78  tx   4 rx   4 | 3 0 0 2 | 41098c4c 4109d0e4 | 0 a04
++ 34 22  code 178  tx   4 rx   4 | 3 0 0 2 | 41098c60 4109d0e4 | 0 a04
++ 35 23  code 278  tx   4 rx   4 | 3 0 0 2 | 41098c6c 4109d0e4 | 0 a04
++ 36 24  code 79  tx   4 rx   4 | 3 0 0 2 | 41098c78 4109d0e4 | 0 a04
++ 37 25  code 7e  tx   4 rx   4 | 3 0 0 2 | 4109a910 4109d0e4 | 0 a04
++ 38 26  code 17e  tx   4 rx   4 | 3 0 0 2 | 41098c88 4109d0e4 | 0 a04
++ 39 27  code 27e  tx  16 rx   6 | 4 3 1 0 | 41098c94 4109ba3c | 0 a04
++ 40 28  code 37e  tx  18 rx   6 | 4 3 1 0 | 41098d40 4109ba78 | 0 a04
++ 41 29  code 47e  tx   6 rx   6 | 3 0 0 2 | 41098dfc 4109d0e4 | 0 a04
++ 42 2a  code 57e  tx   4 rx   4 | 3 0 0 1 | 4109a910 4109bab4 | 0 a04
++ 43 2b  code 67e  tx  14 rx   8 | 3 3 1 0 | 41098e44 4109bad8 | 0 a04
++ 44 2c  code a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109bb1c | 1 0
++ 45 2d  code 1a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109bbe8 | 1 0
++ 46 2e  code 2a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109bcb4 | 1 0
++ 47 2f  code 3a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109bd80 | 1 0
++ 48 30  code 4a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109be4c | 1 0
++ 49 31  code 5a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109bf18 | 1 0
++ 50 32  code 6a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109bfe4 | 1 0
++ 51 33  code 7a0  tx  24 rx  24 | 3 0 0 0 | 41098ebc 4109c0b0 | 1 0
++ 52 34  code a1  tx  10 rx  10 | 3 0 0 2 | 41098ef4 4109d0e4 | 1 0
++ 53 35  code a2  tx   4 rx   4 | 3 0 0 2 | 4109a910 4109d0e4 | 0 a04
++ 54 36  code a3  tx   4 rx   4 | 3 0 0 2 | 41098f74 4109d0e4 | 1 0
++ 55 37  code 1a3  tx   4 rx   4 | 3 0 0 2 | 41098f74 4109d0e4 | 1 0
++ 56 38  code b0  tx   4 rx   4 | 3 0 0 2 | 41098fac 4109d0e4 | 0 a04
++ 57 39  code b1  tx   8 rx   8 | 3 0 0 2 | 41098fc8 4109d0e4 | 0 a04
++ 58 3a  code b2  tx   6 rx   6 | 3 0 0 2 | 41099000 4109d0e4 | 0 a04
++ 59 3b  code c0  tx  18 rx  24 | 3 0 0 1 | 4109901c 4109c17c | 0 0
++ 60 3c  code c1  tx  24 rx  24 | 3 0 0 1 | 410990e4 4109c1a0 | 1 0
++ 61 3d  code c2  tx  14 rx  14 | 3 0 0 2 | 410991dc 4109d0e4 | 1 0
++ 62 3e  code c3  tx  20 rx  20 | 3 0 0 0 | 4109a910 4109c1c4 | 0 a04
++ 63 3f  code c4  tx  22 rx  22 | 3 0 0 0 | 41099274 4109c288 | 0 a04
++ 64 40  code d2  tx   8 rx   8 | 3 0 0 2 | 41099280 4109d0e4 | 0 a04
++ 65 41  code d3  tx  10 rx  10 | 3 0 0 2 | 410992b8 4109d0e4 | 1 0
++ 66 42  code d4  tx   4 rx   4 | 3 0 0 2 | 41099338 4109d0e4 | 0 a04
++ 67 43  code d5  tx   4 rx   4 | 3 0 0 2 | 41099350 4109d0e4 | 1 0
++ 68 44  code d7  tx  10 rx  10 | 3 0 0 2 | 4109935c 4109d0e4 | 1 0
++ 69 45  code d8  tx   4 rx   4 | 3 0 0 2 | 410993a0 4109d0e4 | 1 0
++ 70 46  code e0  tx   4 rx   4 | 3 0 0 1 | 410993b4 4109c33c | 0 a04
++ 71 47  code e1  tx   4 rx   4 | 3 0 0 1 | 410993d8 4109c360 | 0 a04
++ 72 48  code e2  tx  10 rx  10 | 3 0 0 1 | 410993fc 4109c384 | 1 0
++ 73 49  code e4  tx  16 rx  16 | 3 0 0 1 | 41099480 4109c3a8 | 1 0
++ 74 4a  code e6  tx  10 rx  10 | 3 0 0 1 | 41099538 4109c3cc | 1 0
++ 75 4b  code e8  tx  10 rx  10 | 3 0 0 1 | 410995bc 4109c3f0 | 1 0
++ 76 4c  code eb  tx  12 rx  12 | 3 0 0 2 | 41099640 4109d0e4 | 0 a04
++ 77 4d  code ec  tx  12 rx  12 | 3 0 0 1 | 410996c0 4109c414 | 1 0
++ 78 4e  code ed  tx  12 rx  12 | 3 0 0 2 | 41099738 4109d0e4 | 0 a04
++ 79 4f  code ee  tx  28 rx  28 | 3 0 0 1 | 410997b8 4109c438 | 0 a04
++ 80 50  code ef  tx   4 rx   4 | 3 0 0 2 | 410998dc 4109d0e4 | 0 a04
++ 81 51  code f0  tx   4 rx   4 | 3 2 0 1 | 4109a910 4109c45c | 1 0
++ 82 52  code f1  tx   4 rx   4 | 3 2 0 2 | 41099908 4109d0e4 | 1 0
++ 83 53  code f2  tx   8 rx   8 | 3 0 0 2 | 4109991c 4109d0e4 | 1 0
++ 84 54  code f3  tx   8 rx   8 | 3 2 0 1 | 4109a910 4109c4b4 | 1 0
++ 85 55  code f4  tx   2 rx   2 | 3 2 0 2 | 4109a910 4109d0e4 | 1 0
++ 86 56  code f5  tx   8 rx   8 | 3 2 0 1 | 4109a910 4109c53c | 1 0
++ 87 57  code f7  tx 1026 rx 1026 | 3 2 0 2 | 4109994c 4109d0e4 | 1 0
++ 88 58  code f8  tx   4 rx   4 | 3 2 0 1 | 4109a910 4109c5c4 | 1 0
++ 89 59  code fa  tx   2 rx   2 | 3 2 0 2 | 4109a910 4109d0e4 | 1 0
++ 90 5a  code 370  tx 4108 rx   6 | 0 5 1 2 | 41099988 4109d0e4 | 1 0
++ 91 5b  code 470  tx   6 rx  10 | 0 5 1 2 | 410999f0 4109c60c | 1 0
++# cmd 0x1b sub-table (a2[1] -> record) at RAM a02b4c430 (file VA 4553d430)
++# idx  code len2 len4 | +8 +12 +16 +20 | builder parser | +40 +44
++  0 00  code 370  tx 4108 rx   6 | 0 5 1 2 | 41099988 4109d0e4 | 1 0
++  1 01  code 470  tx   6 rx  10 | 0 5 1 2 | 410999f0 4109c60c | 1 0
++  2 02  code 570  tx   4 rx   6 | 0 5 1 2 | 41099a10 4109d0e4 | 1 0
++  3 03  code 1270  tx   6 rx   8 | 0 3 1 0 | 41099a20 4109c640 | 1 0
++  4 04  code 2270  tx   6 rx  34 | 0 3 1 0 | 41099a40 4109c664 | 1 0
++  5 05  code 2570  tx   6 rx  46 | 0 3 1 0 | 41099a60 4109c690 | 1 0
++  6 06  code 2670  tx   6 rx  14 | 1 3 1 0 | 41099a80 4109c6bc | 1 0
++  7 07  code 2770  tx   6 rx  46 | 0 3 1 0 | 41099aa0 4109c718 | 1 0
++  8 08  code 2870  tx   6 rx  50 | 0 3 1 0 | 41099ac0 4109c744 | 1 0
++  9 09  code 2970  tx   6 rx  34 | 1 3 1 0 | 41099ae0 4109c770 | 1 0
++ 10 0a  code 2a70  tx   6 rx  26 | 0 3 1 0 | 41099b00 4109c86c | 1 0
++ 11 0b  code 2b70  tx   6 rx  20 | 1 3 1 0 | 41099b20 4109c920 | 1 0
++ 12 0c  code 2c70  tx   6 rx  12 | 0 3 1 0 | 41099b40 4109c9a4 | 1 0
++ 13 0d  code 2d70  tx   6 rx  34 | 1 3 1 0 | 41099b60 4109c9e8 | 1 0
++ 14 0e  code 2e70  tx   6 rx  16 | 0 3 1 0 | 41099b80 4109cadc | 1 0
++ 15 0f  code 2f70  tx   6 rx 194 | 0 3 1 1 | 41099ba0 4109cb18 | 1 0
++ 16 10  code 3070  tx   6 rx 7816 | 0 4 1 1 | 41099bc0 4109cb64 | 1 0
++ 17 11  code 4070  tx  12 rx  14 | 0 3 1 0 | 41099be4 4109cc20 | 1 0
++ 18 12  code 4170  tx   6 rx   8 | 0 3 1 0 | 41099c2c 4109cc9c | 1 0
++ 19 13  code 4270  tx  14 rx  22 | 0 3 1 0 | 41099c48 4109ccc8 | 1 0
++ 20 14  code 4470  tx   6 rx  78 | 0 3 1 0 | 41099ca4 4109cd84 | 1 0
++ 21 15  code 4570  tx  34 rx   8 | 0 3 1 0 | 41099cc4 4109cdd4 | 1 0
++ 22 16  code 4670  tx   8 rx   6 | 0 3 1 2 | 41099d38 4109d0e4 | 1 0
++ 23 17  code b070  tx  14 rx   6 | 4 3 1 2 | 41099d64 4109d0e4 | 1 0
++ 24 18  code b170  tx  10 rx   6 | 4 3 1 2 | 41099dfc 4109d0e4 | 1 0
++ 25 19  code b270  tx  16 rx   6 | 4 3 1 2 | 41099e70 4109d0e4 | 1 0
++ 26 1a  code b370  tx  16 rx   6 | 4 3 1 2 | 41099f18 4109d0e4 | 1 0
++ 27 1b  code b470  tx  18 rx   6 | 4 3 1 2 | 41099fc0 4109d0e4 | 1 0
++ 28 1c  code b570  tx  14 rx   6 | 4 3 1 2 | 4109a074 4109d0e4 | 1 0
++ 29 1d  code b670  tx   8 rx   6 | 0 3 1 2 | 4109a10c 4109d0e4 | 1 0
++ 30 1e  code c070  tx   6 rx   8 | 0 3 1 0 | 4109a134 4109cdf8 | 1 0
++ 31 1f  code c170  tx   6 rx   6 | 0 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 32 20  code c270  tx   6 rx  10 | 0 3 1 0 | 4109a154 4109ce1c | 1 0
++ 33 21  code c370  tx   6 rx   6 | 0 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 34 22  code c470  tx   6 rx   6 | 0 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 35 23  code c570  tx   6 rx  14 | 0 3 1 0 | 4109a174 4109ce58 | 1 0
++ 36 24  code c670  tx   6 rx   6 | 0 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 37 25  code c770  tx   6 rx  16 | 0 3 1 0 | 4109a194 4109ceb4 | 1 0
++ 38 26  code c870  tx   6 rx  14 | 0 3 1 0 | 4109a1b4 4109cf20 | 1 0
++ 39 27  code c970  tx   6 rx  12 | 0 3 1 0 | 4109a1d4 4109cf7c | 1 0
++ 40 28  code d070  tx   6 rx   6 | 0 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 41 29  code d170  tx   8 rx   6 | 0 3 1 2 | 4109a1f4 4109d0e4 | 1 0
++ 42 2a  code d270  tx  10 rx   6 | 1 3 1 2 | 4109a228 4109d0e4 | 1 0
++ 43 2b  code d370  tx   8 rx   6 | 1 3 1 2 | 4109a270 4109d0e4 | 1 0
++ 44 2c  code d470  tx   8 rx   6 | 1 3 1 2 | 4109a2b0 4109d0e4 | 1 0
++ 45 2d  code d570  tx  10 rx   6 | 0 3 1 2 | 4109a2d8 4109d0e4 | 1 0
++ 46 2e  code d670  tx  12 rx   6 | 0 3 1 2 | 4109a31c 4109d0e4 | 1 0
++ 47 2f  code d770  tx  10 rx   6 | 0 3 1 2 | 4109a374 4109d0e4 | 1 0
++ 48 30  code d870  tx  10 rx   6 | 1 3 1 2 | 4109a3b4 4109d0e4 | 1 0
++ 49 31  code d970  tx  14 rx   6 | 0 3 1 2 | 4109a3f8 4109d0e4 | 1 0
++ 50 32  code da70  tx  10 rx   8 | 5 3 1 0 | 4109a458 4109cfac | 1 0
++ 51 33  code db70  tx   6 rx   6 | 0 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 52 34  code dc70  tx   6 rx   8 | 1 3 1 0 | 4109a490 4109cfd0 | 1 0
++ 53 35  code dd70  tx  14 rx   8 | 5 3 1 0 | 4109a4ac 4109cffc | 1 0
++ 54 36  code de70  tx  14 rx   8 | 0 3 1 0 | 4109a530 4109d020 | 1 0
++ 55 37  code df70  tx   4 rx   6 | 5 3 1 2 | 4109a59c 4109d0e4 | 1 0
++ 56 38  code e070  tx  10 rx   6 | 4 3 1 2 | 4109a5ac 4109d0e4 | 1 0
++ 57 39  code e170  tx   6 rx   6 | 4 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 58 3a  code e270  tx   6 rx   6 | 0 3 1 2 | 4109a910 4109d0e4 | 1 0
++ 59 3b  code e370  tx   4 rx   6 | 6 3 1 2 | 4109a604 4109d0e4 | 1 0
++ 60 3c  code e470  tx   4 rx   6 | 0 3 1 2 | 4109a614 4109d0e4 | 1 0
++ 61 3d  code e770  tx   8 rx   6 | 0 3 1 2 | 4109a624 4109d0e4 | 1 0
++ 62 3e  code e870  tx  12 rx   6 | 6 3 1 2 | 4109a680 4109d0e4 | 1 0
++ 63 3f  code e970  tx   6 rx   6 | 6 3 1 2 | 4109a910 4109d0e4 | 1 0
+diff --git a/docs/mcu-ex/eg/eg-seq.txt b/docs/mcu-ex/eg/eg-seq.txt
+new file mode 100644
+index 0000000..08e3c10
+--- /dev/null
++++ b/docs/mcu-ex/eg/eg-seq.txt
+@@ -0,0 +1,84 @@
++ 0 chk 41083c04 p 5b          start 41087b8c |  | done 41087b9c -> 1,81 retry-fail->0
++ 1 chk 41083bf4 p 5b          start 41087c80 |  | done 41087c90 -> 3 retry-fail->1u
++ 2 chk 41083c24 p 5b          start 41087d20 |  via 41087d20(unsigned int a1, __int64 a2) -> MCU kind4(PG4 latch) a1: &v3, a2: a1, a3: a2; MCU kind4(PG4 latch) &v3, a1, a2 | done 41087d48 -> 3 retry-fail->2u
++ 3 chk 41083bf4 p 5b          start 41087dc8 |  via 41087dc8(unsigned int a1, __int64 a2)
++{) -> MCU kind1(mode) a1: 2, a2: a1, a3: a2; MCU kind1(mode) 2, a1, a2 | done 41087e04 -> v4 retry-fail->3u
++ 4 cmd 06 code 001f           start 41087ec0 |  | done 41087ecc -> 11,5,80 retry-fail->4u
++ 5 cmd 06 code 001f           start 41088050 |  | done 4108805c -> 6,80 retry-fail->5u
++ 6 cmd 00 code 0010           start 41088168 |  | done 41088174 -> 7,80 retry-fail->6u
++ 7 cmd 01 code 0011           start 4108826c |  via 4108826c(unsigned int a1, __int64 a2) -> LENS cmd a1: 1u, a2: (__int64)&v3, a3: a1, a4: a2; LENS cmd 1u, (__int64)&v3, a1, a2 | done 41088298 -> 8 retry-fail->7u
++ 8 cmd 15 code 0030           start 41088320 |  via 41088320(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x15u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x15u, (__int64)&v3, a1, a2 | done 41088348 -> 80,v3 retry-fail->8u
++ 9 cmd 19 code 0052           start 41088478 |  via 41088478(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x19u, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x19u, (__int64)v3, a1, a2 | done 410884ac -> 10 retry-fail->9u
++10 cmd 16 code 0031           start 4108852c |  | done 41088530 -> 11 retry-fail->0xAu
++11 cmd 00 code 0010           start 410885b0 |  | done 410885bc -> 12,80 retry-fail->0xBu
++12 cmd 01 code 0011           start 410887e4 |  via 410887e4(unsigned int a1, __int64 a2) -> LENS cmd a1: 1u, a2: (__int64)&v3, a3: a1, a4: a2; LENS cmd 1u, (__int64)&v3, a1, a2 | done 41088810 -> v3 retry-fail->0xCu
++13 cmd 02 code 0012           start 410888e4 |  via 410888e4(unsigned int a1, __int64 a2) -> LENS cmd a1: 2u, a2: (__int64)&v4, a3: a1, a4: a2; LENS cmd 2u, (__int64)&v4, a1, a2 | done 41088940 -> 80,v7 retry-fail->0xDu
++14 chk 41083c04 p 5b          start 41088af0 |  | done 41088b00 -> 15 retry-fail->0xEu
++15 cmd 03 code 0013           start 41088b94 |  via 41083fc0(a1, a2) -> LENS cmd a1: 3u, a2: (__int64)&v15, a3: a1, a4: a | done 41088be0 -> 16 retry-fail->0xFu
++16 cmd 0e code 0024           start 41088ce4 |  via 41088ce4(unsigned int a1, __int64 a2) -> LENS cmd a1: 0xEu, a2: (__int64)v5, a3: a1, a4: a; LENS cmd 0xEu, (__int64)v5, a1, a2 | done 41088d30 -> 17 retry-fail->0x10u
++17 cmd 10 code 1024           start 41088db0 |  via 41088db0(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x10u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x10u, (__int64)&v3, a1, a2 | done 41088dd8 -> v3 retry-fail->0x11u
++18 cmd 0f code 0224           start 41088ec0 |  via 41088ec0(unsigned int a1, __int64 a2) -> LENS cmd a1: 0xFu, a2: (__int64)&v3, a3: a1, a4: ; LENS cmd 0xFu, (__int64)&v3, a1, a2 | done 41088ee8 -> 19 retry-fail->0x12u
++19 cmd 11 code 1224           start 41088f68 |  via 41088f68(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x11u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x11u, (__int64)&v3, a1, a2 | done 41088f90 -> 20 retry-fail->0x13u
++20 cmd 04 code 0015           start 41089024 |  via 41089024(unsigned int a1, __int64 a2) -> LENS cmd a1: 4u, a2: (__int64)&v3, a3: a1, a4: a2; LENS cmd 4u, (__int64)&v3, a1, a2 | done 4108904c -> 20,22,3,80 retry-fail->0x14u
++21 chk 41083c14 p 4a          start 410893a4 |  via 410893a4(unsigned int a1) -> LENS cmd a1: 0x4Au, a2: (__int64)v4, a3: a1, a4: ; LENS cmd 0x4Au, (__int64)v4, a1, 1091081204 | done 410893f4 -> 3,30 retry-fail->0x15u
++22 cmd 0a code 0021           start 41089554 |  via 41089554(unsigned int a1, __int64 a2) -> LENS cmd a1: 0xAu, a2: (__int64)&v5, a3: a1, a4: ; LENS cmd 0xAu, (__int64)&v5, a1, a2 | done 410895bc -> 23 retry-fail->0x16u
++23 cmd 07 code 0020           start 4108963c |  | done 41089640 -> 24,3 retry-fail->0x17u
++24 cmd 08 code 0120           start 41089704 |  via 41089704(unsigned int a1, __int64 a2) -> LENS cmd a1: 8u, a2: (__int64)&v3, a3: a1, a4: a2; LENS cmd 8u, (__int64)&v3, a1, a2 | done 4108972c -> v3 retry-fail->0x18u
++25 cmd 2c code 00a0           start 410897f0 |  via 4108537c(a1: &v5, a2: a1, a3: a2) -> LENS cmd a1: v36, a2: (__int64)v37, a3: a2, a4: a;  via 4108537c(a1: &v5, a2: a1, a3: a2) -> LENS cmd a1: v2 | done 410898b4 -> 26 retry-fail->0x19u
++26 cmd 07 code 0020           start 41089930 |  | done 41089934 -> 26,27,3 retry-fail->0x1Au
++27 cmd 14 code 0027           start 41089ac4 |  via 41089ac4(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x14u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x14u, (__int64)&v3, a1, a2 | done 41089aec -> 29 retry-fail->0x1Bu
++28 cmd 12 code 0025           start 41089b6c |  via 41089b6c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x12u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x12u, (__int64)&v3, a1, a2 | done 41089b94 -> 29 retry-fail->0x1Cu
++29 cmd 05 code 0016           start 41089c14 |  via 410810b4(a1: 1, a2: a1, a3: a2) -> LENS cmd a1: 5, a2: &v12, a3: a2, a4: a3;  via 410810b4(a1: 0, a2: a1, a3: a2) -> LENS cmd a1: 5, a2: &v12, a3 | done 41089d10 -> 21,3,30,45 retry-fail->0x1Du
++30 chk 4108a010 p 5c          start 41089f34 |  via 41089f34(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x50u, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x50u, (__int64)v3, a1, a2 | done 41089f94 -> 3 retry-fail->0x1Eu
++31 cmd 1e code 0074           start 4108a020 |  via 4108a020(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Eu, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x1Eu, (__int64)&v3, a1, a2 | done 4108a048 -> 33,v4 retry-fail->0x1Fu
++32 chk 41083c04 p 5b          start 4108a23c |  | done 4108a24c -> 33 retry-fail->0x20u
++33 cmd 1b code 0070           start 4108a354 |  | done 4108a364 -> 33,34,37 retry-fail->0x21u
++34 cmd 21 code 0078           start 4108a568 |  via 4108a568(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x21u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x21u, (__int64)&v3, a1, a2 | done 4108a5a4 -> 35,36 retry-fail->0x22u
++35 cmd 1b code 0070           start 4108a6f4 |  via 4108a6f4(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108a728 -> 37,v7 retry-fail->0x23u
++36 cmd 1b code 0070           start 4108a92c |  via 4108a92c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v7, a3: a1, a4:; LENS cmd 0x1Bu, (__int64)&v7, a1, a2 | done 4108a9e8 -> 37 retry-fail->0x24u
++37 cmd 1b code 0070           start 4108ab8c |  via 4108ab8c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v6, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v6, a1, a2 | done 4108ac24 -> 37 retry-fail->0x25u
++38 cmd 21 code 0078           start 4108ae40 |  via 4108ae40(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x21u, a2: (__int64)&v8, a3: a1, a4:; LENS cmd 0x21u, (__int64)&v8, a1, a2 | done 4108af24 -> v3 retry-fail->0x26u
++39 cmd 1b code 0070           start 4108b028 |  via 4108b028(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108b05c -> 39 retry-fail->0x27u
++40 cmd 1b code 0070           start 4108b108 |  via 4108b108(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v6, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v6, a1, a2 | done 4108b160 -> 40 retry-fail->0x28u
++41 cmd 1b code 0070           start 4108b20c |  via 4108b20c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v6, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v6, a1, a2 | done 4108b264 -> 41,42 retry-fail->0x29u
++42 cmd 1f code 0075           start 4108b364 |  via 4108b364(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Fu, a2: 0xA048435C8LL, a3: a1, a4; LENS cmd 0x1Fu, 0xA048435C8LL, a1, a2 | done 4108b3bc -> 43 retry-fail->0x2Au
++43 cmd 26 code 017e           start 4108b46c |  via 4108b46c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x26u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x26u, (__int64)&v3, a1, a2 | done 4108b498 -> 44 retry-fail->0x2Bu
++44 cmd 05 code 0016           start 4108b550 |  via 410810b4(a1: v4, a2: a1, a3: a2) -> LENS cmd a1: 5, a2: &v12, a3: a2, a4: a3 | done 41089d10 -> 21,3,30,45 retry-fail->0x1Du
++45 cmd 25 code 007e           start 4108b618 |  via 410852c0(a1, a2) -> LENS cmd a1: 0x25u, a2: (__int64)v6, a3: a1, a4:  | done 4108b698 -> 46 retry-fail->0x2Du
++46 cmd 03 code 0013           start 4108b718 |  | done 4108b71c -> v3 retry-fail->0x2Eu
++47 cmd 04 code 0015           start 4108b850 |  via 4108b850(unsigned int a1, __int64 a2) -> LENS cmd a1: 4u, a2: (__int64)&v3, a3: a1, a4: a2; LENS cmd 4u, (__int64)&v3, a1, a2 | done 4108b878 -> 3,47,48,80 retry-fail->0x2Fu
++48 cmd 20 code 0076           start 4108baa4 |  via 4108baa4(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x20u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x20u, (__int64)&v3, a1, a2 | done 4108bacc -> 3,49,v6 retry-fail->0x30u
++49 cmd 1b code 0070           start 4108bca8 |  via 4108bca8(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108bcdc -> 49,v3 retry-fail->0x31u
++50 cmd 23 code 0278           start 4108bdec |  via 4108bdec(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x23u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x23u, (__int64)&v3, a1, a2 | done 4108be18 -> 51 retry-fail->0x32u
++51 cmd 20 code 0076           start 4108be98 |  via 4108be98(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x20u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x20u, (__int64)&v3, a1, a2 | done 4108bec0 -> 3,51,v4 retry-fail->0x33u
++52 cmd 23 code 0278           start 4108c090 |  via 4108c090(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x23u, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x23u, (__int64)&v3, a1, a2 | done 4108c0b8 -> 47,v4 retry-fail->0x34u
++53 cmd 1b code 0070           start 4108c1ac |  via 4108c1ac(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v10, a3: a1, a4; LENS cmd 0x1Bu, (__int64)&v10, a1, a2 | done 4108c24c -> v4 retry-fail->0x35u
++54 cmd 1b code 0070           start 4108c2e0 |  via 4108c2e0(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v26, a3: a1, a4; LENS cmd 0x1Bu, (__int64)&v26, a1, a2 | done 4108c24c -> v4 retry-fail->0x35u
++55 cmd 1b code 0070           start 4108c4b0 |  via 4108c4b0(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108c4e4 -> v3,v5,v6 retry-fail->0x37u
++56 chk 4108a010 p 5c          start 4108c69c |  via 4108c69c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108c4e4 -> v3,v5,v6 retry-fail->0x37u
++57 cmd 1b code 0070           start 4108c6d0 |  via 4108c6d0(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v5, a3: a1, a4:; LENS cmd 0x1Bu, (__int64)&v5, a1, a2 | done 4108c724 -> 59,v3 retry-fail->0x39u
++58 cmd 1b code 0070           start 4108c884 |  via 4108c884(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v11, a3: a1, a4; LENS cmd 0x1Bu, (__int64)&v11, a1, a2 | done 4108c724 -> 59,v3 retry-fail->0x39u
++59 cmd 1b code 0070           start 4108c950 |  via 4108c950(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108c984 -> 59,60,v4 retry-fail->0x3Bu
++60 cmd 1b code 0070           start 4108cc08 |  via 4108cc08(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108cc3c -> 60,v4 retry-fail->0x3Cu
++61 cmd 1b code 0070           start 4108ce38 |  via 4108ce38(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108ce6c -> v3,v4,v5 retry-fail->0x3Du
++62 cmd 1b code 0070           start 4108d000 |  via 4108d000(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108ce6c -> v3,v4,v5 retry-fail->0x3Du
++63 cmd 1b code 0070           start 4108d034 |  via 4108d034(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v8, a3: a1, a4:; LENS cmd 0x1Bu, (__int64)&v8, a1, a2 | done 4108d0ac -> 63,v3,v4 retry-fail->0x3Fu
++64 cmd 1b code 0070           start 4108d258 |  via 4108d258(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108d28c -> 66,v3,v5 retry-fail->0x40u
++65 cmd 1b code 0070           start 4108d40c |  via 4108d40c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108d28c -> 66,v3,v5 retry-fail->0x40u
++66 cmd 1b code 0070           start 4108d440 |  via 4108d440(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v6, a3: a1, a4:; LENS cmd 0x1Bu, (__int64)&v6, a1, a2 | done 4108d494 -> 66,67,v4 retry-fail->0x42u
++67 cmd 1b code 0070           start 4108d618 |  via 4108d618(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v9, a3: a1, a4:; LENS cmd 0x1Bu, (__int64)&v9, a1, a2 | done 4108d6cc -> 67,v5,v6 retry-fail->0x43u
++68 cmd 1b code 0070           start 4108d868 |  via 4108d868(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108d89c -> 70,v3,v5 retry-fail->0x44u
++69 cmd 1b code 0070           start 4108da30 |  via 4108da30(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108d89c -> 70,v3,v5 retry-fail->0x44u
++70 cmd 1b code 0070           start 4108da64 |  via 4108da64(unsigned int a1, __int64 a2, l) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v10, a3: a1, a4; LENS cmd 0x1Bu, (__int64)&v10, a1, a2 | done 4108db10 -> 70,v3,v5 retry-fail->0x46u
++71 cmd 1b code 0070           start 4108dcb4 |  via 4108dcb4(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108dce8 -> v3,v4 retry-fail->0x47u
++72 cmd 1b code 0070           start 4108de38 |  via 4108de38(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108dce8 -> v3,v4 retry-fail->0x47u
++73 cmd 1b code 0070           start 4108de6c |  via 4108de6c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108dea0 -> 73,v3,v6 retry-fail->0x49u
++74 cmd 1b code 0070           start 4108e050 |  via 4108e050(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108e084 -> 74,75 retry-fail->0x4Au
++75 cmd 1b code 0070           start 4108e2e4 |  via 4108e2e4(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108e318 -> 3,75,76 retry-fail->0x4Bu
++76 chk 4108a010 p 5c          start 4108e448 |  via 4108e448(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v6, a3: a1, a4:; LENS cmd 0x1Bu, (__int64)&v6, a1, a2 | done 4108e4b4 -> 3,77,80 
++77 chk 4108a010 p 5c          start 4108e754 |  via 4108e754(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)&v3, a3: a1, a4:; LENS cmd 0x1Bu, (__int64)&v3, a1, a2 | done 4108e7ac -> 3,78 
++78 chk 4108a010 p 5c          start 4108e86c |  via 4108e86c(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108e8a0 -> 3,79 
++79 chk 4108a010 p 5c          start 4108e960 |  via 4108e960(unsigned int a1, __int64 a2) -> LENS cmd a1: 0x1Bu, a2: (__int64)v3, a3: a1, a4: ; LENS cmd 0x1Bu, (__int64)v3, a1, a2 | done 4108e994 -> 3,76 
++80 chk 41083c04 p 5b          start 4108ea54 |  | done 4108ea64 -> 3,81 retry-fail->0x50u
++81 chk 41083bf4 p 5b          start 4108eb40 |  | done 4108eb50 -> 3 retry-fail->0x51u
++82 chk 4108a010 p 5c          start 4108ebcc |  | done 0 ->  
+diff --git a/docs/mcu-ex/eg/eg-steps.txt b/docs/mcu-ex/eg/eg-steps.txt
+new file mode 100644
+index 0000000..9dd2650
+--- /dev/null
++++ b/docs/mcu-ex/eg/eg-steps.txt
+@@ -0,0 +1,156 @@
++  0 45535de0: start 41087b8c done 41087b9c check 41083c04 param 5b
++  1 45535e00: start 41087c80 done 41087c90 check 41083bf4 param 5b
++  2 45535e20: start 41087d20 done 41087d48 check 41083c24 param 5b
++  3 45535e40: start 41087dc8 done 41087e04 check 41083bf4 param 5b
++  4 45535e60: start 41087ec0 done 41087ecc check 41096a3c param 6
++  5 45535e80: start 41088050 done 4108805c check 41096a3c param 6
++  6 45535ea0: start 41088168 done 41088174 check 41096a3c param 0
++  7 45535ec0: start 4108826c done 41088298 check 41096a3c param 1
++  8 45535ee0: start 41088320 done 41088348 check 41096a3c param 15
++  9 45535f00: start 41088478 done 410884ac check 41096a3c param 19
++ 10 45535f20: start 4108852c done 41088530 check 41096a3c param 16
++ 11 45535f40: start 410885b0 done 410885bc check 41096a3c param 0
++ 12 45535f60: start 410887e4 done 41088810 check 41096a3c param 1
++ 13 45535f80: start 410888e4 done 41088940 check 41096a3c param 2
++ 14 45535fa0: start 41088af0 done 41088b00 check 41083c04 param 5b
++ 15 45535fc0: start 41088b94 done 41088be0 check 41096a3c param 3
++ 16 45535fe0: start 41088ce4 done 41088d30 check 41096a3c param e
++ 17 45536000: start 41088db0 done 41088dd8 check 41096a3c param 10
++ 18 45536020: start 41088ec0 done 41088ee8 check 41096a3c param f
++ 19 45536040: start 41088f68 done 41088f90 check 41096a3c param 11
++ 20 45536060: start 41089024 done 4108904c check 41096a3c param 4
++ 21 45536080: start 410893a4 done 410893f4 check 41083c14 param 4a
++ 22 455360a0: start 41089554 done 410895bc check 41096a3c param a
++ 23 455360c0: start 4108963c done 41089640 check 41096a3c param 7
++ 24 455360e0: start 41089704 done 4108972c check 41096a3c param 8
++ 25 45536100: start 410897f0 done 410898b4 check 41096a3c param 2c
++ 26 45536120: start 41089930 done 41089934 check 41096a3c param 7
++ 27 45536140: start 41089ac4 done 41089aec check 41096a3c param 14
++ 28 45536160: start 41089b6c done 41089b94 check 41096a3c param 12
++ 29 45536180: start 41089c14 done 41089d10 check 41096a3c param 5
++ 30 455361a0: start 41089f34 done 41089f94 check 4108a010 param 5c
++ 31 455361c0: start 4108a020 done 4108a048 check 41096a3c param 1e
++ 32 455361e0: start 4108a23c done 4108a24c check 41083c04 param 5b
++ 33 45536200: start 4108a354 done 4108a364 check 41096a3c param 1b
++ 34 45536220: start 4108a568 done 4108a5a4 check 41096a3c param 21
++ 35 45536240: start 4108a6f4 done 4108a728 check 41096a3c param 1b
++ 36 45536260: start 4108a92c done 4108a9e8 check 41096a3c param 1b
++ 37 45536280: start 4108ab8c done 4108ac24 check 41096a3c param 1b
++ 38 455362a0: start 4108ae40 done 4108af24 check 41096a3c param 21
++ 39 455362c0: start 4108b028 done 4108b05c check 41096a3c param 1b
++ 40 455362e0: start 4108b108 done 4108b160 check 41096a3c param 1b
++ 41 45536300: start 4108b20c done 4108b264 check 41096a3c param 1b
++ 42 45536320: start 4108b364 done 4108b3bc check 41096a3c param 1f
++ 43 45536340: start 4108b46c done 4108b498 check 41096a3c param 26
++ 44 45536360: start 4108b550 done 41089d10 check 41096a3c param 5
++ 45 45536380: start 4108b618 done 4108b698 check 41096a3c param 25
++ 46 455363a0: start 4108b718 done 4108b71c check 41096a3c param 3
++ 47 455363c0: start 4108b850 done 4108b878 check 41096a3c param 4
++ 48 455363e0: start 4108baa4 done 4108bacc check 41096a3c param 20
++ 49 45536400: start 4108bca8 done 4108bcdc check 41096a3c param 1b
++ 50 45536420: start 4108bdec done 4108be18 check 41096a3c param 23
++ 51 45536440: start 4108be98 done 4108bec0 check 41096a3c param 20
++ 52 45536460: start 4108c090 done 4108c0b8 check 41096a3c param 23
++ 53 45536480: start 4108c1ac done 4108c24c check 41096a3c param 1b
++ 54 455364a0: start 4108c2e0 done 4108c24c check 41096a3c param 1b
++ 55 455364c0: start 4108c4b0 done 4108c4e4 check 41096a3c param 1b
++ 56 455364e0: start 4108c69c done 4108c4e4 check 4108a010 param 5c
++ 57 45536500: start 4108c6d0 done 4108c724 check 41096a3c param 1b
++ 58 45536520: start 4108c884 done 4108c724 check 41096a3c param 1b
++ 59 45536540: start 4108c950 done 4108c984 check 41096a3c param 1b
++ 60 45536560: start 4108cc08 done 4108cc3c check 41096a3c param 1b
++ 61 45536580: start 4108ce38 done 4108ce6c check 41096a3c param 1b
++ 62 455365a0: start 4108d000 done 4108ce6c check 41096a3c param 1b
++ 63 455365c0: start 4108d034 done 4108d0ac check 41096a3c param 1b
++ 64 455365e0: start 4108d258 done 4108d28c check 41096a3c param 1b
++ 65 45536600: start 4108d40c done 4108d28c check 41096a3c param 1b
++ 66 45536620: start 4108d440 done 4108d494 check 41096a3c param 1b
++ 67 45536640: start 4108d618 done 4108d6cc check 41096a3c param 1b
++ 68 45536660: start 4108d868 done 4108d89c check 41096a3c param 1b
++ 69 45536680: start 4108da30 done 4108d89c check 41096a3c param 1b
++ 70 455366a0: start 4108da64 done 4108db10 check 41096a3c param 1b
++ 71 455366c0: start 4108dcb4 done 4108dce8 check 41096a3c param 1b
++ 72 455366e0: start 4108de38 done 4108dce8 check 41096a3c param 1b
++ 73 45536700: start 4108de6c done 4108dea0 check 41096a3c param 1b
++ 74 45536720: start 4108e050 done 4108e084 check 41096a3c param 1b
++ 75 45536740: start 4108e2e4 done 4108e318 check 41096a3c param 1b
++ 76 45536760: start 4108e448 done 4108e4b4 check 4108a010 param 5c
++ 77 45536780: start 4108e754 done 4108e7ac check 4108a010 param 5c
++ 78 455367a0: start 4108e86c done 4108e8a0 check 4108a010 param 5c
++ 79 455367c0: start 4108e960 done 4108e994 check 4108a010 param 5c
++ 80 455367e0: start 4108ea54 done 4108ea64 check 41083c04 param 5b
++ 81 45536800: start 4108eb40 done 4108eb50 check 41083bf4 param 5b
++ 82 45536820: start 4108ebcc done 0 check 4108a010 param 5c
++ 83 45536840: start 4108f6ac done 4108f6d4 check 41083c24 param 5b
++ 84 45536860: start 4108f760 done 4108f7e0 check 41096a3c param 1b
++ 85 45536880: start 4108f920 done 4108f954 check 41096a3c param 1b
++ 86 455368a0: start 4108fae0 done 4108fb54 check 41096a3c param 1b
++ 87 455368c0: start 4108fc88 done 4108fcbc check 41096a3c param 1b
++ 88 455368e0: start 4108fe24 done 4108fe60 check 41096a3c param 1b
++ 89 45536900: start 4108ffcc done 41090000 check 41096a3c param 1b
++ 90 45536920: start 41090168 done 410901ec check 41096a3c param 1b
++ 91 45536940: start 410902ec done 4109032c check 41096a3c param 23
++ 92 45536960: start 41090410 done 4109047c check 41096a3c param 5
++ 93 45536980: start 4109057c done 410905dc check 4108a010 param 5c
++ 94 455369a0: start 41090694 done 41090698 check 4108a010 param 5c
++ 95 455369c0: start 410907e8 done 410907ec check 41096a3c param 17
++ 96 455369e0: start 410908a4 done 410908cc check 41096a3c param 18
++ 97 45536a00: start 41090bdc done 41090be0 check 41096a3c param 7
++ 98 45536a20: start 41090ea0 done 41090eb0 check 41083c04 param 5b
++ 99 45536a40: start 41091040 done 41091044 check 41096a3c param 7
++100 45536a60: start 410910c8 done 4109111c check 41096a3c param 24
++101 45536a80: start 41091218 done 4109111c check 41096a3c param 19
++102 45536aa0: start 41091224 done 41091234 check 41083bf4 param 5b
++103 45536ac0: start 410912dc done 410912ec check 41083bf4 param 5b
++104 45536ae0: start 410913fc done 41091420 check 41083c24 param 5b
++105 45536b00: start 410914a0 done 410914c8 check 41096a3c param 23
++106 45536b20: start 41091550 done 41091588 check 41096a3c param 1f
++107 45536b40: start 41091638 done 41091668 check 41096a3c param 3
++108 45536b60: start 41091720 done 4109175c check 41096a3c param 21
++109 45536b80: start 410917dc done 41091804 check 41096a3c param 4
++110 45536ba0: start 41091970 done 41091994 check 41083c24 param 5b
++111 45536bc0: start 41091a14 done 41091a24 check 41083c04 param 5b
++112 45536be0: start 41091af8 done 41091b08 check 41083bf4 param 5b
++113 45536c00: start 41091c00 done 0 check 4108a010 param 5c
++114 45536c20: start 41092a64 done 41092ae0 check 41096a3c param 5
++115 45536c40: start 41092b58 done 41092b68 check 41083c04 param 5b
++116 45536c60: start 41092bf0 done 41092c00 check 41083bf4 param 5b
++117 45536c80: start 41092cdc done 0 check 4108a010 param 5c
++118 45536ca0: start 41092d40 done 41092e18 check 41096a3c param 5
++119 45536cc0: start 41092e90 done 41092ea0 check 41083c04 param 5b
++120 45536ce0: start 41092f28 done 41092f38 check 41083bf4 param 5b
++121 45536d00: start 41093014 done 0 check 4108a010 param 5c
++122 45536d20: start 41093078 done 41081174 check 41096a3c param 5
++123 45536d40: start 410930dc done 4109311c check 41096a3c param 1b
++124 45536d60: start 41093268 done 410932e8 check 41096a3c param 1b
++125 45536d80: start 410933a8 done 410933dc check 41096a3c param 1b
++126 45536da0: start 41093550 done 410935c4 check 41096a3c param 1b
++127 45536dc0: start 41093684 done 410936b8 check 41096a3c param 1b
++128 45536de0: start 41093838 done 4109389c check 41096a3c param 1b
++129 45536e00: start 41093960 done 41093990 check 41083bf4 param 5b
++130 45536e20: start 41093a18 done 41093a1c check 41096a3c param 17
++131 45536e40: start 41093ad4 done 41093afc check 41096a3c param 18
++132 45536e60: start 41093c50 done 41093c78 check 41096a3c param 54
++133 45536e80: start 41093cf8 done 41093d20 check 41096a3c param 55
++134 45536ea0: start 41093da0 done 41093dc8 check 41096a3c param 56
++135 45536ec0: start 41093e48 done 41093e4c check 41096a3c param 57
++136 45536ee0: start 41093f04 done 410815f0 check 41096a3c param 59
++137 45536f00: start 41093f2c done 41093f54 check 41096a3c param 58
++138 45536f20: start 41094010 done 41094050 check 410940ec param 5b
++139 45536f40: start 410940fc done 41094180 check 410940ec param 5b
++140 45536f60: start 41094208 done 4109423c check 410940ec param 5b
++141 45536f80: start 41094400 done 41094434 check 410940ec param 5b
++142 45536fa0: start 410944c4 done 410944d4 check 410940ec param 5b
++143 45536fc0: start 410945a4 done 410945b4 check 41083c04 param 5b
++144 45536fe0: start 4109463c done 4109464c check 41083bf4 param 5b
++145 45537000: start 410946d4 done 410946e4 check 4108a010 param 5c
++146 45537020: start 4109475c done 4109476c check 4108a010 param 5c
++147 45537040: start 410947dc done 0 check 4108a010 param 5c
++148 45537060: start 41094898 done 410948bc check 41096a3c param 46
++149 45537080: start 4109493c done 4109498c check 41096a3c param 42
++150 455370a0: start 41094a0c done 0 check 4108a010 param 5c
++151 455370c0: start 41094b1c done 0 check 4108a010 param 5c
++152 455370e0: start 41094c28 done 41094c38 check 41083c04 param 5b
++153 45537100: start 41094cc0 done 41094cd0 check 41083bf4 param 5b
++154 45537120: start 41094dac done 0 check 4108a010 param 5c
++end 0x45537140
+diff --git a/docs/mcu-ex/lens.md b/docs/mcu-ex/lens.md
+new file mode 100644
+index 0000000..fe0b41f
+--- /dev/null
++++ b/docs/mcu-ex/lens.md
+@@ -0,0 +1,426 @@
++# 镜头：机身 MCU（ex2010）这一侧
++
++对象：`ex2010_0200a0.bi`（"Z6_3 Firmware Ex" 02.00.a0，sha256 41149887…ee56），
++STM32F469，µT-Kernel。地址都是这个镜像的，Thumb 函数写偶地址。函数和变量名
++在 `z63-tools/mcu-ex/names.json`，用 `apply_names.py` 打进 IDA 库
++（`~/LiBr/nikon/idb/mcu-re`，idasql 8089）。
++
++"已验证"= 在 QEMU 里跑原版 MCU 镜像看到的；"推断"= 只有代码依据，
++没有机身测量。
++
++## 1. 结论
++
++- **和镜头交换数据的不是 MCU。** MCU 的镜头代码不调用任何 SPI/UART，只有
++  GPIO、EXTI 和一个定时器。MCU 给镜头上电之后，EXPEED 用自己的链路和镜头通信：
++  串口实例 3，8 MHz 全双工；pin 58 唤醒镜头，pin 41 收镜头的"就绪"（见 §10）。
++- MCU 负责四件事：
++  1. 镜头**检测**（PG0，低有效，带去抖）；
++  2. 两条**供电通路** A（PB0）/ B（PA9）的切换，A↔B 之间先通后断；
++  3. 两根由 EXPEED 直接设定的线：PF12，以及 PG4 上升沿锁存；
++  4. 按相机模式和镜头在位情况控制 PD15。
++- MCU 和 EXPEED 之间用 provider 13 通信：
++  - EXPEED → MCU：请求 kind 1..5；
++  - MCU → EXPEED：应答 0x81..0x85；
++  - MCU → EXPEED：主动上报 0x91（在位变化）和 0x96（开机自动上电结果，每次上电只发一次）。
++
++## 2. 接线（L0）
++
++逻辑引脚 id 经 `pin_res` 0x08046ED4 → ROM 表 0x0805639A → 资源对象（0x2000EDAC[]），
++GPIO 的 id 就是 16×端口+位。`lenshw_init` 0x08035620 取下面这些：
++
++| 逻辑 id | 引脚 | 方向 / 配置（运行时读出） | 用途 | 置位函数 |
++|---|---|---|---|---|
++| 16 | PB0 | 推挽输出，初值 0 | 供电通路 A | `lenshw_set_a` 0x08035850 |
++| 9 | PA9 | 推挽输出，初值 0 | 供电通路 B | `lenshw_set_b` 0x0803586C |
++| 92 | PF12 | 推挽输出，初值 0 | EXPEED 用 kind 2/3 直接设的线 | `lenshw_set_pf12` 0x08035888 |
++| 96 | PG0 | 输入，无内部上下拉；EXTI0 双沿 | **镜头检测，低 = 在位** | `lenshw_detect_read` 0x08035600 |
++| 63 | PD15 | 推挽输出，初值 1 | 低 = 使能（随模式和在位情况） | `lenshw_set_pd15` 0x08036AFC |
++| 100 | PG4 | 输入，无内部上下拉；EXTI4 上升沿 | 一次性锁存，kind 4 布防，kind 5 读出 | `lenshw_pg4_irq` 0x080357A0 |
++| 定时器 13 | TIM12 CH1 | 输出比较中断（IRQ 43） | 单次定时，预分频 499 → 5.56 µs/格（90 MHz 定时器时钟） | `lenshw_tim_oneshot` 0x080358A4 |
++
++中断槽：`irq_slot`（ROM 表 0x08056868）→ 1 号给 PG0（槽 6 = EXTI0），45 号给 TIM12
++（槽 70 → IRQ 43），6 号给 PG4（槽 10 = EXTI4）。
++
++PG0 没开内部上拉，所以板子上应该有外部上拉，镜头装上时接地（推断）。QEMU 里悬空
++输入读 0，**模型默认就是"装着镜头"**：要模拟没装镜头得加 `mcu-pins=D13=1,,G0=1`。
++
++A/B 到底是什么还没定论（§9）。从代码能看出的只有：两者正常互斥；在 A、B 之间切换时
++先接通新的一路，等 10 个内核 tick（alarm LnPrtAlC，推断是 10 ms）再断开旧的一路；
++EXPEED 的命令里，模式 2 = A，模式 1 = B。
++
++## 3. 两个任务
++
++| 任务 | 创建 | 处理函数 | 事件掩码 | 对象 |
++|---|---|---|---|---|
++| LnMng（上层：provider 13、状态上报） | `lnmng_task_create` 0x080359E8 | `lnmng_task` 0x08035B80 | 0x7FFDF | 信号量 LnMngSem（发送锁）、LnMngOpe |
++| LnPrt（下层：引脚、检测、供电状态机） | `lnprt_task_create` 0x08036770 | `lnprt_task` 0x08036930 | 0x3FFD | alarm LnPrtAlC（通路重叠）、LnPrtAlR（检测超时） |
++
++两个任务都是 `mod_create`：事件标志 + 任务，任务循环里等任意一位，再调用处理函数。
++LnPrt 往上报事件用 `lnprt_report` 0x08036910 和 `lnprt_report_det` 0x08036920，
++它们调回 LnMng 注册的两个回调：`lnmng_on_lnprt_event` 0x08035CD0 和
++`lnmng_on_lnprt_det` 0x08035D50。
++
++| 事件码 | 含义 | LnMng 的反应 |
++|---|---|---|
++| 0x02060001 | 模式命令完成（status 0 成功 / 1 模式非法） | 发 0x81 |
++| 0x02060002 | PF12 命令完成 | 发 0x82 |
++| 0x02060003 | 检测已停止 | 回调 McuCm（0x040A0001 → `mcucm_on_lens_stopped`） |
++| 0x02060004 | kind 3 直设完成 | 发 0x83 |
++| 0x02060005 | PG4 锁存命令完成 | 发 0x84 |
++| 0x02060006 | 查询结果 | 发 0x85 |
++| 0x02060007 | 模式 3（开机自动上电）完成 | 发 0x96（每次上电只发一次） |
++| 0x02060065 | 检测结果：status 1 = 在位，0 = 不在位 | 记入 `lens_attached` 0x2000E7F8 → `lnmng_on_attach_change` |
++| 0x02060066 | PG4 上升沿到了 | 记锁存，在 0x85 的 [13] 里报 |
++
++两个模块挂在模块表 0x2000D000 上（每项是一个返回 ops 表 {create, init, start, stop} 的 getter）：
++
++| 模块 | 表中位置 | 启动 walker（调 ops[2]） | 停止 walker（逆序调 ops[3]） |
++|---|---|---|---|
++| LnMng | 第 16 项，10..20 组 | 0x08048ADC | 0x08048A64 |
++| LnPrt | 第 25 项，25..32 组 | 0x08048BC8 | 0x08048B50（ops[3] = `lnprt_shutdown` 0x08036214） |
++
++`lnprt_shutdown` 只关检测和 TIM12，不动 PB0、PA9、PD15。
++
++另：RW 数据在 ROM 里是压缩存放的（ARM 的 RW 压缩，表在 0x0805B6xx 一带），所以在 ROM 里
++直接找初值找不到；本文用到的 RAM 表都是从运行中的 MCU 读出来的（`m4mem.py`）。
++
++## 4. 供电通路状态机（6 状态 × 10 选择子）
++
++`lnpwr_dispatch` 0x080367DC 查 ROM 表 0x080578F0。状态存在 `lens_pwr_state` 0x20019354：
++0 = 冷态，1 = 只开 A，2 = 只开 B，3 = 全关，4 = 重叠过渡中，5 = A、B 都开。
++
++选择子的来源：
++
++| 选择子 | 来源 |
++|---|---|
++| 0 / 1 / 2 / 9 | kind 1 的模式 2 / 1 / 0 / 3（`lnprt_cmd_mode` 0x08036B08）。模式超出 0..3 时报 0x02060001 status 1 |
++| 3 | alarm C 到期，重叠过渡结束 |
++| 4 | 冷启动（`lnprt_reset(1)`） |
++| 5 / 6 / 7 / 8 | kind 3 的 (a, b) = (1,0) / (0,1) / (0,0) / (1,1)（`lnprt_do_lines` 0x08036590） |
++
++按当前状态分别处理（"报"= 发 0x02060001；kind 3 的单元格自己不报，由 `lnprt_do_lines` 统一报 0x02060004）：
++
++| 当前状态 | 模式 2（A） | 模式 1（B） | 模式 0（全关） | 模式 3 | kind 3 直设 |
++|---|---|---|---|---|---|
++| 1（A） | 已是 A，报 | 开 B，等 10，关 A → 2，报 | 关 A → 3，报 | 无动作，**不报** | 按 (a,b) 设引脚 |
++| 2（B） | 开 A，等 10，关 B → 1，报 | 已是 B，报 | 关 B → 3，报 | 同模式 2，但最后报 0x02060007 | 同上 |
++| 3（全关） | 开 A → 1，报 | 开 B → 2，报 | 报 | 开 A → 1，报 0x02060007 | 同上 |
++| 5（A+B） | 关 B → 1，报 | 关 A → 2，报 | 全关 → 3，报 | 无动作 | 同上 |
++| 4（过渡中） | 忽略，只等 alarm C 来结束（`lnpwr_s4_overlap_end` 0x08036480） | | | | |
++| 0（冷态） | 只认选择子 4 → 3 | | | | |
++
++模式 3 就是 MCU 开机时**自己**用的那条路（§6）。EXPEED 如果发模式 3，只会拿到 0x96
++而拿不到 0x81。所以推断 EXPEED 不会用模式 3。
++
++## 5. 检测状态机（3 状态 × 7 事件）
++
++`lndet_dispatch` 0x080367FC 查 ROM 表 0x080579E0。状态存在 `lens_det_state` 0x20019359：
++0 = 空闲，1 = 已布防，2 = 去抖中。
++
++- **启动**（事件 1，`lnprt_detect_start`）：先采样一次 PG0，进入状态 1。
++- **PG0 有边沿**（EXTI0 → `lndet_pg0_isr`），或者刚启动：进入状态 2。
++  - 开 alarm R，作为超时；
++  - 用 TIM12 每隔"采样间隔"采一次 PG0（`lndet_tim_isr`）。
++- **连续 4 次采到同一电平**（`lndet_s2_sample` 0x080366C8）：
++  - 记下结果（1 = 在位，2 = 不在位），报 0x02060065；
++  - 回到状态 1，重新打开 PG0 双沿中断。
++- **超时**（alarm R 先到，`lndet_s2_timeout`）：结果记 2，报 0x02060065 status 0。
++- **停止**（事件 0x100，`lndet_stop`）：关中断，关定时器，回到状态 0。
++
++时序参数是 `lnmng_load_params` 0x08035A48 从参数记录 4（"LENS"，0x40 字节）里读的：
++
++| 字段 | 本次运行的值 | 用法 | 折算 |
++|---|---|---|---|
++| +24（采样间隔） | 5 | ×100 个 TIM12 格 | 2.78 ms |
++| +32（超时） | 30 | ×100 个内核 tick | 推断 3 s |
++
++记录为空时用代码里的默认值，同样是 5 / 30。记录本身在 flash 0x08008210（包里的镜像这里是全 0）。
++参数块在 MCU 记录表 `param_records` 0x2000E890 里，flash 位置在 0x08008000 那一块之内；
++推断它是 EXPEED 开机时经 provider 15 下发的（本次见到 family 15 kind 15，4328 字节），
++所以真机的值属于机身自己的调整数据。
++
++## 6. provider 13 报文
++
++provider 表在 RAM 0x2000D098，每行 8 字节 {绑定(发送函数, 通道), 接收函数}。
++第 13 行是 {`lnmng_bind` 0x08035A38, `lnmng_rx` 0x08035D80}。帧走 route 2（日志里的 "route 2"）。
++
++**EXPEED → MCU**：16 字节（kind 5 为 12 字节）；[0] = kind，[4] = 序号，[9] = 1（目前见到的都是 1），参数从 [12] 开始。
++
++| kind | 参数 | MCU 侧动作 | 应答 |
++|---|---|---|---|
++| 1 | [12] 模式 0..3 | §4 | 0x81 |
++| 2 | [12] PF12 = 0/1，其他值报错 | 设 PF12 | 0x82 |
++| 3 | [12] a，[13] b，[14] PF12 | 直接设 A/B 组合，再设 PF12 | 0x83 |
++| 4 | [12] 0 = 清除结果并布防 PG4 上升沿锁存；1 = 撤防 | | 0x84 |
++| 5 | 无 | 查询 | 0x85 |
++
++**MCU → EXPEED**：
++
++| kind | 长度 | 内容 |
++|---|---|---|
++| 0x81..0x84 | 12 | [4] 回填序号，[5] = 0x80 表示失败 |
++| 0x85 | 16 | [4] 序号，[5] 0x80 = 失败，[9] = 2，[12] 检测结果（0 无 / 1 在位 / 2 不在位或超时），[13] PG4 是否锁存到（读后清零） |
++| 0x91 | 16 | 主动上报在位：[4] = 1，[9] = 1，[12] = 0/1；检测出错时 [5] = 0x80、[12] = 0xFF |
++| 0x96 | 16 | 开机自动上电的结果：[4] = 1，[9] = 1，[12] = 1 已上电 / 0 没装镜头，[5] = 0x80 失败；**每次 MCU 上电只发一次**（`lnmng_96_sent` 0x20013DE8） |
++
++链路建立之前（`lnmng_link_up` 0x08035B38 之前），0x91/0x96 先压着，链路一通再补发。
++
++## 7. 相机模式 → PD15
++
++EXPEED 用 family 1 kind 8 下发相机模式（[4] = 0..12）。`mcucm_apply_mode` 0x08037C18
++按 ROM 表 0x08056B23 换算成镜头类别：
++
++| 模式 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
++|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
++| 类别 | 0 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 8 | 3 | 4 |
++
++另外 `mcucm_mode_special` 0x08037CFC 会直接设类别 9。
++
++`lnmng_apply_pd15` 0x080359BE 的规则：**镜头在位且类别属于 {2, 4, 7, 8, 9} 时 PD15 拉低**，
++其他情况都是高。
++
++- 本次运行开机是模式 9，所以有镜头时 PD15 为低。
++- 待机时 EXPEED 先发模式 8（PD15 仍低），再发模式 6（PD15 变高）。
++- 镜头拔掉时，MCU 自己会把 PD15 拉高。
++
++`lnmng_power_down`（事件 0x80，从 `mcucm_mode_down` 0x08037CA4 来）做三件事：
++
++1. PD15 拉高；
++2. 停止检测；
++3. 回调 0x040A0001 通知 McuCm。
++
++PD15 到底接到哪里还没定（§9）。
++
++## 8. 过程（QEMU 验证）
++
++运行脚本在 `z63-tools/mcu-ex/`（`run.sh`、`hotplug.sh`、`m4mem.py`，exapfs 上
++`/Volumes/ExAPFS/z63-run/claude/lens/`）。运行时用 `qom-set /machine mcu-pins G0=0|1` 装上/拔下镜头
++（nikon-z63.c 本次改动：mcu-pins 现在可以在运行时设置）。
++
++**开机，悬空（相当于装着镜头）**：
++1. MCU 去抖通过后，自己发模式 3（开 A），先报 0x91 [12]=1，再报 0x96 [12]=1。
++2. EXPEED 随后循环：kind 2 PF12=0 → kind 1 模式 0 → kind 1 模式 2 → kind 2 PF12=0 → 模式 0 → 模式 2 ……（序号 3, 4, 6, 9, 0x0a, 0x0c, 0x0f, 0x15）。
++   这像是 EXPEED 在反复上电、尝试和镜头通信、得不到应答再断电（推断，见 EXPEED 侧）。
++
++**开机，G0=1（没装镜头）**：
++1. MCU 报 0x91 [12]=0、0x96 [12]=0。
++2. EXPEED 只发一次 PF12=0 和模式 0，之后不再给镜头上电。
++
++**运行中装上（G0=0）**：
++1. MCU 报 0x91 [12]=1，不再报 0x96（开机已经报过）。
++2. EXPEED 发：模式 2 → PF12=0 → 模式 0 → 模式 2 → PF12=0 → PF12=0，然后停下。
++
++**运行中拔下（G0=1）**：
++1. MCU 只报 0x91 [12]=0，PB0 保持原样。
++2. 15 秒内 EXPEED 没有发模式 0。
++
++**再装上**：
++1. MCU 报 0x91 [12]=1。
++2. 20 秒内 EXPEED 没有反应。EXPEED 那边的状态机停在哪里，见 EXPEED 侧。
++
++## 9. 还没定的
++
++- A（PB0）/ B（PA9）是哪两路电。从 EXPEED 的用法看（§10.5）：
++  - A = 连接序列在第一次握手前打开的那一路，即"通信供电"；
++  - B 只在另一条序列（0x41091224）里用，推断是另一种供电档位；
++  - PF12 只在识别成功后才置 1，推断是"第二路电源 / 全功率使能"。
++  这些都没有字符串直接命名，都是推断。PD15、PG4 的接线也还没定。
++- 内核 tick 的单位（推断 1 ms），会影响 10 ms 重叠和 3 s 超时这两个数。
++- kind 3/4/5 这次的运行里都没出现，什么时候用要看 EXPEED 侧。
++
++## 10. EXPEED 侧（镜头链路、握手、连接序列）
++
++明细（英文，带地址）见 `docs/mcu-ex/eg/eg-lens.md`，同目录还有三份表：
++- `eg-lenscmd.txt`：92 条命令和 0x70 下的 64 条子命令；
++- `eg-steps.txt`：155 条步骤记录；
++- `eg-seq.txt`：Z 镜头连接序列的第 0–82 步。
++
++脚本在 `z63-tools/mcu-ex/`（`egmem.py`、`steps.py`、`findq.py`、`egread.py`）。
++EXPEED 镜像是共享库（8084），只读，没有改动。
++
++### 10.1 分层
++
++```
++EXPEED 镜头服务（连接序列引擎 0x4107d730，步骤表 RAM 0xA02B44DE0）
++ ├─ MCU 控制模块 0x41182064..0x41185300 ── provider 13 ── MCU LnMng/LnPrt（§2–§6）
++ │    kind 1..5 → 0x81..0x85；0x91 → 事件 0x03070001；0x96 → 0x03070010
++ └─ 镜头链路任务 0x4117a310（初始化 0x4117ad38）── 串口实例 3 + 4 根 GPIO ── 镜头
++```
++
++- provider 13 在 EXPEED 上：行 0x441b60d8；注册 0x411832d0，接收 0x411832fc；
++  编解码对象 0x4100fcb8（编码 0x4100fea4..，解码 0x41010130..0x410103e8）。
++  请求的 [8..9] = 0x0100，也就是 MCU 侧看到的 [9]=1。
++- 每个请求等应答 100 tick；应答以事件 0x03070020|n 交给调用方。
++- **0x91 是 EXPEED 发起连接或断开的唯一触发**（`0x41062a58`）。
++
++### 10.2 镜头链路的硬件（运行中读出确认）
++
++| 东西 | 位置 | 用途 |
++|---|---|---|
++| 串口实例 3 | 0x0e700000 起 12 个控制器之一 | 镜头数据，**8 MHz**（配置 RAM 0xA02AFF508：+24 = 8 000 000 Hz，80 MHz/(2×5)） |
++| pin 41 | 端口 3 位 10，中断输入，ISR 0x4117b338 | 镜头 → 机身"就绪" |
++| pin 58 | 端口 4 位 11，输出 | 机身 → 镜头"唤醒/请求" |
++| pin 59 / 60 | 端口 4 位 12 / 13，初始化时置 1 | 推断是线路使能 |
++
++（引脚句柄 0xA02C29000[id] = {id, 端口, 位}，在 QEMU 运行中读出。）
++
++**唤醒握手**（0x4117b210）：
++1. 拉 pin 58；
++2. 最多等 200 tick，等 pin 41 的中断；
++3. 等不到就报错（0x41083e20）。
++
++**不开 `lens=on` 时 QEMU 卡在这一步**：没有镜头来拉 pin 41，所以连接序列第 4 步失败，EXPEED 断电重试，
++这就是 §8 里看到的循环（开了之后见 §11）。重新装上后没反应，推断是重试次数用完、序列以错误码 3 收尾，
++而 EXPEED 的镜头状态没有因为 0x91 再次变化（未查证）。
++
++### 10.3 帧格式
++
++每次传输由两部分组成：
++1. 8 字节命令头（0x4117b950 生成，已核对）；
++2. 数据块（0xA04CE5780）：首字节 0x55，然后是载荷，最后一字节让整块和为 0。
++
++命令头布局：
++
++```
++[0] 0x55
++[1] 链路序号（0xA04CE3700，每帧加 1）
++[2] 类别 1 或 2（请求 +0x20；2 = 0xA04851D8A 非 0 时，推断是速度/阶段）
++[3] 命令码低字节   [4] 命令码高字节（子命令）
++[5..6] 载荷长度，u16，以 16 位字为单位 = (发送长度 − 2)/2
++[7] 校验 = −(Σ[0..6]) mod 256
++```
++
++- 每条命令的发送长度和接收长度相同：机身发出 N 字节的同时收回 N 字节（全双工）。
++- 传输完成最多等 5010 tick；失败码记在 0xA04CE376C（1/3 = 启动失败，6 = 驱动错误，9 = 状态不对）。
++- 重试次数和间隔来自每条命令的记录（+44），例如 0x0a04 = 10 次，每次间隔 4 tick。
++
++### 10.4 命令字典
++
++RAM 0xA02B4B350 起，每条 48 字节：
++{u16 码, u16 发送长度, u16 接收长度, 传输类型, 是否两阶段, builder, parser, {等待, 重试}}。
++
++握手头几条：
++
++| 码 | 长度 | builder / parser | 内容（目前能确定的） |
++|---|---|---|---|
++| 0x1F | 4 | 0x4109892c / 0x4109adac | 机身发 1 字节（第一次 1，第二次 2）；镜头回 2 字节 → 字段 36、37 |
++| 0x10 | 28 | 0x41098744 / 0x4109a914 | 机身发 5 字节参数；镜头回 26 字节，写进缓冲区 1（镜头类别 2 时写缓冲区 11）；第 13 字节 = 字段 92 |
++| 0x11 | 74 | — / 0x4109aadc | 识别信息 |
++| 0x12 | 66 | 0x41098770 / 0x4109ab60 | 识别信息 |
++| 0x13 / 0x15 / 0x16 | 14 / 6 / 4 | 见表 | |
++| 0x24 / 0x224 | 7426 | | 大块数据（两阶段传输） |
++| 0x1024 / 0x1224 | 3468 | | 大块数据 |
++| 0x70 | 14 | 子命令表 0xA02B4C430 | 64 条子命令，例如 0x3070 收 7816 字节 |
++
++### 10.5 Z 镜头连接序列（第 0–82 步）
++
++**上电和握手**：
++1. 第 0 步：kind 2 PF12=0。
++2. 第 1 步：kind 1 模式 0（全关）。
++3. 第 3 步：kind 1 模式 2，**镜头通信供电，即 MCU 的 PB0**。
++4. 第 4 步：唤醒握手，然后发 0x1F（参数 1），按应答分支：
++   - 字段 36 == 0 → 跳到第 11 步；
++   - 否则，若 (字段 56 & 0xFE) == 0 且字段 37 ≠ 0 → 第 5 步；
++   - 否则 → 错误码 3，转第 80 步（断电）。
++5. 第 5 步：发 0x1F（参数 2）。字段 36 == 0 且字段 37 ≠ 0 → 第 6 步，否则 → 第 80 步。
++   推断 0x1F 是"协议/模式协商"：参数 1 询问，参数 2 要求切换。
++6. 第 6 步起：0x10 → 0x11，期间可能插入 0x30 / 0x52 / 0x31。第 6 步中，字段 92 ≠ 0 → 第 80 步。
++7. 第 11–13 步：0x10 → 0x11 → 0x12，读识别信息。
++8. **第 14 步：kind 2 PF12=1，只在识别成功之后才置位。**
++9. 第 15–79 步：0x13、0x24/0x1024/0x224/0x1224、0x15、0x21、0x20、0x16……然后是大量 0x70 子命令。
++10. 第 80 步：PF12=0；第 81 步：模式 0。都属于断电收尾。
++
++kind 1 模式 1（MCU 的 PA9，通路 B）只在另一条序列里用（0x41091224，步骤记录 102）。
++kind 4/5（PG4 锁存）在镜头检测逻辑旁边用（0x4107e8a8 布防，0x4107e99c 查询）。
++
++### 10.6 上层：Sysc 和状态库
++
++**Sysc 控制器**（表 0x4408a4b0）：5 = Lens，6 = MlLens（Z 镜头），7 = FLens（F 镜头，经 FTZ）。
++
++**命令号**：
++- 0x2f / 0x30：MlLensConnect / MlLensDisconnect
++- 0x31 / 0x32：FLensConnect / FLensDisconnect
++- 0x33：LensConnectCheckComplete
++- 0x34 / 0x35：MlLensConnectStartupComplete / MlLensConnectComplete
++- 0x36 / 0x37：MlLensDisconnectComplete / MlLensDisconnectShutdownComplete
++- 0x38–0x3a：F 镜头对应的几个 Complete
++
++镜头服务用事件 0x04080005..0x0408000c 驱动这些控制器；哪一步发哪个事件还没追。
++
++**状态库**：发布函数 0x4106b568 写这些项：
++
++| 项 | 含义 |
++|---|---|
++| 0x2C04 | 已接镜头 |
++| 0x2C01 | 焦距 |
++| 0x2C00 | 对焦距离 |
++| 0x2C29 / 0x2C2A | 最短 / 最长焦距 |
++| 0x2C19 | 镜头名 |
++| 0x2C1A | 转接环名 |
++
++对 Z 镜头（类别 1）：焦距和对焦距离在缓冲区 4 的 +0x0d / 0x0e / 0x10 / 0x14 / 0x15，镜头名在缓冲区 7 的 +5（64 字节）。
++字段描述表在 RAM 0xA02B4D210，每条 40 字节。
++
++### 10.7 还没做的（镜头部分的下一步）
++
++1. 逐条读 builder/parser，把 0x10/0x11/0x12/0x13 和 0x70 子命令的字段排布写成表；
++   字段名只能从使用方反推。§11 的 `lensfields.py` 已经能回答"某个字段是哪条应答的哪个字节"。
++2. 哪一步发 Sysc 事件 0x04080005..0c。
++3. 镜头自报名称（0x4470）和镜头身份缓存（第 34/36 步）那条路径，见 §11.4。
++
++## 11. QEMU 里的镜头端（`-machine lens=on`）
++
++`hw/arm/nikon-z63-lens.h`：一个合成的镜头，按 EXPEED 镜头传输层的要求应答，
++每一帧都记日志（`Z63_LENS`）。所有应答都是声明的合成数据，不是从真镜头读来的。
++
++### 11.1 链路怎么接
++
++- **镜头在位**：跟随真 MCU 的 PG0。
++- **镜头上电**：跟随 MCU 的 PB0 或 PA9（任一路通电即可）。
++- **唤醒**：pin 58（GPIO_TOP 第 2 组，0x0d151210 的位 11）拉起后，镜头把 pin 41 先拉高、再拉低，产生下降沿。
++- **每笔传输**：
++  1. 命令头 4 个字（PIO，类型 3）；
++  2. pin 41 一个下降沿；
++  3. 数据阶段（DMA，类型 4），两阶段命令有两段；
++  4. 每段之后再一个下降沿。
++- 命令头和数据阶段靠串口模型的 `pio[3].dma` 区分；数据长度取 DMA 的 `units`。
++- 一次定时器到期就把整个 DMA 传输送完：按 FIFO 一批批推进时，7426 字节的 0x24 要花约 90 ms 虚拟时间，超过了类型 1 传输的 50 tick 看门狗（类型表 0x4117a688）。
++
++### 11.2 为它修的两处板级问题
++
++- **NoC group 0 的窗口目标**（`nikon-z63-noc.h`）：原来 group 0 的 8 个窗口全指向 DRAM 开头的 128 MiB。0x21（时间戳）的发送缓冲区在 0xa1cea5840，固件的换算函数 `sub_40CB8280` 查不到窗口，却照样返回成功、给出总线地址 0，DMA 就永远不动。现在和 DSP 组一样，按 k × 128 MiB 铺满 1 GiB。
++- **串口和 HDMAC 的诊断**（`nikon-z63-sio.h`、`-hdmac.h`）：DMA 拒绝每个实例最多报 8 次，和成功分开计数；报"不在 DRAM"时带上总线地址。原来每个实例只报一次，第一次传输成功之后，后面的失败就全是静默的。
++
++### 11.3 连接序列走通
++
++默认应答（`z63_lens_replies`，可用 `-machine lens-replies=0x15:40+…` 在运行时覆盖）：
++
++| 命令 | 设什么 | 为什么（判定函数） |
++|---|---|---|
++| 0x10 | 块第 9 字节 = 0x80 | 字段 24：镜头类别 1，即 Z 镜头（0x41096d14；第 12 步 0x41088810 → 第 31 步） |
++| 0x74 | 第 2 字节 = 0x01 | 字段 59 必须为 1（第 31 步 0x4108a048） |
++| 0x76 | 第 4 字节 = 0x40 | 字段 334 = 1、字段 333 = 0（第 48 步 0x4108f194） |
++| 0x15 | 第 1 字节 = 0x40 | 字段 108（第 20 步，类别 2 的路径） |
++| 0x2870 | 缓冲区 4 +0x10 / +0x14 / +0x15 = 80 / 24 / 183 | 当前 / 最短 / 最长焦距编码，即 50 / 10 / 1000 mm（焦距表 0xa02b3447c） |
++
++实际走过的步：3 → 4（0x1F）→ 11（0x10）→ 12（0x11）→ 31（0x74）→ 33 34 35 37 42 43 44 45 46 47 48（0x4070、0x78、0x4170、0x2870、0x75、0x17E、0x16、0x7E、0x13、0x15、0x76）→ 0x67E。之后相机以 0x2670 周期轮询镜头状态。
++
++取景画面离开"无镜头"状态：曝光模式从 A 变成 P，光圈显示 F1，ISO 显示 AUTO。
++状态项 0x2C19（镜头名，0xa04831d38）读出来是 **"10-1000mm f/1"**，是相机按 `"%g-%gmm "` + `"f/%g"` 自己拼的（`sub_4106A450`）。
++
++### 11.4 f/0.5 与镜头名称
++
++- **f/0.5 在这个协议里表达不出来。** 光圈字节都按无符号数读、以 Av×12 存：
++  - 缓冲区 4 的 +0x16/+0x17：广角端和长焦端的最大光圈（字符串字段 39/40，取值函数 0x410986f8）；
++  - 缓冲区 4 的 +0x19：字段 512。
++
++  换算函数 `sub_40C77078` 先把值变成 1/6 EV，再加 12 查 F 值表 0x4185b8b0（F 值 ×100，从 Av −2 即 f/0.5 开始）。字节 0 正好落在第 12 项 f/1，比它更大的光圈都在下标 0..11，一个无符号字节够不着。试过把 +0x19 设成 0xE8（−24），结果被当作 232，越界后光圈显示为空。所以合成镜头的最大光圈停在 f/1。
++- **镜头自报名称**：发布函数对镜头种类 3 的处理是，字段 375（等级值 0xa0484315c ∈ 9..10）为真时，用镜头给的字符串（字符串字段 29 = 缓冲区 7 +5，64 字节）。这个字符串由 0x4470 读入（parser 0x4109cd84）。等级值在第 37 步设定：只有当状态 0xa048433dc = 2 时，等级 = 字段 344 + 5（0x4070 块第 5 字节）；而状态 2 来自第 36 步"镜头身份与缓存一致"的判断（第 34 步的入口条件是字段 352 = 1、字段 398 = 0）。照这个思路把 0x4070 改成走第 36 步后，状态确实变成了 2，但等级变成 0，名字变成 "800mm f/16"，序列转到读缓存的另一条路径（多出 0x1270）并停住。这条路还没走通，所以名字仍由相机按焦段自动生成。
++
++### 11.5 工具
++
++| 文件 | 用途 |
++|---|---|
++| `z63-tools/mcu-ex/lensfields.py <字段号>` | 查字段在哪个缓冲区、哪个偏移、用什么读法，以及由哪条命令应答的第几字节填入 |
++| `lensfields.py --map` | 列出所有 parser 的"缓冲区 + 偏移 ← 命令应答字节"映射（memcpy 形式的 parser 未覆盖，见 11.4 里的 0x2870） |
++| `z63-tools/mcu-ex/lenssteps.sh <名称> "<lens-replies>"` | 用指定应答启动，在引擎调用点 0x4107d810 下断点，打印实际执行的步号（运行脚本放在 exapfs 的 claude/lens/） |
+diff --git a/z63-tools/mcu-ex/apply_names.py b/z63-tools/mcu-ex/apply_names.py
+new file mode 100755
+index 0000000..3e80b19
+--- /dev/null
++++ b/z63-tools/mcu-ex/apply_names.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""apply_names.py [names.json] -- write the names and comments in names.json into the MCU
++(ex2010) IDA database behind an idasql HTTP server (PORT, default 8089).
++
++names.json is the source of truth: {"funcs": {addr: [name, comment]}, "data": {addr: [name,
++comment]}}. Functions are renamed through the funcs table, data through names/comments."""
++import json, os, sys, urllib.request
++
++PORT = int(os.environ.get('PORT', '8089'))
++
++def sql(q):
++    req = urllib.request.Request('http://127.0.0.1:%d/query' % PORT, data=q.encode(), method='POST')
++    with urllib.request.urlopen(req, timeout=120) as r:
++        d = json.load(r)
++    for res in d['results']:
++        if not res['success']:
++            raise RuntimeError('%s: %s' % (q, res['error']))
++    return d['results'][-1]['rows']
++
++def esc(s):
++    return s.replace("'", "''")
++
++path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), 'names.json')
++names = json.load(open(path))
++n = 0
++for a, (name, comment) in names.get('funcs', {}).items():
++    a = int(a, 16)
++    if not sql('select 1 from funcs where addr=%d' % a):
++        print('no function at 0x%x (%s)' % (a, name)); continue
++    sql("update funcs set name='%s' where addr=%d" % (esc(name), a))
++    if comment:
++        sql("update funcs set comment='%s' where addr=%d" % (esc(comment), a))
++    n += 1
++for a, (name, comment) in names.get('data', {}).items():
++    a = int(a, 16)
++    try:
++        sql("delete from names where addr=%d" % a)
++        sql("insert into names(addr,name) values(%d,'%s')" % (a, esc(name)))
++    except RuntimeError as e:
++        # IDA refuses a name inside an already defined item (an array's middle)
++        print('name not set at 0x%x (%s): %s' % (a, name, str(e).split(': ')[-1])); continue
++    if comment:
++        sql("delete from comments where addr=%d" % a)
++        sql("insert into comments(addr,comment) values(%d,'%s')" % (a, esc(comment)))
++    n += 1
++print('applied', n)
+diff --git a/z63-tools/mcu-ex/egmem.py b/z63-tools/mcu-ex/egmem.py
+new file mode 100644
+index 0000000..fc3fa77
+--- /dev/null
++++ b/z63-tools/mcu-ex/egmem.py
+@@ -0,0 +1,18 @@
++# egmem.py -- read z63_eg.elf by virtual address (ELF64 program headers)
++import struct, sys
++F = '/Users/admin/LiBr/nikon/idb/z63_eg.elf'
++_d = open(F, 'rb').read()
++_ph = []
++phoff, = struct.unpack_from('<Q', _d, 0x20); phentsz, phnum = struct.unpack_from('<HH', _d, 0x36)
++for i in range(phnum):
++    t, fl, off, va, pa, fsz, msz, al = struct.unpack_from('<IIQQQQQQ', _d, phoff + i * phentsz)
++    if t == 1: _ph.append((va, off, fsz, msz))
++def rd(a, n):
++    for va, off, fsz, msz in _ph:
++        if va <= a < va + fsz:
++            return _d[off + a - va: off + a - va + n]
++    return None
++def q(a): return struct.unpack('<Q', rd(a, 8))[0]
++def d(a): return struct.unpack('<I', rd(a, 4))[0]
++if __name__ == '__main__':
++    for va, off, fsz, msz in _ph: print('%x off %x fsz %x msz %x' % (va, off, fsz, msz))
+diff --git a/z63-tools/mcu-ex/egread.py b/z63-tools/mcu-ex/egread.py
+new file mode 100644
+index 0000000..9f46ccf
+--- /dev/null
++++ b/z63-tools/mcu-ex/egread.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++"""egread.py <qmp sock>: read the EXPEED's lens-link config and pin handles (A53 space, DRAM only)."""
++import json, socket, sys, re
++s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); f = s.makefile("rw"); f.readline()
++def cmd(ex, **a):
++    f.write(json.dumps({"execute": ex, "arguments": a}) + "\n"); f.flush()
++    while True:
++        d = json.loads(f.readline())
++        if "return" in d or "error" in d: return d
++def hmp(c): return cmd("human-monitor-command", **{"command-line": c})["return"]
++def words(addr, n, w='g'):
++    out = hmp("xp /%d%sx 0x%x" % (n, w, addr)); return [int(x, 16) for x in re.findall(r'0x([0-9a-f]+)', out.split(':',1)[1] if ':' in out else '') ] if n == 1 else [int(x,16) for l in out.splitlines() for x in re.findall(r'0x([0-9a-f]+)', l.split(':',1)[1])]
++cmd("qmp_capabilities")
++print("serial config 0xA02AFF508:"); print(hmp("xp /32bx 0xa02aff508"))
++print("handle table 0xA02C29000[40..61]:")
++hs = words(0xa02c29000 + 8 * 40, 22)
++for i, h in enumerate(hs):
++    pid = 40 + i
++    line = "  pin %d -> %x" % (pid, h)
++    if 0xa00000000 <= h < 0xa80000000:
++        line += "  " + hmp("xp /12wx 0x%x" % h).replace("\r", " ").replace("\n", " ")
++    print(line)
+diff --git a/z63-tools/mcu-ex/findq.py b/z63-tools/mcu-ex/findq.py
+new file mode 100644
+index 0000000..408f648
+--- /dev/null
++++ b/z63-tools/mcu-ex/findq.py
+@@ -0,0 +1,14 @@
++# findq.py <hexval>... -- find 8-byte little-endian occurrences in the eg image (8-aligned)
++import sys, struct, egmem
++data = egmem._d
++va0, off0, fsz, msz = egmem._ph[0]
++vals = [int(x, 16) for x in sys.argv[1:]]
++pats = {struct.pack('<Q', v): v for v in vals}
++for p, v in pats.items():
++    i = data.find(p, off0)
++    while i >= 0:
++        if (i - off0) % 4 == 0:
++            va = va0 + i - off0
++            ram = va + 0x5B30F000 if 0x45000000 <= va < 0x46000000 else None
++            print('%x at %x%s' % (v, va, ' (RAM %x?)' % ram if ram else ''))
++        i = data.find(p, i + 1)
+diff --git a/z63-tools/mcu-ex/hotplug.sh b/z63-tools/mcu-ex/hotplug.sh
+new file mode 100755
+index 0000000..17686d8
+--- /dev/null
++++ b/z63-tools/mcu-ex/hotplug.sh
+@@ -0,0 +1,22 @@
++#!/bin/sh
++# lens/hotplug.sh <name>: boot with no lens (PG0 high), then put a lens on / take it off / on
++# again through qom-set mcu-pins, marking the log line at each step in <name>.steps.
++D=/Volumes/ExAPFS/z63-run/claude/lens
++cd $D
++MX="mcu-pins=D13=1,,G0=1${MX:+,$MX}" HOLD=1 ./run.sh $1 0
++qmp() { python3 - "$1" <<'PY'
++import json, socket, sys
++s = socket.socket(socket.AF_UNIX); s.connect('/Volumes/ExAPFS/z63-run/claude/lens/qmp.sock')
++f = s.makefile('rw')
++f.readline(); f.write('{"execute":"qmp_capabilities"}\n'); f.flush(); f.readline()
++f.write(json.dumps({"execute": "qom-set", "arguments": {"path": "/machine", "property": "mcu-pins", "value": sys.argv[1]}}) + '\n'); f.flush()
++print(f.readline().strip())
++PY
++}
++step() { echo "$(wc -l < $1.log) $2" >> $1.steps; }
++: > $1.steps
++sleep ${T0:-40}; step $1 attach; qmp G0=0
++sleep ${T1:-20}; step $1 detach; qmp G0=1
++sleep ${T2:-15}; step $1 attach2; qmp G0=0
++sleep ${T3:-20}; step $1 end
++kill $(cat $1.pid)
+diff --git a/z63-tools/mcu-ex/lensfields.py b/z63-tools/mcu-ex/lensfields.py
+new file mode 100644
+index 0000000..4a70b42
+--- /dev/null
++++ b/z63-tools/mcu-ex/lensfields.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""lensfields.py <field id>... | --map -- the EXPEED's lens fields and where the lens's replies
++put them.
++
++A field id indexes the descriptor table at RAM 0xA02B4D210 (40 bytes: mode, buffer/offset for
++lens kind 1 = Z lens, buffer/offset for other kinds, getter, argument; field getter 0x4109710C).
++The command parsers (command table RAM 0xA02B4B350, +32) copy reply bytes into those buffers:
++`result = sub_41095C34(buffer)` then `result[off] = a1[reply byte]`. --map prints, for every
++(buffer, offset) a parser writes, which command and reply byte feeds it. Reads the eg image
++(egmem.py) and the decompile cache (DC, default ~/LiBr/claude-work/dc)."""
++import os, re, struct, sys
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import egmem
++
++K = 0x9BD60F000                       # RAM - image VA for this .data range
++DC = os.environ.get('DC', os.path.expanduser('~/LiBr/claude-work/dc'))
++GET = {0x41097f2c: 'bit', 0x41097de4: 'int'}
++INT = {39: 'u8', 40: 'le16', 41: 'le24', 42: 'le32', 43: 'be16', 44: 'be24', 45: 'be32', 46: 's16'}
++
++def ram(a, n):
++    return egmem.rd(a - K, n)
++
++def field(fid):
++    mode, b1, o1, b2, o2, _, getter, arg = struct.unpack('<6IQI', ram(0xA02B4D210 + 40 * fid, 36))
++    g = GET.get(getter, '%x' % getter)
++    how = ('bit %d' % arg) if g == 'bit' else INT.get(arg, '%s(%d)' % (g, arg))
++    return mode, (b1, o1), (b2, o2), how
++
++def commands():
++    """[(index, code, txlen, rxlen, builder, parser)] from the command table, + 0x70 group."""
++    out = []
++    for base, n in ((0xA02B4B350, 92), (0xA02B4C430, 64)):
++        for i in range(n):
++            r = ram(base + 48 * i, 48)
++            code, tx, rx = struct.unpack_from('<3H', r, 0)
++            b, p = struct.unpack_from('<2Q', r, 24)
++            out.append((i, code, tx, rx, b, p))
++    return out
++
++def parser_writes(addr):
++    """[(kind branch, buffer, offset, reply byte)] read from the decompiled parser."""
++    path = os.path.join(DC, '%x.c' % addr)
++    if not os.path.exists(path):
++        return []
++    res, bufs, branch = [], {}, 'any'
++    for line in open(path).read().splitlines():
++        line = re.sub(r'^/\*[^*]*\*/', '', line).strip()
++        if 'sub_4109634C() == 2' in line:
++            branch = 'kind2'
++        elif line == 'else' or line.startswith('else '):
++            branch = 'other' if branch == 'kind2' else branch
++        m = re.search(r'(\w+) = (?:\([^)]*\))?sub_41095C34\(a1: (\d+)\)', line)
++        if m:
++            bufs[m.group(1)] = int(m.group(2))
++        m = re.search(r'(\w+)\[(\d+)\] = a1\[(\d+)\]', line)
++        if m and m.group(1) in bufs:
++            res.append((branch, bufs[m.group(1)], int(m.group(2)), int(m.group(3))))
++    return res
++
++def build_map():
++    m = {}
++    for i, code, tx, rx, b, p in commands():
++        for branch, buf, off, j in parser_writes(p):
++            m.setdefault((buf, off), []).append((code, j, branch))
++    return m
++
++if __name__ == '__main__':
++    if sys.argv[1:] == ['--map']:
++        for (buf, off), srcs in sorted(build_map().items()):
++            print('buf %2d +0x%03x <- %s' % (buf, off, ', '.join(
++                'cmd 0x%04x byte %d (%s)' % s for s in srcs)))
++        sys.exit()
++    m = build_map()
++    for a in sys.argv[1:]:
++        fid = int(a, 0)
++        mode, z, o, how = field(fid)
++        src = lambda bo: ', '.join('0x%04x[%d]%s' % (c, j, '' if br == 'any' else ' ' + br)
++                                   for c, j, br in m.get(bo, [])) or '-'
++        print('field %d: mode %d, Z lens buf %d +0x%x (%s), other buf %d +0x%x (%s), %s'
++              % (fid, mode, z[0], z[1], src(z), o[0], o[1], src(o), how))
+diff --git a/z63-tools/mcu-ex/lenssteps.sh b/z63-tools/mcu-ex/lenssteps.sh
+new file mode 100755
+index 0000000..45e927e
+--- /dev/null
++++ b/z63-tools/mcu-ex/lenssteps.sh
+@@ -0,0 +1,22 @@
++#!/bin/sh
++# lenssteps.sh <name> "<lens-replies>" [secs]: boot with the synthetic lens answering as given,
++# record which connect-sequence steps the EXPEED runs (breakpoint on the engine's start call
++# 0x4107d810, x1 = the step's done function) and print them as step numbers, then the last
++# lens frames. Runs on exapfs in claude/lens (run.sh, ../rspbrk.py, steps table steps.txt).
++cd /Volumes/ExAPFS/z63-run/claude/lens
++MX="lens=on,lens-replies=$2" HOLD=1 ./run.sh $1 0
++sleep 2
++python3 ../rspbrk.py 41270 ${3:-40} 0x4107d810 > $1.brk 2>&1
++kill $(cat $1.pid)
++python3 - $1 <<'PY'
++import re, sys
++done = {}
++for l in open('steps.txt'):
++    m = re.match(r'\s*(\d+) \w+: start (\w+) done (\w+)', l)
++    if m:
++        done.setdefault(m.group(3), []).append(m.group(1))
++seq = [('/'.join(done.get(m.group(1), ['?' + m.group(1)])))
++       for m in re.finditer(r'x1=([0-9a-f]+)', open(sys.argv[1] + '.brk').read())]
++print('steps:', ' '.join(seq))
++PY
++grep -E "Z63_LENS: #" $1.log | sed -E "s/qemu-system-aarch64: //" | cut -c1-110 | awk '!seen[substr($0, index($0,"cmd"), 11)]++' | tail -12
+diff --git a/z63-tools/mcu-ex/m4mem.py b/z63-tools/mcu-ex/m4mem.py
+new file mode 100755
+index 0000000..9dc7939
+--- /dev/null
++++ b/z63-tools/mcu-ex/m4mem.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""m4mem.py <port> <out-prefix> <addr:len>... : attach to QEMU's gdb stub (the VM pauses),
++select the Cortex-M4 (gdb process 2), dump each range to <out-prefix>-<addr>.bin, print the
++M4's registers, detach (the VM runs on)."""
++import socket, sys, re
++
++class Rsp:
++    def __init__(self, port):
++        self.s = socket.create_connection(("127.0.0.1", port), timeout=10)
++        self.buf = b""
++    def send(self, cmd):
++        self.s.sendall(b"$" + cmd + b"#%02x" % (sum(cmd) & 0xff))
++        while True:
++            c = self.s.recv(1)
++            if c == b"+": return
++            if not c: raise EOFError
++    def recv(self):
++        while True:
++            i = self.buf.find(b"$"); j = self.buf.find(b"#", i + 1)
++            if i >= 0 and j >= 0 and len(self.buf) >= j + 3:
++                pkt = self.buf[i + 1:j]; self.buf = self.buf[j + 3:]
++                self.s.sendall(b"+"); return pkt
++            d = self.s.recv(65536)
++            if not d: raise EOFError
++            self.buf += d
++    def cmd(self, c):
++        self.send(c); return self.recv()
++
++r = Rsp(int(sys.argv[1]))
++r.cmd(b"qSupported:multiprocess+")
++r.cmd(b"?")
++print("vAttach;2", r.cmd(b"vAttach;2"))
++threads = []
++t = r.cmd(b"qfThreadInfo")
++while t.startswith(b"m"):
++    threads += t[1:].split(b",")
++    t = r.cmd(b"qsThreadInfo")
++m4 = [x for x in threads if x.startswith(b"p2.") or x.startswith(b"p02.")]
++print("threads", threads, "m4", m4)
++assert m4, "no M4 thread"
++print("Hg", r.cmd(b"Hg" + m4[0]))
++g = r.cmd(b"g")
++regs = [int.from_bytes(bytes.fromhex(g[i:i+8].decode()), 'little') for i in range(0, 16*8, 8)]
++print("m4 regs", ' '.join('r%d=%08x' % (i, v) for i, v in enumerate(regs)))
++for spec in sys.argv[3:]:
++    a, n = [int(x, 0) for x in spec.split(':')]
++    data = b""
++    while len(data) < n:
++        k = min(0x800, n - len(data))
++        p = r.cmd(b"m%x,%x" % (a + len(data), k))
++        if p.startswith(b"E"):
++            print("read error at %x: %s" % (a + len(data), p)); break
++        data += bytes.fromhex(p.decode())
++    open("%s-%08x.bin" % (sys.argv[2], a), "wb").write(data)
++    print("dumped %x +%x -> %d bytes" % (a, n, len(data)))
++r.send(b"D")
++print("detached")
+diff --git a/z63-tools/mcu-ex/names.json b/z63-tools/mcu-ex/names.json
+new file mode 100644
+index 0000000..fc9cac9
+--- /dev/null
++++ b/z63-tools/mcu-ex/names.json
+@@ -0,0 +1,229 @@
++{
++  "_about": "Names for the body MCU image ex2010_0200a0.bi (Z6_3 Firmware Ex 02.00.a0), applied with apply_names.py. Thumb addresses are even. See docs/mcu-ex/lens.md.",
++  "funcs": {
++    "0x8021500": ["mod_create", "module = event flag (obj+24) + task running sub_802152C: wait for any bit in mask, call handler(bits). (obj, handler, mask, arg)"],
++    "0x8021552": ["mod_post", "set event-flag bits of a module task (tk_set_flg on obj+24)"],
++    "0x8021558": ["mod_start", "tk_sta_tsk on the module's task"],
++    "0x80214c0": ["err_log", "append {file id, line} to the 100-entry error ring 0x2003AB4C"],
++    "0x8020a06": ["alm_create", "named alarm handler (alm, handler, name)"],
++    "0x8020a50": ["alm_start", "tk_sta_alm(alm, time); time in kernel ticks (1 ms, inferred)"],
++    "0x8020a62": ["alm_stop", "tk_stp_alm"],
++    "0x80489ba": ["sem_create", "named semaphore"],
++    "0x80489fe": ["sem_wait", "tk_wai_sem(id, 1, TMO_FEVR)"],
++    "0x8048a12": ["sem_signal", "tk_sig_sem(id, 1)"],
++    "0x8047112": ["irq_save", ""],
++    "0x804711e": ["irq_restore", ""],
++    "0x802060a": ["memzero", "(p, n)"],
++    "0x80204c8": ["memcpy_", "(dst, src, n)"],
++    "0x8054378": ["memcmp_", ""],
++    "0x8046ed4": ["pin_res", "logical pin id -> resource index, table *0x2000F2A0 (= 0x805639A); identity for GPIO ids: id = 16*port + pin"],
++    "0x8046f14": ["timer_res", "logical timer id -> resource index, table *0x2000F2AC (= 0x805647E)"],
++    "0x8021198": ["res_get", "resource index -> object {idx, lock, base, mask/channel} (0x2000EDAC[])"],
++    "0x80211c4": ["res_set", ""],
++    "0x80469bc": ["res_register_all", "registers the 16-byte resource objects from 0x2000DDC8"],
++    "0x80211e0": ["board_main", "board init: installs pin/timer/irq tables, creates and starts the modules, then the start-phase loop"],
++    "0x8047134": ["irq_slot", "logical interrupt id -> slot, table *0x2000F2CC (= 0x8056868); slot -> NVIC IRQ via 0x80562B0"],
++    "0x80471c0": ["irq_disable", "(slot)"],
++    "0x804719c": ["irq_clear", "(slot) clear pending"],
++    "0x80471e8": ["irq_enable", "(slot)"],
++    "0x8048580": ["irq_set_handler", "(slot, fn)"],
++    "0x8046e48": ["res_lock", ""],
++    "0x8046990": ["res_unlock", ""],
++    "0x804bb10": ["HAL_GPIO_ReadPin", "(port, mask): IDR & mask"],
++    "0x804bb22": ["HAL_GPIO_WritePin", "(port, mask, level): BSRR"],
++    "0x804b93c": ["HAL_GPIO_Init", "(port, {Pin, Mode, Pull, Speed, Alternate})"],
++    "0x804d798": ["HAL_TIM_OC_Init", "TIM_Base_SetConfig + state"],
++    "0x804db66": ["HAL_TIM_OC_ConfigChannel", ""],
++    "0x804dc68": ["HAL_TIM_OC_Start_IT", "DIER CCxIE"],
++    "0x804dcd4": ["HAL_TIM_OC_Stop_IT", ""],
++    "0x804dc30": ["HAL_TIM_Start", "CR1.CEN (+BDTR.MOE on TIM1/TIM8)"],
++    "0x804d760": ["HAL_TIM_Stop", ""],
++    "0x804e088": ["HAL_TIM_ReadCapturedValue", "CCRx"],
++    "0x80522c8": ["TIM_Base_SetConfig", ""],
++    "0x8033780": ["param_record_get", "(id, &ptr): record id -> RAM copy; records arrive from the EXPEED over provider 15 (ExI2c); id 4 = 'LENS'"],
++
++    "0x80355c4": ["lenshw_tim_halt", "TIM12 CH1 compare IRQ off, counter stopped"],
++    "0x80355e4": ["lenshw_pg4_irq_off", ""],
++    "0x8035600": ["lenshw_detect_read", "1 when PG0 reads low = a lens is on the mount (PG0 has no internal pull; board pull-up inferred)"],
++    "0x8035620": ["lenshw_init", "lens pins: PB0 (out, power path A), PA9 (out, power path B), PF12 (out, EXPEED-set line), PG0 (in, lens detect, active low), PD15 (out, low = enabled), PG4 (in, rising-edge latch); TIM12 CH1 compare as a one-shot, prescaler 499 -> 5.56 us/tick (90 MHz timer clock)"],
++    "0x80356f0": ["lenshw_pg0_irq", "(on, cb): EXTI0 for PG0"],
++    "0x803574c": ["lenshw_pg0_mode", "(on): PG0 EXTI on both edges, else plain input"],
++    "0x80357a0": ["lenshw_pg4_irq", "(on, cb): EXTI4 for PG4"],
++    "0x80357fc": ["lenshw_pg4_mode", "(on): PG4 EXTI on the rising edge, else plain input"],
++    "0x8035850": ["lenshw_set_a", "PB0 = level (power path A; EXPEED mode 2, set before the first lens handshake = lens comm power, inferred)"],
++    "0x803586c": ["lenshw_set_b", "PA9 = level (power path B; EXPEED mode 1, only in sequence 0x41091224)"],
++    "0x8035888": ["lenshw_set_pf12", "PF12 = level (EXPEED kind 2: 1 only after lens identification succeeded, connect step 14; 0 at power-down; inferred second/full-power enable)"],
++    "0x80358a4": ["lenshw_tim_oneshot", "(how, cb, ticks): 0 cancel; 1 next compare = last compare + ticks; 2 = now + ticks (at least 2)"],
++    "0x803596c": ["lenshw_tim_start", "counter running, compare IRQ off"],
++
++    "0x8035990": ["lnmng_create", ""],
++    "0x80359b0": ["lnmng_init", ""],
++    "0x80359ba": ["lnmng_start", ""],
++    "0x80359be": ["lnmng_apply_pd15", "(attached, -, power class): attached and class in {2,4,7,8,9} -> PD15 low, else PD15 high"],
++    "0x80359e8": ["lnmng_task_create", "LnMng task (mask 0x7FFDF) + semaphores LnMngSem (TX) and LnMngOpe"],
++    "0x8035a38": ["lnmng_bind", "provider 13 bind: (send fn, channel)"],
++    "0x8035a48": ["lnmng_load_params", "record 4 'LENS': +24 detect sample interval (x100 TIM12 ticks), +32 detect timeout (x100 kernel ticks); defaults 5 / 30"],
++    "0x8035a94": ["lnmng_take_pg4_latched", "read-and-clear"],
++    "0x8035ab4": ["lnmng_reset", "state reset; registers lnmng_on_lnprt_event / _det as LnPrt's report callbacks"],
++    "0x8035b38": ["lnmng_link_up", "event 0x1: the EXPEED link is up; flushes the pending 0x91 / 0x96"],
++    "0x8035b44": ["lnmng_set_power_class", "event 0x400: camera power class (from the mode command, table 0x8056B23) -> PD15"],
++    "0x8035b5c": ["lnmng_tx_done", ""],
++    "0x8035b6c": ["lnmng_param_changed", "param record 4 changed -> event 0x200 (reload timing)"],
++    "0x8035b80": ["lnmng_task", "LnMng event handler: bit0 link up, 0x2 kind1, 0x4 kind2, 0x800 kind3, 0x2000 kind4, 0x4000 kind5, 0x8/0x10/0x1000/0x8000/0x10000 send 0x81/0x82/0x83/0x84/0x85, 0x40 attach changed, 0x40000 send 0x96, 0x80 power down, 0x100 stop done, 0x200 params, 0x400 power class, 0x20000 PG4 event"],
++    "0x8035cd0": ["lnmng_on_lnprt_event", "LnPrt -> LnMng: 0x02060001 mode done (0x81), 02 PF12 done (0x82), 03 stopped (-> 0x040A0001 to McuCm), 04 lines done (0x83), 05 PG4 latch cmd done (0x84), 06 query result (0x85), 07 boot power-up done (0x96)"],
++    "0x8035d50": ["lnmng_on_lnprt_det", "0x02060065 attach result (lens_attached), 0x02060066 PG4 rising edge seen"],
++    "0x8035d80": ["lnmng_rx", "provider 13 receive: [0] kind 1..5, 16 bytes (kind 5: 12) copied to 0x20013E40; [4] sequence id, [12..14] arguments"],
++    "0x8035e00": ["lnmng_on_attach_change", "PD15 from attach+class; first attach after power-on -> internal mode 3 (power path A on, report 0x96 once); sends 0x91"],
++    "0x8035e50": ["lnmng_set_stop_cb", ""],
++    "0x8035e64": ["lnmng_power_down", "event 0x80: PD15 high, LnPrt stop (detection off) -> 0x02060003 -> callback 0x040A0001"],
++    "0x8035e78": ["lnmng_tx_81", "reply to kind 1: {0x81, [4] seq, [5] 0x80 on error}, 12 bytes"],
++    "0x8035ee8": ["lnmng_tx_96", "unsolicited boot power-up result: {0x96, [4]=1, [5] 0x80 on error, [9]=1, [12] powered 0/1}, 16 bytes; sent once per MCU power-on"],
++    "0x8035f5c": ["lnmng_send", "provider send through the bound function, retry while busy (0xFFFF)"],
++    "0x8035f98": ["lnmng_tx_83", "reply to kind 3"],
++    "0x8036008": ["lnmng_tx_91", "unsolicited attach state: {0x91, [4]=1, [5] 0x80 if state 2, [9]=1, [12] attached 0/1 (0xFF on error)}, 16 bytes"],
++    "0x8036080": ["lnmng_tx_82", "reply to kind 2"],
++    "0x80360f0": ["lnmng_tx_85", "reply to kind 5: [5] 0x80 on error, [9]=2, [12] detect result (0 none, 1 attached, 2 detached/timeout), [13] PG4 latched; 16 bytes"],
++    "0x8036174": ["lnmng_tx_84", "reply to kind 4"],
++    "0x80361e4": ["lnmng_start_tasks", ""],
++
++    "0x80361fc": ["lnprt_create", ""],
++    "0x8036214": ["lnprt_shutdown", "detection off, timer halted"],
++    "0x803622c": ["lnprt_init", "lenshw_init + lnprt_reset"],
++    "0x803623e": ["lnprt_start", ""],
++    "0x8036258": ["lnpwr_s0_coldinit", "state 0 sel 4 -> state 3 (both paths off)"],
++    "0x8036264": ["lnpwr_s1_mode2_done", "already A: report 0x02060001 ok"],
++    "0x8036270": ["lnpwr_s1_mode1", "A->B: B on, alarm C 10, overlap kind 1, state 4"],
++    "0x8036294": ["lnpwr_s1_mode0", "A off -> state 3, report"],
++    "0x80362bc": ["lnpwr_s1_set_b", "kind 3: B on, A off -> state 2"],
++    "0x80362d8": ["lnpwr_s1_set_none", "kind 3: A off -> state 3"],
++    "0x80362ec": ["lnpwr_s1_set_ab", "kind 3: B on -> state 5"],
++    "0x8036300": ["lnpwr_s2_mode2", "B->A: A on, alarm C 10, overlap kind 2, state 4"],
++    "0x8036324": ["lnpwr_s2_mode3", "B->A as mode 2 but completes with 0x02060007: overlap kind 3"],
++    "0x8036348": ["lnpwr_s2_mode1_done", "already B: report ok"],
++    "0x8036354": ["lnpwr_s2_mode0", "B off -> state 3, report"],
++    "0x803637c": ["lnpwr_s2_set_a", "kind 3: A on, B off -> state 1"],
++    "0x8036398": ["lnpwr_s2_set_none", "kind 3: B off -> state 3"],
++    "0x80363ac": ["lnpwr_s2_set_ab", "kind 3: A on -> state 5"],
++    "0x80363c0": ["lnpwr_s3_mode2", "A on -> state 1, report"],
++    "0x80363e4": ["lnpwr_s3_mode3", "A on -> state 1, report 0x02060007 (boot power-up)"],
++    "0x8036408": ["lnpwr_s3_mode1", "B on -> state 2, report"],
++    "0x803642c": ["lnpwr_s3_mode0_done", "already off: report ok"],
++    "0x8036434": ["lnpwr_s3_set_a", ""],
++    "0x8036448": ["lnpwr_s3_set_b", ""],
++    "0x803645c": ["lnpwr_s3_set_ab", ""],
++    "0x8036480": ["lnpwr_s4_overlap_end", "alarm C: overlap 1 -> A off, state 2; 2 -> B off, state 1; 3 -> B off, state 1, report 0x02060007"],
++    "0x80364dc": ["lnpwr_s5_mode2", "B off -> state 1, report"],
++    "0x8036500": ["lnpwr_s5_mode1", "A off -> state 2, report"],
++    "0x8036524": ["lnpwr_s5_mode0", "both off -> state 3, report"],
++    "0x803654c": ["lnpwr_s5_set_a", ""],
++    "0x8036560": ["lnpwr_s5_set_b", ""],
++    "0x8036574": ["lnpwr_s5_set_none", ""],
++    "0x8036590": ["lnprt_do_lines", "kind 3 (a, b, pf12): (1,0) sel 5 = A, (0,1) sel 6 = B, (0,0) sel 7 = none, (1,1) sel 8 = both; pf12 0/1; report 0x02060004"],
++    "0x8036604": ["lndet_s0_start", "sample PG0, state 1, event 0x8"],
++    "0x8036630": ["lndet_s1_edge", "start debounce: state 2, alarm R = timeout, TIM12 sampling every interval"],
++    "0x8036688": ["lndet_stop", "PG0 IRQ off, sampling off, alarm R off, state 0"],
++    "0x80366b8": ["lndet_clear_result", "kind 4 arm: result 0"],
++    "0x80366c8": ["lndet_s2_sample", "4 equal samples in a row -> result (1 attached / 2 not), report 0x02060065, state 1, PG0 EXTI both edges"],
++    "0x803674c": ["lndet_s2_timeout", "alarm R before a stable level: result 2, report 0x02060065 status 0"],
++    "0x803676a": ["lndet_s2_stop", ""],
++    "0x8036770": ["lnprt_task_create", "LnPrt task (mask 0x3FFD) + alarms LnPrtAlC (power-path overlap) and LnPrtAlR (detect timeout)"],
++    "0x80367c4": ["lnprt_detect_off", ""],
++    "0x80367dc": ["lnpwr_dispatch", "(state, selector) through the 6 x 10 table 0x80578F0"],
++    "0x80367fc": ["lndet_dispatch", "(state, event) through the 3 x 7 table 0x80579E0"],
++    "0x803681c": ["lnprt_query", "kind 5 -> LnPrt event 0x2000"],
++    "0x803682c": ["lnprt_sample_ticks", "100 * LOWORD(params)"],
++    "0x8036848": ["lnprt_reset", "(cold): states cleared, cold -> power state 0 sel 4; PD15 high"],
++    "0x8036894": ["lndet_pg0_isr", "PG0 edge: IRQ off, sample, event 0x8"],
++    "0x80368bc": ["lndet_pg4_isr", "PG4 rising: event 0x1000"],
++    "0x80368cc": ["lndet_tim_isr", "TIM12 compare: sample PG0, event 0x4"],
++    "0x80368f4": ["lnprt_detect_start", "event 0x1"],
++    "0x8036900": ["lnprt_detect_stop", "event 0x100"],
++    "0x8036910": ["lnprt_report", "(code 0x0206000x, status, arg) -> LnMng"],
++    "0x8036920": ["lnprt_report_det", "(code 0x02060065/66, status, arg) -> LnMng"],
++    "0x8036930": ["lnprt_task", "LnPrt event handler: 0x1 detect start, 0x4 sample, 0x8 PG0 edge, 0x40 detect timeout, 0x100 stop, 0x10 mode, 0x20 PF12, 0x80 overlap end, 0x200 params, 0x400 lines, 0x800 PG4 latch cmd, 0x1000 PG4 edge, 0x2000 query"],
++    "0x8036a58": ["lnprt_almC", "alarm C -> event 0x80"],
++    "0x8036a64": ["lnprt_almR", "alarm R -> event 0x40"],
++    "0x8036a74": ["lnprt_do_pg4_latch", "kind 4: 0 = clear result + latch, PG4 rising-edge IRQ on; 1 = off; report 0x02060005"],
++    "0x8036ad4": ["lnprt_set_report_cb", ""],
++    "0x8036ae8": ["lnprt_set_report_det_cb", ""],
++    "0x8036afc": ["lenshw_set_pd15", "(x): PD15 = (x != 1), i.e. 1 -> low"],
++    "0x8036b08": ["lnprt_cmd_mode", "kind 1 -> event 0x10; mode 0 -> sel 2, 1 -> sel 1, 2 -> sel 0, 3 -> sel 9, else error"],
++    "0x8036b1c": ["lnprt_cmd_lines", "kind 3 -> event 0x400"],
++    "0x8036b34": ["lnprt_cmd_pf12", "kind 2 -> event 0x20"],
++    "0x8036b48": ["lnprt_cmd_pg4", "kind 4 -> event 0x800"],
++    "0x8036b60": ["lnprt_set_params", "event 0x200"],
++    "0x8036b84": ["lnprt_task_start", ""],
++
++    "0x8037218": ["mcucm_mode", "current camera mode (family 1 kind 8 [4])"],
++    "0x8037c18": ["mcucm_apply_mode", "per-mode tables at 0x8056B16 (13 entries each) -> module setters, lens class from 0x8056B23"],
++    "0x8037ca4": ["mcucm_mode_down", "calls lnmng_power_down(class from 0x8056B23) among others"],
++    "0x8037cfc": ["mcucm_mode_special", "lens class 9"],
++    "0x8037dba": ["mcucm_link_up", "calls lnmng_link_up"],
++    "0x8038396": ["mcucm_on_lens_stopped", "0x040A0001 -> McuMg event 0x8000"]
++  },
++  "data": {
++    "0x2000d098": ["mcu_provider_table", "provider n at +8n: {bind(send fn, channel), receive}; 13 = LnMng, 8 = DspTop (no bind), 2 = SwMng, 4 = Bat, 9 = McMng, 10 = SbMng, 15 = ExI2c"],
++    "0x2000f2a0": ["pin_table_ptr", ""],
++    "0x2000edac": ["res_table", "317 resource object pointers"],
++    "0x2000e890": ["param_records", "20-byte rows {id, flash addr, RAM copy, size, flag}; 4 = LENS (flash 0x08008210, 0x40 bytes)"],
++    "0x80578f0": ["lens_pwr_table", "6 states x 10 selectors"],
++    "0x80579e0": ["lens_det_table", "3 states x 7 events"],
++    "0x8056b23": ["mode_lens_class", "camera mode 0..12 -> lens power class {0,0,1,2,3,4,5,6,7,8,8,3,4}"],
++    "0x2000e7f8": ["lens_attached", "0xFF unknown, 0 no, 1 yes (from 0x02060065)"],
++    "0x2000e7f9": ["lens_power_class", ""],
++    "0x2000e7fa": ["lens_boot_power_err", "status of 0x02060007"],
++    "0x2000e7fb": ["lens_boot_power_done", ""],
++    "0x2000e9b8": ["lens_det_last", ""],
++    "0x2000e9b9": ["lens_det_level", "1 = PG0 low = lens"],
++    "0x2000e9ba": ["lens_req_pg4", ""],
++    "0x20013de0": ["lnmng_channel", ""],
++    "0x20013de1": ["lnmng_req_seq", "request [4], echoed in replies"],
++    "0x20013de2": ["lnmng_st_81", ""],
++    "0x20013de3": ["lnmng_st_82", ""],
++    "0x20013de4": ["lnmng_st_83", ""],
++    "0x20013de5": ["lnmng_pg4_event", ""],
++    "0x20013de6": ["lnmng_st_84", ""],
++    "0x20013de7": ["lnmng_pg4_latched", ""],
++    "0x20013de8": ["lnmng_96_sent", "0x96 goes out once per MCU power-on"],
++    "0x20013de9": ["lnmng_query", "{detect result, PG4 seen, error}"],
++    "0x20013dec": ["lnmng_send_fn", ""],
++    "0x20013df0": ["lnmng_stop_cb", ""],
++    "0x20013df4": ["lnmng_link_is_up", ""],
++    "0x20013df8": ["lnmng_stop_status", ""],
++    "0x20013dfc": ["lnmng_params", "lo: sample interval x100 ticks, hi: timeout x100"],
++    "0x20013e00": ["lnmng_mod", ""],
++    "0x20013e2c": ["lnmng_tx_sem", "LnMngSem"],
++    "0x20013e36": ["lnmng_ope_sem", "LnMngOpe"],
++    "0x20013e40": ["lnmng_req", "last request, 16 bytes"],
++    "0x20013f30": ["lnmng_tx_buf", "240 bytes"],
++    "0x20014020": ["lnmng_tx_desc", "{channel, u16 len, buf, queue class 2, ..., done cb}"],
++    "0x20019354": ["lens_pwr_state", "0 cold, 1 A (PB0), 2 B (PA9), 3 none, 4 overlap, 5 A+B"],
++    "0x20019355": ["lens_req_mode", ""],
++    "0x20019356": ["lens_overlap_kind", "1 A->B, 2 B->A, 3 B->A (mode 3)"],
++    "0x20019357": ["lens_req_pf12", ""],
++    "0x20019358": ["lens_det_count", "equal samples so far"],
++    "0x20019359": ["lens_det_state", "0 idle, 1 armed, 2 debouncing"],
++    "0x2001935a": ["lens_det_result", "0 cleared, 1 attached, 2 not attached / timeout"],
++    "0x2001935b": ["lens_pg4_seen", ""],
++    "0x2001935c": ["lens_query_err", ""],
++    "0x2001935d": ["lens_req_lines", "kind 3 {a, b, pf12}"],
++    "0x20019360": ["lnprt_report_cb", ""],
++    "0x20019364": ["lnprt_report_det_cb", ""],
++    "0x20019368": ["lnprt_params", ""],
++    "0x2001936c": ["lnprt_params_new", ""],
++    "0x20019370": ["lnprt_mod", ""],
++    "0x2001939c": ["lnprt_almC", "LnPrtAlC"],
++    "0x200193b0": ["lnprt_almR", "LnPrtAlR"],
++    "0x200193c4": ["lens_irq_pg0", "slot 6 = EXTI0"],
++    "0x200193c5": ["lens_irq_tim12", "slot 70 = IRQ 43 TIM8_BRK_TIM12"],
++    "0x200193c6": ["lens_irq_pg4", "slot 10 = EXTI4"],
++    "0x200193d8": ["lens_res_pb0", ""],
++    "0x200193dc": ["lens_res_pa9", ""],
++    "0x200193e0": ["lens_res_pf12", ""],
++    "0x200193e4": ["lens_res_pg0", ""],
++    "0x200193e8": ["lens_res_pd15", ""],
++    "0x200193ec": ["lens_res_pg4", ""],
++    "0x200193f0": ["lens_res_tim12", "timer resource 13 = TIM12 channel 1"],
++    "0x200193f4": ["lens_htim12", "TIM handle: Instance, Prescaler 499, CounterMode 0, Period 0xFFFF"]
++  }
++}
+diff --git a/z63-tools/mcu-ex/pins.py b/z63-tools/mcu-ex/pins.py
+new file mode 100755
+index 0000000..fbd3fdd
+--- /dev/null
++++ b/z63-tools/mcu-ex/pins.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++"""pins.py <ex2010_0200a0.bi> <MCU RAM dump from 0x20000000> -- the MCU's logical pin ids and
++timer ids, resolved to GPIO port/pin or peripheral object.
++
++pin_res (0x08046ED4) maps an id through the ROM table that 0x2000F2A0 points at to a resource
++index; res_get (0x08021198) maps that through 0x2000EDAC[] to a 16-byte object
++{index, lock, base, mask}. Both tables are filled at run time, hence the RAM dump (m4mem.py)."""
++import struct, sys
++
++rom = open(sys.argv[1], 'rb').read()
++ram = open(sys.argv[2], 'rb').read()
++
++def r32(a):
++    if 0x08000000 <= a < 0x08000000 + len(rom):
++        return struct.unpack_from('<I', rom, a - 0x08000000)[0]
++    return struct.unpack_from('<I', ram, a - 0x20000000)[0]
++
++def r16(a):
++    if 0x08000000 <= a < 0x08000000 + len(rom):
++        return struct.unpack_from('<H', rom, a - 0x08000000)[0]
++    return struct.unpack_from('<H', ram, a - 0x20000000)[0]
++
++def describe(i):
++    o = r32(0x2000EDAC + 4 * i)
++    if not o:
++        return '-'
++    w = [r32(o + 4 * k) for k in range(4)]
++    if 0x40020000 <= w[2] < 0x40022c00 and w[3] and not w[3] & (w[3] - 1):
++        return 'P%s%d' % ('ABCDEFGHIJK'[(w[2] - 0x40020000) // 0x400], w[3].bit_length() - 1)
++    return 'obj %08x {%s}' % (o, ' '.join('%08x' % x for x in w))
++
++pin_tab, tim_tab = r32(0x2000F2A0), r32(0x2000F2AC)
++print('# pin id -> resource -> GPIO (table 0x%x)' % pin_tab)
++for i in range((tim_tab - pin_tab) // 2):
++    ri = r16(pin_tab + 2 * i)
++    print('pin\t%d\t%d\t%s' % (i, ri, describe(ri) if ri != 0xffff else '-'))
++print('# timer id -> resource (table 0x%x)' % tim_tab)
++for i in range(24):
++    ri = r16(tim_tab + 2 * i)
++    print('timer\t%d\t%d\t%s' % (i, ri, describe(ri) if ri < 317 else '-'))
+diff --git a/z63-tools/mcu-ex/run.sh b/z63-tools/mcu-ex/run.sh
+new file mode 100755
+index 0000000..d2fd256
+--- /dev/null
++++ b/z63-tools/mcu-ex/run.sh
+@@ -0,0 +1,15 @@
++#!/bin/sh
++# lens/run.sh <name> <secs>: a boot named z63-lens (gdb 41270, qmp lens/qmp.sock), for the
++# MCU lens work; separate from z63-agent / z63-probe / z63-ui. Output in claude/lens/.
++# env: MX= extra -machine opts, EXTRA= extra QEMU opts, HOLD=1 leaves it running (kill by pid file).
++cd /Volumes/ExAPFS/z63-run
++D=/Volumes/ExAPFS/z63-run/claude/lens
++cp /Volumes/ExAPFS/z63-run/nand-e.img $D/nand.img
++/Volumes/ExAPFS/qemu-z63/build/qemu-system-aarch64 -name z63-lens \
++  -machine nikon-z63,loader=loader_0x40000000-0x40160000.bin,snor-user=${SNOR:-/Volumes/ExAPFS/z63-run/claude/snor_user_sti.bin},nand=$D/nand.img,mcu-image=/Volumes/ExAPFS/Z6_3_0200_modules/ex2010_0200a0.bi,z9-capture=on,z9-capture-raw=bars.raw,gfx-skip-unmodelled=on,sio-sink=9:8:7,imu-mg=-1000:0:0,scanout-dump=$D/$1.ppm${MX:+,$MX} \
++  -cpu cortex-a53 -smp 4,maxcpus=5 -bios /Volumes/ExAPFS/Z6_3_0200_modules/eg2010_0200i1.bi \
++  -serial file:$D/$1.serial -monitor none -display none -action shutdown=pause -gdb tcp:127.0.0.1:41270 ${QSTOP:+-S} \
++  ${EXTRA:-} -qmp unix:$D/qmp.sock,server=on,wait=off > $D/$1.log 2>&1 &
++pid=$!
++echo $pid > $D/$1.pid
++if [ -z "$HOLD" ]; then sleep $2; kill $pid; fi
+diff --git a/z63-tools/mcu-ex/steps.py b/z63-tools/mcu-ex/steps.py
+new file mode 100644
+index 0000000..88d25a0
+--- /dev/null
++++ b/z63-tools/mcu-ex/steps.py
+@@ -0,0 +1,40 @@
++# steps.py -- lens sequence steps: what each start fn sends, where each done fn goes
++import re, os, sys, struct
++sys.path.insert(0, os.path.dirname(__file__))
++import egmem
++DC = '/Users/admin/LiBr/claude-work/dc'
++D = 0x9BD60F000
++def src(a):
++    p = os.path.join(DC, '%x.c' % a)
++    if not os.path.exists(p): return ''
++    return re.sub(r'^/\* [0-9A-F ]{6,10} \*/ ?', '', open(p).read(), flags=re.M)
++cmdtab = {}
++for i in range(0x5c):
++    b = egmem.rd(0xA02B4B350 - D + 48 * i, 48)
++    cmdtab[i] = struct.unpack_from('<H', b, 0)[0]
++def follow(a, depth=0):
++    """calls made by a start fn, resolving one level of thunks/wrappers"""
++    s = src(a); out = []
++    for m in re.finditer(r'sub_([0-9A-F]{8})\(([^;]*)\)', s):
++        f = int(m.group(1), 16); args = m.group(2)
++        out.append((f, args))
++    return s, out
++MCU = {0x4109521C: 'MCU kind1(mode)', 0x41095258: 'MCU kind2(PF12)', 0x41095300: 'MCU kind4(PG4 latch)',
++       0x41095348: 'MCU kind5(query)', 0x41087B08: 'MCU kind3', 0x41083D70: 'LENS cmd', 0x41096398: 'LENS cmd(raw)'}
++for i in range(0x53):
++    a = 0x45535de0 + 32 * i
++    st, dn, ck, pa = [egmem.q(a + 8 * k) for k in range(4)]
++    s, calls = follow(st)
++    what = []
++    for f, args in calls:
++        if f in MCU:
++            what.append('%s %s' % (MCU[f], args.replace('a1: ', '').replace('a2: ', '').replace('a3: ', '').replace('a4: ', '')))
++        else:
++            s2, c2 = follow(f)
++            for g, a2 in c2:
++                if g in MCU: what.append('%s via %x(%s) -> %s %s' % ('', f, args[:30], MCU[g], a2[:40]))
++    d = src(dn)
++    nxt = sorted(set(re.findall(r'MEMORY\[0xA02995F84\] = (\w+);', d)))
++    calls_dn = sorted(set(re.findall(r'sub_4107DAA0\(result: 0, a2: (\w+)', d)))
++    pinfo = ('cmd %02x code %04x' % (pa, cmdtab.get(pa, 0))) if ck == 0x41096a3c else ('chk %x p %x' % (ck, pa))
++    print('%2d %-26s start %x | %s | done %x -> %s %s' % (i, pinfo, st, '; '.join(what)[:150], dn, ','.join(nxt), ('retry-fail->' + ','.join(calls_dn)) if calls_dn else ''))
+-- 
+2.55.0
+

@@ -1,0 +1,229 @@
+From 0badf9708eeb7fe2c20a30d8642b04c5f9a2c518 Mon Sep 17 00:00:00 2001
+From: LiBr <me@nvme0n1p.dev>
+Date: Mon, 19 Oct 2026 11:17:37 +0800
+Subject: [PATCH 53/57] z63-tools: z63ftrace and z63watch can print a stack
+ scan
+
+stack=<bytes> adds to each line every word in that much of the stack above
+sp that points into the A53 code (0x40200000..0x417fffff). This image keeps
+no frame-pointer chain, so a scan is the only call chain there is; it
+includes stale words. In z63watch it names who called the memcpy inside a
+store-wide setter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ z63-tools/plugins/z63ftrace.c | 59 ++++++++++++++++++++++++++++++++---
+ z63-tools/plugins/z63watch.c  | 52 ++++++++++++++++++++++++++++--
+ 2 files changed, 104 insertions(+), 7 deletions(-)
+
+diff --git a/z63-tools/plugins/z63ftrace.c b/z63-tools/plugins/z63ftrace.c
+index 0a5ad22..2c317a6 100644
+--- a/z63-tools/plugins/z63ftrace.c
++++ b/z63-tools/plugins/z63ftrace.c
+@@ -13,7 +13,11 @@
+  *   <us> cpu<n> first pc=0x40f62720 x0=0x5 x1=0x0 x2=0x0 from=0x40f7d078
+  *
+  * in order, with its first three arguments and return address; cap=<n>
+- * (default 1) allows more calls per function. At exit each listed function
++ * (default 1) allows more calls per function. stack=<bytes> adds, to each
++ * line, every word in that much of the stack above sp that points into the
++ * A53 code (0x40200000..0x417fffff): this image keeps no frame-pointer
++ * chain, so a stack scan is the only call chain there is, and it includes
++ * stale words. At exit each listed function
+  * that ran after the trigger gets a summary line with its count and whether
+  * it had run before the trigger ("new" when not). <us> is host time since
+  * load, as in z63log.
+@@ -37,6 +41,8 @@ typedef struct Func {
+ } Func;
+ 
+ static struct qemu_plugin_register *arg[MAX_VCPUS][3], *lr_reg[MAX_VCPUS];
++static struct qemu_plugin_register *sp_reg[MAX_VCPUS];
++static uint64_t stack_bytes;
+ static GHashTable *funcs;               /* pc -> Func */
+ static FILE *out;
+ static GMutex lock;
+@@ -79,6 +85,41 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int idx)
+         if (!strcmp(d->name, "x30")) {
+             lr_reg[idx] = d->handle;
+         }
++        if (!strcmp(d->name, "sp")) {
++            sp_reg[idx] = d->handle;
++        }
++    }
++}
++
++/* The code addresses in the top stack_bytes of the stack, as " stack=a,b". */
++static void stack_scan(unsigned int idx, GString *line)
++{
++    g_autoptr(GByteArray) buf = g_byte_array_new();
++    uint64_t sp = reg_u64(sp_reg[idx]);
++    bool first = true;
++
++    if (!stack_bytes || !sp_reg[idx]) {
++        return;
++    }
++    /* In 256-byte pieces, up to the first that fails: a task's stack may
++     * end at an unmapped page well inside stack_bytes. */
++    for (uint64_t off = 0; off < stack_bytes; off += 256) {
++        g_autoptr(GByteArray) part = g_byte_array_new();
++
++        if (!qemu_plugin_read_memory_vaddr(sp + off, part, 256)) {
++            break;
++        }
++        g_byte_array_append(buf, part->data, part->len);
++    }
++    for (guint o = 0; o + 8 <= buf->len; o += 8) {
++        uint64_t v;
++
++        memcpy(&v, buf->data + o, 8);
++        if (v >= 0x40200000 && v < 0x41800000 && !(v & 3)) {
++            g_string_append_printf(line, "%s0x%" PRIx64, first ? " stack=" : ",",
++                                   v);
++            first = false;
++        }
+     }
+ }
+ 
+@@ -90,11 +131,15 @@ static void trigger_hit(unsigned int idx, void *udata)
+     if (trigger_x0_set && reg_u64(arg[idx][0]) != trigger_x0) {
+         return;
+     }
++    g_autoptr(GString) line = g_string_new(NULL);
++    stack_scan(idx, line);
+     g_mutex_lock(&lock);
+     if (!triggered) {
+         triggered = true;
+-        fprintf(out, "%" PRId64 " cpu%u trigger pc=0x%" PRIx64 "\n",
+-                g_get_monotonic_time() - t0, idx, trigger_pc);
++        fprintf(out, "%" PRId64 " cpu%u trigger pc=0x%" PRIx64 " x0=0x%" PRIx64
++                " from=0x%" PRIx64 "%s\n", g_get_monotonic_time() - t0, idx,
++                trigger_pc, reg_u64(arg[idx][0]), reg_u64(lr_reg[idx]),
++                line->str);
+     }
+     g_mutex_unlock(&lock);
+ }
+@@ -113,12 +158,14 @@ static void func_hit(unsigned int idx, void *udata)
+     if (f->after++ >= cap) {
+         return;
+     }
++    g_autoptr(GString) line = g_string_new(NULL);
++    stack_scan(idx, line);
+     g_mutex_lock(&lock);
+     fprintf(out, "%" PRId64 " cpu%u first pc=0x%" PRIx64 " x0=0x%" PRIx64
+-            " x1=0x%" PRIx64 " x2=0x%" PRIx64 " from=0x%" PRIx64 "%s\n",
++            " x1=0x%" PRIx64 " x2=0x%" PRIx64 " from=0x%" PRIx64 "%s%s\n",
+             g_get_monotonic_time() - t0, idx, f->pc, reg_u64(arg[idx][0]),
+             reg_u64(arg[idx][1]), reg_u64(arg[idx][2]),
+-            reg_u64(lr_reg[idx]), f->before ? "" : " new");
++            reg_u64(lr_reg[idx]), f->before ? "" : " new", line->str);
+     g_mutex_unlock(&lock);
+ }
+ 
+@@ -180,6 +227,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+             trigger_x0_set = true;
+         } else if (g_str_has_prefix(argv[i], "cap=")) {
+             cap = g_ascii_strtoull(argv[i] + 4, NULL, 0);
++        } else if (g_str_has_prefix(argv[i], "stack=")) {
++            stack_bytes = MIN(g_ascii_strtoull(argv[i] + 6, NULL, 0), 4096);
+         }
+     }
+     if (!list || !g_file_get_contents(list, &text, NULL, NULL)) {
+diff --git a/z63-tools/plugins/z63watch.c b/z63-tools/plugins/z63watch.c
+index 7705a09..148fbe2 100644
+--- a/z63-tools/plugins/z63watch.c
++++ b/z63-tools/plugins/z63watch.c
+@@ -9,6 +9,10 @@
+  * max= times (default 4), so a store in a loop does not flood the file.
+  * Restricting the code range keeps the cost to the instructions that can
+  * matter -- the body MCU's flash, say, with the A53s untouched.
++ * stack=<bytes> adds every word in that much of the stack above sp that
++ * points into the A53 code (0x40200000..0x417fffff), as z63ftrace does: a
++ * store is often a memcpy inside a store-wide setter, and the A53 image
++ * keeps no frame-pointer chain to say whose.
+  *
+  *   -plugin libz63watch.dylib,lo=0x20014150,hi=0x20014190,
+  *           pclo=0x08000000,pchi=0x08080000,out=/tmp/w.txt
+@@ -27,6 +31,8 @@ static GMutex lock;
+ static GHashTable *seen;               /* (pc << 32 | addr low) -> count */
+ static int64_t t0;
+ static struct qemu_plugin_register *lr_reg[16];   /* per vCPU: lr / x30 */
++static struct qemu_plugin_register *sp_reg[16];
++static uint64_t stack_bytes;
+ 
+ static uint64_t read_lr(unsigned int vcpu)
+ {
+@@ -55,6 +61,44 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int idx)
+         if (!strcmp(d->name, "lr") || !strcmp(d->name, "x30")) {
+             lr_reg[idx] = d->handle;
+         }
++        if (!strcmp(d->name, "sp")) {
++            sp_reg[idx] = d->handle;
++        }
++    }
++}
++
++/* The code addresses in the top stack_bytes of the stack, as " stack=a,b". */
++static void stack_scan(unsigned int vcpu, GString *line)
++{
++    g_autoptr(GByteArray) sp_buf = g_byte_array_new();
++    g_autoptr(GByteArray) buf = g_byte_array_new();
++    uint64_t sp = 0;
++    bool first = true;
++
++    if (!stack_bytes || vcpu >= 16 || !sp_reg[vcpu] ||
++        qemu_plugin_read_register(sp_reg[vcpu], sp_buf) <= 0) {
++        return;
++    }
++    memcpy(&sp, sp_buf->data, MIN(sp_buf->len, sizeof(sp)));
++    /* In 256-byte pieces, up to the first that fails: a task's stack may
++     * end at an unmapped page well inside stack_bytes. */
++    for (uint64_t off = 0; off < stack_bytes; off += 256) {
++        g_autoptr(GByteArray) part = g_byte_array_new();
++
++        if (!qemu_plugin_read_memory_vaddr(sp + off, part, 256)) {
++            break;
++        }
++        g_byte_array_append(buf, part->data, part->len);
++    }
++    for (guint o = 0; o + 8 <= buf->len; o += 8) {
++        uint64_t w;
++
++        memcpy(&w, buf->data + o, 8);
++        if (w >= 0x40200000 && w < 0x41800000 && !(w & 3)) {
++            g_string_append_printf(line, "%s0x%" PRIx64, first ? " stack=" : ",",
++                                   w);
++            first = false;
++        }
+     }
+ }
+ 
+@@ -82,13 +126,15 @@ static void store(unsigned int vcpu, qemu_plugin_meminfo_t info,
+     n = g_hash_table_lookup(seen, &key);
+     if (GPOINTER_TO_UINT(n) < maxper) {
+         uint64_t *k = g_new(uint64_t, 1);
++        g_autoptr(GString) line = g_string_new(NULL);
+ 
+         *k = key;
+         g_hash_table_replace(seen, k, GUINT_TO_POINTER(GPOINTER_TO_UINT(n) + 1));
++        stack_scan(vcpu, line);
+         fprintf(out, "%" PRId64 " cpu%u pc=0x%" PRIx64 " lr=0x%" PRIx64
+-                " addr=0x%" PRIx64 " size=%u val=0x%" PRIx64 "\n",
++                " addr=0x%" PRIx64 " size=%u val=0x%" PRIx64 "%s\n",
+                 g_get_monotonic_time() - t0, vcpu, pc, read_lr(vcpu), vaddr,
+-                1u << qemu_plugin_mem_size_shift(info), val);
++                1u << qemu_plugin_mem_size_shift(info), val, line->str);
+         fflush(out);
+     }
+     g_mutex_unlock(&lock);
+@@ -142,6 +188,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+             pchi = g_ascii_strtoull(kv[1], NULL, 0);
+         } else if (!strcmp(kv[0], "max")) {
+             maxper = g_ascii_strtoull(kv[1], NULL, 0);
++        } else if (!strcmp(kv[0], "stack")) {
++            stack_bytes = MIN(g_ascii_strtoull(kv[1], NULL, 0), 4096);
+         }
+     }
+     out = path ? fopen(path, "w") : stderr;
+-- 
+2.55.0
+

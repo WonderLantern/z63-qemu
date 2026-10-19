@@ -1,7 +1,7 @@
 From 6155a25b4663f81eb4e64b722dfd7a772a01bbd2 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 21:06:06 +0000
-Subject: [PATCH 39/47] Z 6III: a release writes a JPEG to the card -- the
+Subject: [PATCH 39/57] Z 6III: a release writes a JPEG to the card -- the
  still's capture models on by default
 
 With the shutter type (custom setting d6) at "electronic shutter", a

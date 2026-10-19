@@ -1,7 +1,7 @@
 From 62a27ed9d174b9b959ea5c192e50ba2c764ca533 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 03:49:15 +0000
-Subject: [PATCH 11/47] Z 6III: the audio codec answers; movie live view's
+Subject: [PATCH 11/57] Z 6III: the audio codec answers; movie live view's
  set-up stops timing out
 
 Module 0x421's start-up handler (sub_40E3FE2C, on a worker task) runs the

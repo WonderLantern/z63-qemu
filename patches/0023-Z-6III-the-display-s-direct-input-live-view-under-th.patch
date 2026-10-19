@@ -1,7 +1,7 @@
 From eade6518bf82de646b7839b34f2d5c5c7924e11a Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Mon, 12 Oct 2026 11:28:33 +0000
-Subject: [PATCH 23/47] Z 6III: the display's direct input -- live view under
+Subject: [PATCH 23/57] Z 6III: the display's direct input -- live view under
  the menus
 
 The live-view display path programs the display unit's direct source from

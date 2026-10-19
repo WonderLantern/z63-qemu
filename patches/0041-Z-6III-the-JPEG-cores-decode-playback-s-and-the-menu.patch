@@ -1,7 +1,7 @@
 From 1bb08e968dfd92947040e70a8bedbcb4bc06a3c4 Mon Sep 17 00:00:00 2001
 From: LiBr <me@nvme0n1p.dev>
 Date: Tue, 13 Oct 2026 02:29:00 +0000
-Subject: [PATCH 41/47] Z 6III: the JPEG cores decode -- playback's and the
+Subject: [PATCH 41/57] Z 6III: the JPEG cores decode -- playback's and the
  menus' pictures, z63-jpeg-decode
 
 Playback (PLAY) and Setup > monitor colour balance stopped at once on
